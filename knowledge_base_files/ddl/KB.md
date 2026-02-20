@@ -1,21 +1,21 @@
-```markdown
 ---
 name: ddl_index
-description: "This section provides detailed information on the database table schemas, column definitions, and semantic descriptions for the NBA analytics database. It is essential for understanding the structure and organization of data used in NBA analytics."
+description: "This section provides detailed information on the database table schemas, column definitions, and semantic descriptions for the NBA analytics database. It is essential for understanding the structure and relationships within the database."
 ---
 
 # Ddl Section
 
-The DDL (Data Definition Language) section contains comprehensive documentation on the database schemas used in the NBA analytics database. This section is crucial for developers, data analysts, and engineers who need to understand the structure and relationships of the data tables to perform data analysis, integration, or reporting tasks effectively.
+This section contains the Data Definition Language (DDL) files for the NBA analytics database. It includes comprehensive details on the structure of tables, the definitions of columns, and the semantic meanings behind the data stored. This information is crucial for database administrators, data engineers, and analysts who need to understand or modify the database schema.
 
 ## Contents
 
-- **players**: Schema and column definitions for the players table, detailing player attributes and identifiers.
-- **teams**: Structure and descriptions of the teams table, including team identifiers and metadata.
-- **games**: Schema for the games table, capturing game-specific data and relationships.
-- **box_scores**: Detailed layout of the box_scores table, which records individual and team performance metrics per game.
-- **seasons**: Definitions and structure of the seasons table, outlining season-specific data and timelines.
-- **player_awards**: Schema for the player_awards table, documenting awards and recognitions received by players.
-- **arenas**: Structure and semantic details of the arenas table, including location and capacity information.
-- **salaries**: Schema and column descriptions for the salaries table, detailing player salary information and contracts.
-```
+- **dwh_d_games**: Schema and column definitions for the games table, detailing each NBA game.
+- **dwh_d_players**: Structure and descriptions of the players table, including player-specific data.
+- **dwh_d_player_nicknames**: Table schema for player nicknames, linking players to their known aliases.
+- **dwh_d_teams**: Definitions and structure for the teams table, covering all NBA teams.
+- **dwh_f_player_awards**: Schema for player awards, detailing accolades received by players.
+- **dwh_f_player_boxscore**: Structure of the player boxscore table, capturing individual game performance statistics.
+- **dwh_f_player_team_seasons**: Definitions for player team seasons, tracking player participation across seasons.
+- **dwh_f_player_tracking**: Schema for player tracking data, providing advanced metrics and movement data.
+- **dwh_f_team_boxscore**: Structure of the team boxscore table, summarizing team performance in games.
+- **dwh_f_team_championships**: Definitions for team championships, documenting championship wins by teams.

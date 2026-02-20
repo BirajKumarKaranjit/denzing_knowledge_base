@@ -52,8 +52,6 @@ def build_sql_prompt(
         Fully assembled prompt string ready to send to the LLM.
     """
     sections: list[str] = []
-
-    # ── 1. System header ──
     system_header = (
         "You are an expert SQL analyst. Generate a valid, efficient SQL query "
         "to answer the user's question using ONLY the tables and columns described below. "

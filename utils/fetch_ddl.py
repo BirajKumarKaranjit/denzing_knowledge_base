@@ -115,7 +115,7 @@ def _empty_table_info() -> List:
 #                 "database_type": "postgresql",
 #                 "db_dns": None,
 #                 "db_new": None,
-#                 "db_included_tables": ["dwh_d_games", "dwh_d_players"],
+#                 "db_included_tables": ["dwh_d_games", "dwh_d_players", "dwh_d_player_nicknames", "dwh_d_teams", "dwh_f_player_awards", "dwh_f_player_boxscore", "dwh_f_player_team_seasons", "dwh_f_player_tracking", "dwh_f_team_boxscore", "dwh_f_team_championships"],
 #             }
 #     table_info = get_included_tables_ddl(db_config)
 #     print(table_info)
