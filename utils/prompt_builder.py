@@ -18,22 +18,34 @@ LLM the schema it needs to write correct SQL without hallucinating columns.
 """
 
 from __future__ import annotations
-
 from typing import Any
+from utils.citation_builder import (
+    build_citations,
+    format_citations_as_xml,
+    format_citations_for_user,
+    TableCitation,
+)
 
 
 def build_sql_prompt(
     user_query: str,
     retrieval_result: dict[str, Any],
     agent_backstory: str = "",
-) -> str:
+) -> tuple[str, str]:
     """
-    Assemble the complete SQL generation prompt from KB retrieval results.
+    Assemble the SQL generation prompt from KB retrieval results.
 
-    This function is the bridge between the KB retrieval system and the
-    SQL generation LLM call. It formats all retrieved context into a
-    structured prompt that gives the model exactly the schema information
-    it needs — no more, no less.
+    Integrates the citation layer at two levels:
+        1. XML citation block → injected into the LLM prompt before schemas.
+        2. Markdown citation string → returned to the caller for display to the end user
+
+    Prompt section order:
+        [1] System header (role + hard constraint: only use listed tables)
+        [2] <kb_retrieval_citations> XML  ← anti-hallucination manifest
+        [3] Always-inject sections (sql_guidelines, response_guidelines)
+        [4] Section entry point overviews (KB.md files)
+        [5] Matched table schemas with rank-numbered headers
+        [6] User question
 
     Parameters
     ----------
@@ -41,61 +53,78 @@ def build_sql_prompt(
         The original natural language question from the user.
     retrieval_result : dict
         Output from kb_retriever.retrieve_context_for_query().
-        Contains matched_tables, section_entry_points, always_inject.
+        Expected keys: matched_tables, section_entry_points, always_inject.
     agent_backstory : str
-        Optional agent persona/backstory to prepend to the system prompt.
-        E.g., "You are an NBA analytics assistant..."
+        Optional agent persona to prepend to the system header.
+        Pass "" if not needed.
 
     Returns
     -------
-    str
-        Fully assembled prompt string ready to send to the LLM.
+    tuple[str, str]
+        prompt_str   : Fully assembled LLM prompt. Pass this to generate_sql().
+        citation_md  : Markdown citation text. Show this to the end user in the
+                       UI or API response alongside the generated SQL.
     """
+    matched_tables: list[dict] = retrieval_result.get("matched_tables", [])
+    always_inject: dict = retrieval_result.get("always_inject", {})
+    section_entry_points: dict = retrieval_result.get("section_entry_points", {})
+
+    # ── Build citations from matched tables ──
+    # citations is a list[TableCitation] used for both XML and markdown output
+    citations: list[TableCitation] = build_citations(matched_tables)
+    citation_xml: str = format_citations_as_xml(citations)
+    citation_md: str = format_citations_for_user(citations)
+
     sections: list[str] = []
+
     system_header = (
-        "You are an expert SQL analyst. Generate a valid, efficient SQL query "
-        "to answer the user's question using ONLY the tables and columns described below. "
-        "Do not reference any table or column not present in the schema provided."
+        "You are an expert SQL analyst.\n"
+        "Generate a valid, efficient SQL query to answer the user's question.\n"
+        "IMPORTANT CONSTRAINT: Use ONLY the tables listed in the "
+        "<kb_retrieval_citations> block below. "
+        "Do not reference any table or column not explicitly listed there "
+        "and present in the schemas provided."
     )
     if agent_backstory:
         system_header = f"{agent_backstory}\n\n{system_header}"
     sections.append(system_header)
 
-    # ── 2. Always-inject sections (sql_guidelines, response_guidelines) ──
-    always_inject = retrieval_result.get("always_inject", {})
+    sections.append(citation_xml)
+
     for section_name, entry in always_inject.items():
         if entry and entry.get("content"):
             label = section_name.replace("_", " ").upper()
             sections.append(f"## {label}\n\n{entry['content']}")
 
-    # ── 3. Section entry points as context headers ──
-    section_entry_points = retrieval_result.get("section_entry_points", {})
     for section_name, entry in section_entry_points.items():
         if entry and entry.get("content"):
             label = f"{section_name.upper()} SECTION OVERVIEW"
             sections.append(f"## {label}\n\n{entry['content']}")
 
-    # ── 4. Matched table schemas (the actual DDL + column descriptions) ──
-    matched_tables = retrieval_result.get("matched_tables", [])
-
     if matched_tables:
         table_blocks: list[str] = []
-        for table in matched_tables:
-            name = table.get("metadata", {}).get("name", table["file_path"])
-            score = table.get("relevance_score", 0)
+
+        for table, citation in zip(matched_tables, citations):
             content = table.get("content", "").strip()
-            # Each table block shows the file name, relevance score, and full DDL content
-            table_blocks.append(
-                f"### Table: {name}  (relevance: {score:.2f})\n\n{content}"
+            header = (
+                f"### [{citation.rank}] Table: `{citation.table_name}`  "
+                f"(relevance: {citation.relevance_score} — {citation.confidence_label} confidence)"
             )
-        sections.append("## RELEVANT TABLE SCHEMAS\n\n" + "\n\n---\n\n".join(table_blocks))
+            table_blocks.append(f"{header}\n\n{content}")
+
+        sections.append(
+            "## RELEVANT TABLE SCHEMAS\n\n"
+            + "\n\n---\n\n".join(table_blocks)
+        )
     else:
         sections.append(
             "## RELEVANT TABLE SCHEMAS\n\n"
-            "⚠ No tables matched the query. Consider lowering SIMILARITY_THRESHOLD in config.py."
+            "No tables were retrieved from the Knowledge Base for this query.\n"
+            "Do NOT invent table names or column names. "
+            "Return an empty SQL block if valid SQL cannot be generated."
         )
 
-    # ── 5. User question ──
     sections.append(f"## USER QUESTION\n\n{user_query}")
 
-    return "\n\n".join(sections)
+    prompt_str = "\n\n".join(sections)
+    return prompt_str, citation_md

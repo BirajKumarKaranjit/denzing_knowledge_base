@@ -24,7 +24,7 @@ Pipeline order:
 """
 
 from __future__ import annotations
-
+from utils.config import overwrite
 import sys
 
 
@@ -43,9 +43,8 @@ def cmd_generate() -> None:
 
     After generation, review and edit the files before running build.
     """
-    # Import from the package __init__ which explicitly re-exports this symbol
     from kb_system import generate_all_kb_files
-    generate_all_kb_files()
+    generate_all_kb_files(overwrite=overwrite)
 
 
 def cmd_build() -> None:
@@ -91,8 +90,6 @@ def cmd_query(user_query: str) -> None:
     user_query : str
         Natural language question to convert to SQL.
     """
-    # All imports are lazy (inside the function) so that missing dependencies
-    # in one command do not prevent other commands from running.
     from kb_system.kb_store import get_connection
     from kb_system.kb_retriever import retrieve_context_for_query
     from utils.prompt_builder import build_sql_prompt
@@ -101,23 +98,17 @@ def cmd_query(user_query: str) -> None:
     print(f"\n{'=' * 60}")
     print(f"  Query: {user_query}")
     print(f"{'=' * 60}")
-
-    # Open DB connection
     conn = get_connection()
 
-    # Stage 1 + 2: Retrieve relevant context from KB
     retrieval_result = retrieve_context_for_query(conn, user_query)
 
-    # Assemble the prompt from retrieved context
-    prompt = build_sql_prompt(
+    prompt, citation_md = build_sql_prompt(
         user_query=user_query,
         retrieval_result=retrieval_result,
         agent_backstory="You are an NBA analytics assistant with deep knowledge of basketball statistics.",
     )
 
-    print(f"\n[main] Assembled prompt ({len(prompt)} chars). Calling LLM...")
-
-    # Generate SQL
+    print(f"\n[main] Assembled prompt ({prompt}...). Calling LLM...")
     llm_response = generate_sql(prompt)
     sql = extract_sql_from_response(llm_response)
 
@@ -126,6 +117,7 @@ def cmd_query(user_query: str) -> None:
     print(f"{'=' * 60}")
     print(sql)
     print(f"{'=' * 60}\n")
+    print(citation_md)
 
     conn.close()
 

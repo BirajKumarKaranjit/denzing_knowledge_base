@@ -29,7 +29,7 @@ from utils.config import OPENAI_API_KEY, OPENAI_SQL_MODEL
 _client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 
-def generate_sql(prompt: str, temperature: float = 0.0) -> str:
+def generate_sql(prompt: str, temperature: float = 0.25) -> str:
     """
     Send the assembled prompt to the LLM and return the generated SQL.
 

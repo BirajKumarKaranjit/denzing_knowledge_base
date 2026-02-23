@@ -1,7 +1,7 @@
 ---
 name: dwh_f_team_boxscore
-description: "Use when the query involves analyzing team performance metrics in NBA games, such as field goals, three-pointers, free throws, rebounds, assists, steals, blocks, turnovers, and points. This table is essential for evaluating team efficiency, pace, and scoring distribution across different game segments. It provides detailed insights into team strategies, including fastbreak points, points off turnovers, and paint points, as well as advanced metrics like offensive and defensive ratings, assist ratios, and usage percentages."
-tags: [team performance, boxscore, NBA analytics, game metrics]
+description: "Use when the query involves analyzing team performance metrics in NBA games. This table provides comprehensive statistics for each team per game, including shooting efficiency, rebounding, assists, turnovers, and advanced metrics like offensive and defensive ratings. Ideal for queries that require breakdowns of team performance by quarters or overtime periods, or when calculating team-specific metrics such as pace, usage percentage, and net rating. Suitable for detailed game analysis, team comparisons, and performance trend analysis over a season."
+tags: [team performance, game statistics, NBA analytics]
 priority: high
 ---
 
@@ -76,46 +76,41 @@ CREATE TABLE dwh_f_team_boxscore (
 ## Column Semantics
 
 - **id**: Unique identifier for each team boxscore entry. Typically used in SELECT and WHERE clauses.
-- **game_id**: Identifier linking to the specific game. Used for joining with game-related tables.
-- **team_id**: Identifier for the team, used to join with team dimension tables.
-- **minutes**: Total minutes played by the team in the game. Usually 48 for regulation games, higher if overtime.
-- **field_goals_made/attempted**: Number of field goals made/attempted by the team. Key for calculating shooting efficiency.
-- **three_pointers_made/attempted**: Number of three-point shots made/attempted. Important for analyzing team shooting strategy.
-- **free_throws_made/attempted**: Number of free throws made/attempted. Indicates team's ability to capitalize on free throw opportunities.
-- **rebounds_offensive/defensive**: Number of offensive/defensive rebounds. Critical for assessing team control over the game.
-- **assists**: Total assists, reflecting team playmaking ability.
+- **game_id**: Identifier for the game, linking to game details. Essential for JOINs with game tables.
+- **team_id**: Identifier for the team, used to JOIN with team dimension tables.
+- **minutes**: Total minutes played by the team in the game. Usually 48 for regulation games.
+- **field_goals_made/attempted**: Number of field goals made/attempted by the team. Used to calculate shooting percentages.
+- **three_pointers_made/attempted**: Number of three-point shots made/attempted. Key for analyzing team shooting efficiency.
+- **free_throws_made/attempted**: Number of free throws made/attempted. Important for assessing team scoring efficiency.
+- **rebounds_offensive/defensive**: Number of offensive/defensive rebounds. Critical for evaluating team rebounding strength.
+- **assists**: Total assists made by the team. Reflects team playmaking ability.
 - **steals/blocks**: Defensive metrics indicating team defensive prowess.
-- **turnovers**: Number of turnovers, a negative metric affecting team performance.
-- **fouls_personal**: Total personal fouls committed by the team.
-- **points**: Total points scored by the team, a primary performance indicator.
-- **plus_minus_points**: Net point differential when the team is on the court.
-- **percentage_points_midrange_2pt/fastbreak/off_turnovers/paint**: Distribution of points from various play types, indicating team scoring strategy.
-- **percentage_assisted/unassisted_2pt/3pt/fgm**: Proportion of field goals that are assisted/unassisted, reflecting team play style.
-- **team_turnover_percentage**: Turnovers per 100 possessions, a measure of ball security.
-- **offensive_rebound_percentage**: Percentage of available offensive rebounds secured by the team.
-- **opp_team_turnover_percentage/opp_offensive_rebound_percentage**: Opponent's turnover and offensive rebound percentages, used for defensive analysis.
-- **estimated_offensive/defensive_rating**: Points scored/allowed per 100 possessions, key efficiency metrics.
-- **defensive_rating**: Actual defensive performance metric.
-- **estimated_net_rating**: Difference between estimated offensive and defensive ratings.
-- **assist_ratio**: Assists per 100 possessions, indicating team passing efficiency.
-- **defensive_rebound_percentage/rebound_percentage**: Team's ability to secure defensive rebounds and overall rebounds.
-- **turnover_ratio**: Turnovers per 100 possessions, another measure of ball security.
-- **usage_percentage/estimated_usage_percentage**: Percentage of team plays used by a player while on the court.
-- **estimated_pace/pace**: Number of possessions per 48 minutes, indicating game speed.
-- **possessions**: Total possessions in the game.
-- **pie**: Player Impact Estimate, a measure of a team's overall statistical contribution.
-- **qtr1_points/qtr2_points/qtr3_points/qtr4_points**: Points scored by the team in each quarter.
-- **ot1_points to ot10_points**: Points scored in each overtime period, if applicable.
+- **turnovers**: Number of turnovers committed by the team. High values indicate potential issues with ball control.
+- **fouls_personal**: Number of personal fouls committed. Used to assess team discipline.
+- **points**: Total points scored by the team. Central to any scoring analysis.
+- **plus_minus_points**: Net point differential when the team is on the court. Used to gauge overall team impact.
+- **percentage_points_midrange_2pt/fastbreak/off_turnovers/paint**: Breakdown of scoring sources. Useful for strategic analysis.
+- **percentage_assisted/unassisted_2pt/3pt/fgm**: Indicates reliance on assisted vs. unassisted scoring.
+- **team_turnover_percentage**: Turnovers per 100 possessions. Key for efficiency analysis.
+- **offensive/defensive_rebound_percentage**: Percentage of available rebounds secured. Important for rebounding analysis.
+- **estimated_offensive/defensive/net_rating**: Advanced metrics estimating points scored/allowed per 100 possessions.
+- **assist_ratio**: Assists per 100 possessions. Reflects team passing efficiency.
+- **turnover_ratio**: Turnovers per 100 possessions. Used to evaluate ball security.
+- **usage_percentage**: Estimate of team possessions used by a player. Important for player impact analysis.
+- **pace**: Estimate of possessions per 48 minutes. Used to assess game tempo.
+- **possessions**: Total possessions in the game. Fundamental for calculating advanced metrics.
+- **pie**: Player Impact Estimate, reflecting overall team performance.
+- **qtr1_points, qtr2_points, qtr3_points, qtr4_points**: Points scored in each quarter. Useful for analyzing scoring trends.
+- **ot1_points to ot10_points**: Points scored in overtime periods. Relevant for games extending beyond regulation.
 
 ## Common Query Patterns
 
-- Calculate team shooting efficiency by comparing field goals made to attempted.
-- Analyze team performance trends over a season by joining with game and team tables using `game_id` and `team_id`.
-- Evaluate team defensive capabilities by examining steals, blocks, and defensive ratings.
-- Determine scoring distribution by analyzing points from fastbreaks, turnovers, and paint.
+- Retrieve team performance metrics for a specific game: `SELECT * FROM dwh_f_team_boxscore WHERE game_id = '20231025'`
+- Compare team performance across multiple games: `SELECT team_id, AVG(points) FROM dwh_f_team_boxscore WHERE game_id IN ('20231025', '20231026') GROUP BY team_id`
+- Analyze scoring trends by quarter: `SELECT game_id, qtr1_points, qtr2_points, qtr3_points, qtr4_points FROM dwh_f_team_boxscore WHERE team_id = 'LAL'`
 
 ## Join Relationships
 
-- **game_id**: Join with game dimension tables to retrieve game-specific details.
-- **team_id**: Join with team dimension tables to get team metadata and historical performance.
-- Often used in conjunction with player boxscore tables to compare individual and team performances.
+- **game_id**: Joins with game tables to fetch game-specific details.
+- **team_id**: Joins with team dimension tables to retrieve team metadata such as team name and conference.
+- Typically joined with player boxscore tables to aggregate player contributions to team performance.

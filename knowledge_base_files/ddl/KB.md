@@ -5,17 +5,17 @@ description: "This section provides detailed information on the database table s
 
 # Ddl Section
 
-This section contains the Data Definition Language (DDL) files for the NBA analytics database. It includes comprehensive details on the structure of tables, the definitions of columns, and the semantic meanings behind the data stored. This information is crucial for database administrators, data engineers, and analysts who need to understand or modify the database schema.
+This section contains the Data Definition Language (DDL) files for the NBA analytics database. It includes comprehensive details on the structure of tables, the definitions of columns, and the semantic meanings of the data stored within. This information is crucial for database administrators, data analysts, and developers working with the NBA analytics data to ensure accurate data manipulation and retrieval.
 
 ## Contents
 
 - **dwh_d_games**: Schema and column definitions for the games table, detailing each NBA game.
 - **dwh_d_players**: Structure and descriptions of the players table, including player-specific data.
-- **dwh_d_player_nicknames**: Table schema for player nicknames, linking players to their known aliases.
-- **dwh_d_teams**: Definitions and structure for the teams table, covering all NBA teams.
-- **dwh_f_player_awards**: Schema for player awards, detailing accolades received by players.
-- **dwh_f_player_boxscore**: Structure of the player boxscore table, capturing individual game performance statistics.
-- **dwh_f_player_team_seasons**: Definitions for player team seasons, tracking player participation across seasons.
-- **dwh_f_player_tracking**: Schema for player tracking data, providing advanced metrics and movement data.
-- **dwh_f_team_boxscore**: Structure of the team boxscore table, summarizing team performance in games.
-- **dwh_f_team_championships**: Definitions for team championships, documenting championship wins by teams.
+- **dwh_d_player_nicknames**: Details on the player nicknames table, mapping players to their known aliases.
+- **dwh_d_teams**: Schema for the teams table, covering all NBA teams and their attributes.
+- **dwh_f_player_awards**: Information on the player awards fact table, documenting awards received by players.
+- **dwh_f_player_boxscore**: Definitions for the player boxscore fact table, capturing individual game performance metrics.
+- **dwh_f_player_team_seasons**: Structure of the player team seasons fact table, tracking player participation across seasons.
+- **dwh_f_player_tracking**: Schema for the player tracking fact table, providing advanced metrics on player movements and actions.
+- **dwh_f_team_boxscore**: Details of the team boxscore fact table, summarizing team performance in games.
+- **dwh_f_team_championships**: Schema for the team championships fact table, recording championship wins by teams.

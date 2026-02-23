@@ -72,9 +72,6 @@ def _strip_llm_fences(llm_output: str) -> str:
     block even when instructed not to. This helper detects and removes those
     outer fences so the raw frontmatter (---) is at the very top of the file.
 
-    This does NOT touch ``` fences that appear INSIDE the content body
-    (e.g., the ```sql block inside the DDL section) — only the outermost wrap.
-
     Parameters
     ----------
     llm_output : str
@@ -85,30 +82,14 @@ def _strip_llm_fences(llm_output: str) -> str:
     str
         Cleaned content guaranteed to start with --- if the LLM correctly
         generated YAML frontmatter.
-
-    Examples
-    --------
-    If the LLM returns its output wrapped in a markdown fence like::
-
-        ```markdown
-        ---
-        name: players
-        ---
-        # Players Table
-        ```
-
-    This function strips the outer fence and returns only the inner content
-    starting from the ``---`` frontmatter delimiter.
     """
     stripped = llm_output.strip()
 
-    # Detect outer fence: starts with ``` (optional language tag) and ends with ```
     outer_fence = re.match(r"^```[a-zA-Z]*\n(.*)\n```$", stripped, re.DOTALL)
     if outer_fence:
         return outer_fence.group(1).strip()
 
     return stripped
-
 
 
 _TABLE_FILE_SYSTEM_PROMPT = """
@@ -182,7 +163,7 @@ def generate_table_md_file(
         If the GPT-4 API call fails after retries.
     """
     user_prompt = f"""
-        Generate a knowledge base markdown file for the following NBA database table.
+        Generate a knowledge base markdown file for the following database table.
         
         Domain: {domain}
         Table name: {table_name}
@@ -194,7 +175,7 @@ def generate_table_md_file(
         ---
         name: {table_name}
         description: "WRITE A RICH DESCRIPTION HERE. Start with: Use when the query involves..."
-          Include all NBA terminology users might use when asking about this data.
+          Include all {domain} relevant terminology users might use when asking about this data.
           This is the most important field — make it comprehensive (3-5 sentences).
         tags: [tag1, tag2, tag3]
         priority: high | medium | low
@@ -208,7 +189,7 @@ def generate_table_md_file(
         
         ## Column Semantics
         For each column, explain:
-        - Business meaning in NBA context
+        - Business meaning in {domain} context
         - Value ranges or example values if inferrable
         - Whether it's typically used in WHERE, GROUP BY, or SELECT
         - Any gotchas (nullable, approximate values, etc.)
@@ -228,11 +209,10 @@ def generate_table_md_file(
     response = _client.chat.completions.create(
         model=OPENAI_GENERATION_MODEL,
         messages=messages,
-        temperature=0.2,    # Low temperature for consistent, accurate output
+        temperature=0.2,
         max_tokens=2000,
     )
 
-    # Strip outer markdown fences in case the LLM wraps the whole response
     return _strip_llm_fences(response.choices[0].message.content.strip())
 
 
@@ -299,7 +279,7 @@ def generate_section_kb_md(
     return _strip_llm_fences(response.choices[0].message.content.strip())
 
 
-def generate_root_kb_md(sections: dict[str, str]) -> str:
+def generate_root_kb_md(sections: dict[str, str], domain: str = "NBA basketball analytics") -> str:
     """
     Generate the root KB.md file that describes the entire knowledge base.
 
@@ -323,7 +303,7 @@ def generate_root_kb_md(sections: dict[str, str]) -> str:
     )
 
     user_prompt = f"""
-        Generate the root KB.md for an NBA basketball analytics knowledge base.
+        Generate the root KB.md for the {domain} knowledge base.
         
         Sections:
         {section_list}
@@ -331,10 +311,10 @@ def generate_root_kb_md(sections: dict[str, str]) -> str:
         Required format:
         ---
         name: root_knowledge_base
-        description: "Root index of the NBA analytics knowledge base."
+        description: "Root index of the {domain} knowledge base."
         ---
         
-        # NBA Analytics Knowledge Base
+        # {domain} Knowledge Base
         
         [2-3 sentence overview of the entire KB]
         
@@ -402,7 +382,7 @@ def generate_all_table_files(
         output_path = output_dir / f"{table_name}.md"
 
         if output_path.exists() and not overwrite:
-            print(f"[kb_generator] Skipping {table_name}.md (already exists). Use overwrite=True to regenerate.")
+            print(f"[kb_generator] Skipping {table_name}.md Use overwrite=True to regenerate.")
             continue
 
         print(f"[kb_generator] Generating {table_name}.md ...")
@@ -410,9 +390,8 @@ def generate_all_table_files(
 
         output_path.write_text(content, encoding="utf-8")
         written_files.append(output_path)
-        print(f"[kb_generator] ✓ Written: {output_path}")
+        print(f"[kb_generator] Written: {output_path}")
 
-    # Generate the DDL section KB.md index file
     ddl_kb_path = output_dir / "KB.md"
     if not ddl_kb_path.exists() or overwrite:
         print("[kb_generator] Generating ddl/KB.md ...")
@@ -425,7 +404,6 @@ def generate_all_table_files(
         written_files.append(ddl_kb_path)
         print(f"[kb_generator] ✓ Written: {ddl_kb_path}")
 
-    # Generate the root KB.md
     root_kb_path = KB_ROOT / "KB.md"
     if not root_kb_path.exists() or overwrite:
         KB_ROOT.mkdir(parents=True, exist_ok=True)
@@ -440,7 +418,7 @@ def generate_all_table_files(
         )
         root_kb_path.write_text(root_content, encoding="utf-8")
         written_files.append(root_kb_path)
-        print(f"[kb_generator] ✓ Written: {root_kb_path}")
+        print(f"[kb_generator] Written: {root_kb_path}")
 
     return written_files
 
@@ -490,14 +468,10 @@ def generate_all_kb_files(
     """
     Top-level entry point: generate ALL KB markdown files in one call.
 
-    This is the function called by ``python main.py generate``. It runs the
-    full generation sequence:
-
     1. DDL table files (one .md per table, LLM-generated from CREATE TABLE SQL)
     2. DDL section KB.md index  (LLM-generated listing of all tables)
     3. Root KB.md               (LLM-generated overview of all sections)
     4. Static section files     (sql_guidelines, business_rules, response_guidelines)
-       written from pre-authored sample content in sample_values_for_testing.py
 
     After running this, review and edit the .md files, then run:
         python main.py build
@@ -508,7 +482,6 @@ def generate_all_kb_files(
     ddl_dict : dict[str, str] | None
         Mapping of table_name → raw CREATE TABLE SQL string.
         If None, uses Sample_NBA_DDL_DICT from sample_values_for_testing.py.
-        Replace this with your own DDL extraction script output in production.
     overwrite : bool
         If False (default), existing .md files are not regenerated.
         Set to True to force-regenerate all files (e.g. after schema changes).
@@ -517,16 +490,13 @@ def generate_all_kb_files(
     print("  NBA Knowledge Base — File Generation")
     print("=" * 60)
 
-    # Use sample NBA DDL if no custom ddl_dict is provided
     if ddl_dict is None:
         print("[kb_generator] No ddl_dict provided — using Sample_NBA_DDL_DICT.")
         ddl_dict = Sample_NBA_DDL_DICT
 
-    # ── Step 1 & 2 & 3: DDL table files + DDL KB.md + root KB.md ──
     print("\n[kb_generator] Generating DDL table files + index files via LLM...")
     generate_all_table_files(ddl_dict=ddl_dict, overwrite=overwrite)
 
-    # ── Step 4: Static section files (sql_guidelines, business_rules, etc.) ──
     print("\n[kb_generator] Writing static section files (sql/business/response guidelines)...")
     generate_static_section_files(overwrite=overwrite)
 

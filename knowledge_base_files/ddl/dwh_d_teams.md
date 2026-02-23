@@ -1,7 +1,7 @@
 ---
 name: dwh_d_teams
-description: "Use when the query involves retrieving information about NBA teams, such as their full names, abbreviations, nicknames, and locations. This table is essential for understanding team-specific data, including historical context like the year a team was founded and its current status in the league. It is particularly useful for queries involving team affiliations, conference and division alignments, and active status checks. Ideal for analyses that require filtering or grouping by team characteristics or for joining with player statistics and game results."
-tags: [teams, nba, conference, division, active_status]
+description: "Use when the query involves retrieving information about NBA teams, such as their full names, abbreviations, nicknames, and geographical details like city and state. This table is essential for understanding team-specific data, including historical context with the year founded, and organizational structure with conference and division affiliations. It is also useful for filtering teams based on their active status in the league."
+tags: [teams, NBA, conference, division, active status]
 priority: medium
 ---
 
@@ -24,26 +24,26 @@ CREATE TABLE dwh_d_teams (
 
 ## Column Semantics
 
-- **team_id**: A unique identifier for each NBA team. Typically used in JOIN operations with other tables like player statistics or game results.
-- **full_name**: The official full name of the team, e.g., "Los Angeles Lakers". Useful in SELECT statements for display purposes.
-- **abbreviation**: A short form of the team name, such as "LAL" for Los Angeles Lakers. Commonly used in WHERE clauses for filtering or in SELECT for concise output.
-- **nickname**: The team's commonly used nickname, e.g., "Lakers". Often used interchangeably with the full name in casual contexts.
-- **city**: The city where the team is based, e.g., "Los Angeles". Useful for geographical analyses or filtering.
-- **state**: The state where the team is located, e.g., "California". Can be used for regional analyses.
-- **year_founded**: The year the team was established. Useful for historical analyses or filtering teams by age.
-- **conference**: The conference to which the team belongs, either "Eastern" or "Western". Essential for grouping or filtering teams by conference.
-- **division**: The division within the conference, such as "Pacific". Important for more granular grouping or filtering.
-- **active_status**: Indicates whether the team is currently active in the NBA. Typically "active" or "inactive", used in WHERE clauses to filter current teams.
+- **team_id**: A unique identifier for each team. Typically used in JOIN operations with other tables to link team-specific data.
+- **full_name**: The complete name of the team, such as "Los Angeles Lakers". Used in SELECT statements for display purposes.
+- **abbreviation**: A short form of the team name, like "LAL" for Los Angeles Lakers. Commonly used in reports and visualizations.
+- **nickname**: The informal name of the team, such as "Lakers". Useful in SELECT and WHERE clauses for user-friendly outputs.
+- **city**: The city where the team is based, e.g., "Los Angeles". Often used in geographical analyses or fan base studies.
+- **state**: The state where the team is located, such as "California". Useful for regional analyses.
+- **year_founded**: The year the team was established, providing historical context. Can be used in historical trend analyses.
+- **conference**: The conference to which the team belongs, either "Eastern" or "Western". Important for filtering and grouping teams.
+- **division**: The division within the conference, such as "Pacific". Used in grouping and filtering operations.
+- **active_status**: Indicates if the team is currently active in the NBA, typically "active" or "inactive". Essential for filtering current teams.
 
 ## Common Query Patterns
 
 - Retrieve all active teams in the Western Conference: `SELECT * FROM dwh_d_teams WHERE conference = 'Western' AND active_status = 'active';`
-- List all teams founded before 1980: `SELECT full_name FROM dwh_d_teams WHERE year_founded < '1980';`
-- Find teams by city and state: `SELECT full_name FROM dwh_d_teams WHERE city = 'Los Angeles' AND state = 'California';`
-- Group teams by division and count: `SELECT division, COUNT(*) FROM dwh_d_teams GROUP BY division;`
+- List all teams founded before 1970: `SELECT full_name FROM dwh_d_teams WHERE year_founded < '1970';`
+- Find teams by city: `SELECT full_name FROM dwh_d_teams WHERE city = 'Los Angeles';`
+- Get team abbreviations for a specific division: `SELECT abbreviation FROM dwh_d_teams WHERE division = 'Atlantic';`
 
 ## Join Relationships
 
-- **Player Statistics**: Typically joined on `team_id` to associate players with their respective teams.
-- **Game Results**: Joined on `team_id` to link teams with game outcomes.
-- **Conference and Division Tables**: May join on `conference` and `division` for detailed league structure analyses.
+- Typically joined with player tables using `team_id` to associate players with their respective teams.
+- Can be joined with game or match tables to filter or group results by team attributes like conference or division.
+- Useful in conjunction with historical performance tables to analyze team success over time.

@@ -1,6 +1,6 @@
 ---
 name: dwh_d_games
-description: "Use when the query involves retrieving detailed information about NBA games, including scores, teams, and game logistics. This table is essential for analyzing game outcomes, comparing team performances, and understanding game schedules. It includes data on regular season and playoff games, making it crucial for historical analysis and trend identification across different NBA seasons. Ideal for queries focusing on game results, team matchups, and venue details."
+description: "Use when the query involves retrieving detailed information about NBA games, such as game schedules, scores, and team matchups. This table is essential for analyzing game outcomes, comparing team performances, and understanding game contexts like season type and playoff rounds. It is particularly useful for queries that need to distinguish between regular season and playoff games, or when examining game-specific details like the arena or game timing."
 tags: [games, scores, teams, schedule]
 priority: high
 ---
@@ -28,28 +28,28 @@ CREATE TABLE dwh_d_games (
 ## Column Semantics
 
 - **game_id**: A unique identifier for each game, typically used in JOINs and WHERE clauses to filter specific games.
-- **gamecode**: A code representing the game, often used interchangeably with game_id for identification.
-- **season_year**: The year in which the NBA season started, e.g., '2022' for the 2022-2023 season. Useful for filtering data by season.
-- **season**: Describes the part of the season, such as 'Regular' or 'Playoffs'. Important for distinguishing between regular season and playoff games.
-- **game_date**: The date on which the game was played. Commonly used in WHERE clauses for date filtering.
-- **game_time**: The time the game started, typically in local time. Useful for scheduling and time-based analysis.
-- **arena_name**: The name of the arena where the game took place. Can be used to analyze home court advantages or venue-specific statistics.
-- **home_team_id**: Identifier for the home team, used in JOINs with team tables to get more team details.
-- **visitor_team_id**: Identifier for the visiting team, similar usage as home_team_id.
+- **gamecode**: A code representing the game, often used for internal tracking or referencing in other systems.
+- **season_year**: The year in which the season starts, e.g., '2023'. Useful for filtering games by season.
+- **season**: Describes the part of the NBA season, such as 'Regular Season' or 'Playoffs'. Important for distinguishing game contexts.
+- **game_date**: The date the game was played. Commonly used in WHERE clauses to filter games by date range.
+- **game_time**: The time the game started, local to the arena's time zone. Used less frequently but can be important for time-specific analyses.
+- **arena_name**: The name of the arena where the game was played. Useful for location-based queries or analyses.
+- **home_team_id**: The identifier for the home team. Essential for JOINs with team tables to get team details.
+- **visitor_team_id**: The identifier for the visiting team. Also used in JOINs with team tables.
 - **home_score**: The final score of the home team. Used in SELECT statements to analyze game outcomes.
-- **visitor_score**: The final score of the visiting team. Also used in SELECT statements for outcome analysis.
-- **game_type**: Indicates the type of game, such as 'Regular' or 'Playoff'. Important for filtering and analysis based on game significance.
-- **playoff_round**: Specifies the playoff round, e.g., 'First Round', 'Finals'. Relevant only for playoff games, used in filtering and analysis of playoff progression.
+- **visitor_score**: The final score of the visiting team. Similarly used to determine game results.
+- **game_type**: Indicates the type of game, such as 'Regular' or 'Playoff'. Important for filtering and analysis.
+- **playoff_round**: Specifies the playoff round if applicable, e.g., 'First Round', 'Finals'. Critical for playoff-specific analyses.
 
 ## Common Query Patterns
 
-- Retrieve all games for a specific season: `WHERE season_year = '2022'`
-- Compare scores between home and visitor teams: `SELECT home_score, visitor_score WHERE game_id = '12345'`
-- Filter games by type and round: `WHERE game_type = 'Playoff' AND playoff_round = 'Finals'`
-- Join with team details: `JOIN team_table ON dwh_d_games.home_team_id = team_table.team_id`
+- Retrieve all games for a specific season and team: `WHERE season_year = '2023' AND (home_team_id = 'XYZ' OR visitor_team_id = 'XYZ')`
+- Analyze game outcomes by comparing home and visitor scores: `SELECT game_id, home_score, visitor_score WHERE home_score > visitor_score`
+- Filter games by type and playoff round: `WHERE game_type = 'Playoff' AND playoff_round = 'Finals'`
+- List games played at a specific arena: `WHERE arena_name = 'Staples Center'`
 
 ## Join Relationships
 
-- **home_team_id** and **visitor_team_id** typically join with a team dimension table to fetch team names and other details.
-- **game_id** can be used to join with player performance tables to analyze individual performances in specific games.
-- **arena_name** might join with an arena dimension table for additional venue information.
+- Typically joined with a team dimension table using `home_team_id` and `visitor_team_id` to get detailed team information.
+- Can be joined with a player statistics table using `game_id` to analyze player performances in specific games.
+- Often used in conjunction with a calendar table to enrich date-based analyses.
