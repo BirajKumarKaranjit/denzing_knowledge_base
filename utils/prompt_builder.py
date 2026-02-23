@@ -69,8 +69,6 @@ def build_sql_prompt(
     always_inject: dict = retrieval_result.get("always_inject", {})
     section_entry_points: dict = retrieval_result.get("section_entry_points", {})
 
-    # ── Build citations from matched tables ──
-    # citations is a list[TableCitation] used for both XML and markdown output
     citations: list[TableCitation] = build_citations(matched_tables)
     citation_xml: str = format_citations_as_xml(citations)
     citation_md: str = format_citations_for_user(citations)

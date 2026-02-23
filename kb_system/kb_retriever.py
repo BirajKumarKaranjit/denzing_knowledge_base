@@ -75,15 +75,10 @@ def classify_sections(user_query: str) -> list[str]:
     matched_sections: set[str] = set()
 
     for section, keywords in SECTION_KEYWORDS.items():
-        # Section is relevant if ANY keyword from its list appears in the query
         if any(kw in query_lower for kw in keywords):
             matched_sections.add(section)
 
-    # Safety net: always include DDL for NBA analytics queries
-    # since almost every SQL question requires schema knowledge
     matched_sections.add("ddl")
-
-    # Put ddl first (most important), then others alphabetically
     ordered = ["ddl"]
     for section in sorted(matched_sections):
         if section != "ddl":
@@ -136,23 +131,19 @@ def retrieve_context_for_query(
     """
     print(f"\n[kb_retriever] Query: '{user_query[:80]}...' " if len(user_query) > 80 else f"\n[kb_retriever] Query: '{user_query}'")
 
-    # ── Stage 1: Embed query + classify sections ──
     print("[kb_retriever] Stage 1: Embedding query and classifying sections...")
     query_embedding = get_embedding(user_query)
     target_sections = classify_sections(user_query)
     print(f"[kb_retriever] → Searching sections: {target_sections}")
 
-    # ── Stage 2: Vector search within each classified section ──
     print(f"[kb_retriever] Stage 2: Searching within {len(target_sections)} section(s)...")
     all_matched_tables: list[dict] = []
     section_entry_points: dict[str, dict | None] = {}
 
     for section in target_sections:
-        # Fetch the section's KB.md for context injection
         entry_point = get_entry_point(conn, section)
         section_entry_points[section] = entry_point
 
-        # Run vector similarity search within this section
         tables = retrieve_similar_tables(
             conn=conn,
             query_embedding=query_embedding,

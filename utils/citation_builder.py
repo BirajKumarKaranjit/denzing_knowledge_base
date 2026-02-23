@@ -1,98 +1,179 @@
+"""
+Builds structured citations explaining how KB retrieval selected the tables
+that were injected into the SQL generation prompt.
 
-from dataclasses import dataclass
+PURPOSE — two audiences:
+    1. The LLM (via XML in the prompt)
+       Gives the model an explicit "approved table manifest" before it reads
+       the schemas. This prevents it from hallucinating table names it was
+       not given. Placed at the top of the SQL prompt.
 
+    2. The end user (via markdown in the API/UI response)
+       Shows which KB files were retrieved, why (description snippet that
+       matched), and how confident the system is. Satisfies your senior's
+       requirement for retrieval transparency.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
 
 @dataclass
 class TableCitation:
     """
-    Represents a single citation for a retrieved KB table.
+    Structured citation for a single retrieved KB table file.
 
-    Shown to the end user alongside the SQL result so they understand
-    WHICH tables were used, WHY they were selected (relevance score),
-    and WHERE the information came from in the KB.
+    One of these is created per matched table in the retrieval result.
+    The collection of citations is used to produce both the XML block
+    injected into the LLM prompt and the markdown shown to the end user.
+
+    Attributes
+    ----------
+    rank : int
+    table_name : str
+    file_path : str
+    description_snippet : str
+    relevance_score : float
+    retrieval_method : str
+    confidence_label : str
     """
+
+    rank: int
     table_name: str
     file_path: str
-    description: str
+    description_snippet: str
     relevance_score: float
     retrieval_method: str
-    matched_on: str
+    confidence_label: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Derive confidence label from relevance score after dataclass init."""
+        if self.relevance_score >= 0.75:
+            self.confidence_label = "High"
+        elif self.relevance_score >= 0.55:
+            self.confidence_label = "Medium"
+        elif self.relevance_score >= 0.35:
+            self.confidence_label = "Low"
+        else:
+            self.confidence_label = "Very Low"
 
 
-def build_citations(matched_tables: list[dict]) -> list[TableCitation]:
+def build_citations(matched_tables: list[dict[str, Any]]) -> list[TableCitation]:
     """
-    Build structured citation objects from retrieved KB table records.
-
+    Convert raw KB retrieval results into structured TableCitation objects.
     Parameters
     ----------
     matched_tables : list[dict]
-        Output from kb_retriever — list of matched table records with
-        metadata, content, relevance_score, and retrieval_method fields.
-
     Returns
     -------
     list[TableCitation]
-        One citation per retrieved table, ordered by relevance score.
     """
-    citations = []
-    for table in matched_tables:
-        metadata = table.get("metadata", {})
-        citations.append(TableCitation(
-            table_name=metadata.get("name", table["file_path"]),
-            file_path=table["file_path"],
-            description=metadata.get("description", "")[:200],
-            relevance_score=round(table.get("relevance_score", 0.0), 4),
+    citations: list[TableCitation] = []
+
+    for rank, table in enumerate(matched_tables, start=1):
+        metadata = table.get("metadata") or {}
+
+        table_name = (metadata.get("name") or "").strip() or table.get("file_path", "unknown")
+
+        description = (metadata.get("description") or "").strip()
+        # Truncate for display — 200 chars is enough to explain the match reason
+        if len(description) > 200:
+            description_snippet = description[:200].rstrip() + "..."
+        else:
+            description_snippet = description
+
+        citation = TableCitation(
+            rank=rank,
+            table_name=table_name,
+            file_path=table.get("file_path", ""),
+            description_snippet=description_snippet,
+            relevance_score=round(float(table.get("relevance_score", 0.0)), 4),
             retrieval_method=table.get("retrieval_method", "vector_similarity"),
-            matched_on=f"Embedding of: \"{metadata.get('name', '')}: {metadata.get('description', '')[:80]}...\""
-        ))
+        )
+        citations.append(citation)
+
     return citations
+
+def format_citations_as_xml(citations: list[TableCitation]) -> str:
+    """
+    Render citations as an XML block for injection into the SQL prompt.
+    Parameters
+    ----------
+    citations : list[TableCitation]
+
+    Returns
+    -------
+    str
+    """
+    if not citations:
+        return (
+            "<kb_retrieval_citations>\n"
+            "  <warning>No tables were retrieved from the Knowledge Base for this query.\n"
+            "  Do NOT invent table names or column names. If valid SQL cannot be generated\n"
+            "  from the provided information, return an empty SQL block.</warning>\n"
+            "</kb_retrieval_citations>"
+        )
+
+    methods_used = sorted({c.retrieval_method for c in citations})
+    method_str = " + ".join(methods_used)
+
+    lines: list[str] = [
+        "<kb_retrieval_citations>",
+        "  <instruction>Generate SQL using ONLY the tables listed below. "
+        "Do not reference any table or column not present in this list.</instruction>",
+        f"  <summary>{len(citations)} table(s) retrieved via {method_str}</summary>",
+    ]
+
+    for c in citations:
+        lines.append(
+            f'  <citation rank="{c.rank}" table="{c.table_name}" '
+            f'score="{c.relevance_score}" confidence="{c.confidence_label}">'
+        )
+        lines.append(f"    <source_file>{c.file_path}</source_file>")
+        lines.append(f"    <match_reason>{c.description_snippet}</match_reason>")
+        lines.append("  </citation>")
+
+    lines.append("</kb_retrieval_citations>")
+    return "\n".join(lines)
 
 
 def format_citations_for_user(citations: list[TableCitation]) -> str:
     """
-    Format citations as a human-readable string for display to the end user.
+    Render citations as human-readable markdown for the end user.
 
-    This is shown BELOW the SQL result so the user understands how
-    the KB retrieved the relevant schema context.
+    Parameters
+    ----------
+    citations : list[TableCitation]
+    Returns
+    -------
+    str
+
     """
     if not citations:
-        return "No KB tables were retrieved — SQL generated from full schema fallback."
+        return (
+            "### Knowledge Base Citations\n\n"
+            "**No KB tables matched this query.**\n\n"
+            "SQL was generated without Knowledge Base context. "
+            "This increases the risk of hallucinated column or table names. "
+            "Consider improving the `description` and `example_queries` fields "
+            "in your `.md` files, or lowering `SIMILARITY_THRESHOLD` in `config.py`."
+        )
+    lines: list[str] = [
+        "###Knowledge Base Citations",
+        "",
+        "The following tables were retrieved from the Knowledge Base to generate this SQL:",
+        "",
+    ]
 
-    lines = ["**Knowledge Base Citations**", ""]
-    lines.append("The following tables were retrieved from the Knowledge Base to generate this SQL:\n")
-
-    for i, c in enumerate(citations, 1):
-        lines.append(f"**[{i}] `{c.table_name}`**")
-        lines.append(f"   - **Source:** `{c.file_path}`")
-        lines.append(f"   - **Relevance Score:** {c.relevance_score:.4f} ({_score_label(c.relevance_score)})")
-        lines.append(f"   - **Why retrieved:** {c.description[:150]}...")
-        lines.append(f"   - **Method:** {c.retrieval_method}")
+    for c in citations:
+        lines.append(
+            f"**[{c.rank}] `{c.table_name}`** — "
+            f"{c.confidence_label} confidence (score: {c.relevance_score})"
+        )
+        lines.append(f"   - **Source file:** `{c.file_path}`")
+        lines.append(f"   - **Why selected:** {c.description_snippet}")
+        lines.append(f"   - **Retrieval method:** {c.retrieval_method}")
         lines.append("")
 
     return "\n".join(lines)
-
-
-def format_citations_as_xml(citations: list[TableCitation]) -> str:
-    """
-    Format citations as XML for injection into the SQL prompt.
-
-    This tells the LLM explicitly which tables were retrieved and why,
-    reducing hallucination of non-retrieved tables.
-    Mirrors the <knowledge_base> injection format from the PRD (Section 11.2).
-    """
-    lines = ["<retrieval_citations>"]
-    for c in citations:
-        lines.append(f'  <citation table="{c.table_name}" score="{c.relevance_score}" method="{c.retrieval_method}">')
-        lines.append(f'    <reason>{c.description[:200]}</reason>')
-        lines.append(f'  </citation>')
-    lines.append("</retrieval_citations>")
-    return "\n".join(lines)
-
-
-def _score_label(score: float) -> str:
-    if score >= 0.75:
-        return "High confidence"
-    elif score >= 0.55:
-        return "Medium confidence"
-    else:
-        return "Low confidence — verify SQL carefully"

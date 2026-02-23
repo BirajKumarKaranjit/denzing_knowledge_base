@@ -176,7 +176,6 @@ def status_kb() -> None:
         print("[kb_builder] No files found in database. Run 'python main.py build' first.")
         return
 
-    # Group by section for readable output
     by_section: dict[str, list[dict]] = {}
     for f in files:
         by_section.setdefault(f["section"], []).append(f)

@@ -206,28 +206,13 @@ def retrieve_similar_tables(
     (e.g., "ddl") and only against non-entry-point files (individual table
     files like players.md). Returns results sorted by relevance score descending.
 
-    The SQL uses the <=> operator which computes cosine distance.
-    We convert to similarity score as: similarity = 1 - cosine_distance.
-
     Parameters
     ----------
     conn : psycopg2.connection
-        Open database connection.
     query_embedding : list[float]
-        Embedding of the user's natural language query (1536 floats).
-        Must be computed with the same model used to embed KB descriptions.
     section : str
-        Which KB section to search within. Using section scoping means we
-        search maybe 8-15 table files instead of the entire KB — this is
-        the key efficiency win over searching all files flat.
     top_k : int
-        Maximum number of tables to return.
     similarity_threshold : float
-        Minimum cosine similarity (0-1) for inclusion. Tables scoring below
-        this are excluded even if they're the closest match. Prevents
-        returning irrelevant tables when the query is about a topic not
-        covered in the KB.
-
     Returns
     -------
     list[dict]
@@ -269,8 +254,6 @@ def retrieve_similar_tables(
             ),
         )
         rows = cur.fetchall()
-
-    # Convert RealDictRow to plain dicts and parse metadata JSONB string
     results = []
     for row in rows:
         record = dict(row)
