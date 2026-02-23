@@ -1,20 +1,27 @@
 """
-kb_system/prompt_builder.py
-----------------------------
+utils/prompt_builder.py
+------------------------
 Assembles the final SQL generation prompt from retrieved KB context.
 
 Takes the structured output from kb_retriever.retrieve_context_for_query()
 and formats it into a prompt string ready to send to the LLM.
 
 Prompt structure:
-    1. System instruction
-    2. Always-inject sections (sql_guidelines, response_guidelines)
-    3. Section entry points (KB.md context for each searched section)
-    4. Matched table DDL (the actual CREATE TABLE statements + column docs)
-    5. User question
+    1. System instruction + agent backstory
+    2. Anti-hallucination citation manifest (XML)
+    3. Always-inject sections (response_guidelines)
+    4. SQL guidelines entry point overview (KB.md header)
+    5. Matched SQL guideline sub-files (joins.md, aggregations.md, etc.)
+    6. Section entry points (DDL KB.md context)
+    7. Matched table DDL schemas (the actual CREATE TABLE + column docs)
+    8. User question
 
 The matched table content (DDL) is the most important part — it gives the
 LLM the schema it needs to write correct SQL without hallucinating columns.
+
+The matched_sql_guidelines (new in this version) allows the prompt to include
+only the guideline categories relevant to the query (e.g., only aggregations.md
+for a totals query) instead of the entire monolithic sql_guidelines KB.md.
 """
 
 from __future__ import annotations
@@ -42,10 +49,12 @@ def build_sql_prompt(
     Prompt section order:
         [1] System header (role + hard constraint: only use listed tables)
         [2] <kb_retrieval_citations> XML  ← anti-hallucination manifest
-        [3] Always-inject sections (sql_guidelines, response_guidelines)
-        [4] Section entry point overviews (KB.md files)
-        [5] Matched table schemas with rank-numbered headers
-        [6] User question
+        [3] Always-inject sections (response_guidelines)
+        [4] SQL Guidelines entry point overview (KB.md)
+        [5] Matched SQL guideline sub-files (joins.md, aggregations.md, etc.)
+        [6] Section entry point overviews (DDL KB.md files)
+        [7] Matched table schemas with rank-numbered headers
+        [8] User question
 
     Parameters
     ----------
@@ -53,7 +62,8 @@ def build_sql_prompt(
         The original natural language question from the user.
     retrieval_result : dict
         Output from kb_retriever.retrieve_context_for_query().
-        Expected keys: matched_tables, section_entry_points, always_inject.
+        Expected keys: matched_tables, matched_sql_guidelines,
+        section_entry_points, always_inject, sql_guidelines_entry.
     agent_backstory : str
         Optional agent persona to prepend to the system header.
         Pass "" if not needed.
@@ -68,6 +78,8 @@ def build_sql_prompt(
     matched_tables: list[dict] = retrieval_result.get("matched_tables", [])
     always_inject: dict = retrieval_result.get("always_inject", {})
     section_entry_points: dict = retrieval_result.get("section_entry_points", {})
+    matched_sql_guidelines: list[dict] = retrieval_result.get("matched_sql_guidelines", [])
+    sql_guidelines_entry: dict | None = retrieval_result.get("sql_guidelines_entry")
 
     citations: list[TableCitation] = build_citations(matched_tables)
     citation_xml: str = format_citations_as_xml(citations)
@@ -75,6 +87,7 @@ def build_sql_prompt(
 
     sections: list[str] = []
 
+    # ── [1] System header ───────────────────────────────────────────────────
     system_header = (
         "You are an expert SQL analyst.\n"
         "Generate a valid, efficient SQL query to answer the user's question.\n"
@@ -87,18 +100,42 @@ def build_sql_prompt(
         system_header = f"{agent_backstory}\n\n{system_header}"
     sections.append(system_header)
 
+    # ── [2] Anti-hallucination citation manifest ────────────────────────────
     sections.append(citation_xml)
 
+    # ── [3] Always-inject sections (response_guidelines) ───────────────────
     for section_name, entry in always_inject.items():
         if entry and entry.get("content"):
             label = section_name.replace("_", " ").upper()
             sections.append(f"## {label}\n\n{entry['content']}")
 
+    # ── [4] SQL guidelines section entry point overview ─────────────────────
+    # The KB.md header gives the LLM a summary of what SQL guidelines are available.
+    if sql_guidelines_entry and sql_guidelines_entry.get("content"):
+        sections.append(f"## SQL GUIDELINES OVERVIEW\n\n{sql_guidelines_entry['content']}")
+
+    # ── [5] Matched SQL guideline sub-files ─────────────────────────────────
+    # Only inject the guideline categories that are relevant to this query.
+    # E.g., a join-heavy query → joins.md; a totals query → aggregations.md.
+    if matched_sql_guidelines:
+        guideline_blocks: list[str] = []
+        for guideline in matched_sql_guidelines:
+            content = guideline.get("content", "").strip()
+            name = guideline.get("metadata", {}).get("name", guideline["file_path"])
+            if content:
+                guideline_blocks.append(f"### {name.replace('_', ' ').title()}\n\n{content}")
+        if guideline_blocks:
+            sections.append(
+                "## RELEVANT SQL GUIDELINES\n\n" + "\n\n---\n\n".join(guideline_blocks)
+            )
+
+    # ── [6] Section entry point overviews (DDL KB.md) ───────────────────────
     for section_name, entry in section_entry_points.items():
         if entry and entry.get("content"):
             label = f"{section_name.upper()} SECTION OVERVIEW"
             sections.append(f"## {label}\n\n{entry['content']}")
 
+    # ── [7] Matched table schemas ────────────────────────────────────────────
     if matched_tables:
         table_blocks: list[str] = []
 
@@ -122,7 +159,9 @@ def build_sql_prompt(
             "Return an empty SQL block if valid SQL cannot be generated."
         )
 
+    # ── [8] User question ────────────────────────────────────────────────────
     sections.append(f"## USER QUESTION\n\n{user_query}")
 
     prompt_str = "\n\n".join(sections)
     return prompt_str, citation_md
+

@@ -51,7 +51,13 @@ import openai
 from openai.types.chat import ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.config import OPENAI_API_KEY, OPENAI_GENERATION_MODEL, KB_SECTIONS, KB_ROOT
+from utils.config import (
+    OPENAI_API_KEY,
+    OPENAI_GENERATION_MODEL,
+    KB_SECTIONS,
+    KB_ROOT,
+    SQL_GUIDELINES_SUB_SECTIONS,
+)
 from utils.sample_values_for_testing import (
     Sample_NBA_DDL_DICT,
     sql_guidelines_content,
@@ -423,6 +429,186 @@ def generate_all_table_files(
     return written_files
 
 
+_SQL_GUIDELINES_SUB_SYSTEM_PROMPT = """
+    You are a SQL expert specialising in Postgres and NBA analytics databases.
+    Generate a knowledge base markdown file for a specific SQL guideline category.
+
+    The file has two parts:
+    1. YAML frontmatter — contains name, description, tags, priority.
+       The 'description' field MUST start with "Use when the query involves..."
+       and must be rich and specific so that a vector search can match it
+       against user queries that need this type of SQL guidance.
+    2. Markdown body — practical SQL patterns, templates, and gotchas for this
+       guideline category. Include concrete SQL code blocks for the NBA schema.
+
+    Tables available in the NBA schema:
+    - dwh_d_players, dwh_d_teams, dwh_d_games, dwh_d_player_nicknames
+    - dwh_f_player_boxscore, dwh_f_team_boxscore, dwh_f_player_tracking
+    - dwh_f_player_awards, dwh_f_player_team_seasons, dwh_f_team_championships
+
+    Return ONLY the markdown content. No explanations, no code fences around the whole output.
+"""
+
+
+def generate_sql_guideline_sub_file(sub_section: str) -> str:
+    """
+    Call GPT-4 to generate a SQL guideline sub-file for one guideline category.
+
+    Each sub-file (joins.md, aggregations.md, filters.md, etc.) is an
+    independently embeddable document with rich frontmatter description and
+    practical SQL patterns for that specific category. At retrieval time, only
+    the sub-files relevant to the user's query are injected into the prompt.
+
+    Unlike the monolithic sql_guidelines/KB.md (which is always injected),
+    these sub-files are retrieved by vector similarity — so a simple player
+    lookup query won't get aggregation or join guidelines injected.
+
+    Parameters
+    ----------
+    sub_section : str
+        Name of the SQL guideline category (e.g., "joins", "aggregations",
+        "filters", "comparisons", "date_handling", "performance").
+
+    Returns
+    -------
+    str
+        Generated markdown content ready to write to
+        knowledge_base_files/sql_guidelines/{sub_section}.md.
+
+    Raises
+    ------
+    openai.OpenAIError
+        If the GPT-4 API call fails.
+    """
+    # Human-readable descriptions of each sub-section to guide the LLM
+    sub_section_hints: dict[str, str] = {
+        "joins": (
+            "JOIN patterns for linking players, games, teams, box scores, awards, "
+            "and tracking data. Include standard join pairs, gotchas (e.g., double "
+            "join on games for home/away teams), and which columns to join on."
+        ),
+        "aggregations": (
+            "GROUP BY patterns, SUM/AVG/COUNT usage, per-game calculations, "
+            "season totals, HAVING clauses, window functions (RANK, DENSE_RANK, ROW_NUMBER), "
+            "and the NULLIF trick for safe division."
+        ),
+        "filters": (
+            "WHERE clause patterns for player name lookup, season filtering, "
+            "game type (regular/playoff), team filtering, position, draft year, "
+            "and active status. Include ILIKE patterns for text matching."
+        ),
+        "comparisons": (
+            "CASE WHEN expressions, subquery comparisons vs league average, "
+            "head-to-head player/team comparisons, HAVING threshold filters, "
+            "and conditional aggregations."
+        ),
+        "date_handling": (
+            "Season year convention (2022 = 2022-23 season), DATE_TRUNC for "
+            "month/season grouping, date range filters on game_date, avoiding "
+            "CURRENT_DATE, and finding the latest available season dynamically."
+        ),
+        "performance": (
+            "Index-aware query patterns, filter-before-join optimisation, "
+            "which columns are indexed, LIMIT for large result sets, "
+            "EXISTS vs IN for subqueries, and avoiding expensive full scans."
+        ),
+    }
+
+    hint = sub_section_hints.get(
+        sub_section,
+        f"SQL patterns and best practices for {sub_section} in NBA analytics queries.",
+    )
+
+    user_prompt = f"""
+        Generate a knowledge base markdown file for the '{sub_section}' SQL guideline category.
+
+        Category focus: {hint}
+
+        Required frontmatter:
+        ---
+        name: {sub_section}
+        description: "Use when the query involves [SPECIFIC SCENARIOS FOR THIS CATEGORY].
+          Include all the NBA-specific situations where these SQL patterns are needed.
+          Be detailed (3-4 sentences) — this text is embedded for vector retrieval."
+        tags: [tag1, tag2, tag3, tag4]
+        priority: high | medium | low
+        ---
+
+        Then write the markdown body with:
+        - At least 4 practical SQL code blocks referencing the NBA schema tables
+        - A clear structure with ## headers for each sub-topic
+        - Specific gotchas / anti-patterns to avoid
+        - At least one complete query example with JOINs
+
+        Make the description rich enough that these queries will vector-match it:
+        - "How do I join players to their box scores?"
+        - "Calculate season averages for all players"
+        - "Filter by regular season games in 2022"
+    """
+
+    messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
+        ChatCompletionSystemMessageParam(role="system", content=_SQL_GUIDELINES_SUB_SYSTEM_PROMPT),
+        ChatCompletionUserMessageParam(role="user", content=user_prompt),
+    ]
+    response = _client.chat.completions.create(
+        model=OPENAI_GENERATION_MODEL,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=2000,
+    )
+
+    return _strip_llm_fences(response.choices[0].message.content.strip())
+
+
+def generate_sql_guidelines_sub_files(overwrite: bool = False) -> list[Path]:
+    """
+    Generate all SQL guideline sub-files (joins.md, aggregations.md, etc.).
+
+    These are the embeddable, individually-retrievable markdown files inside
+    the sql_guidelines/ section. Unlike KB.md (which is always injected),
+    each sub-file is retrieved by vector similarity at query time — so only
+    the relevant guideline categories are included in each SQL prompt.
+
+    Sub-files that already exist on disk are SKIPPED unless overwrite=True.
+    This is safe to call repeatedly; it only generates missing files.
+
+    NOTE: If the sub-files were created manually (as static files in this
+    project), this function will skip them because they already exist.
+    Only use overwrite=True when you want the LLM to regenerate them fresh.
+
+    Parameters
+    ----------
+    overwrite : bool
+        If False (default), skip sub-files that already exist on disk.
+        Set to True to regenerate all sub-files via LLM.
+
+    Returns
+    -------
+    list[Path]
+        Paths of all sub-files that were written.
+    """
+    section_dir = KB_SECTIONS["sql_guidelines"]
+    section_dir.mkdir(parents=True, exist_ok=True)
+
+    written_files: list[Path] = []
+
+    for sub_section in SQL_GUIDELINES_SUB_SECTIONS:
+        output_path = section_dir / f"{sub_section}.md"
+
+        if output_path.exists() and not overwrite:
+            print(f"[kb_generator] Skipping sql_guidelines/{sub_section}.md (already exists). "
+                  "Use overwrite=True to regenerate.")
+            continue
+
+        print(f"[kb_generator] Generating sql_guidelines/{sub_section}.md via LLM...")
+        content = generate_sql_guideline_sub_file(sub_section)
+        output_path.write_text(content, encoding="utf-8")
+        written_files.append(output_path)
+        print(f"[kb_generator] ✓ Written: {output_path}")
+
+    return written_files
+
+
 def generate_static_section_files(overwrite: bool = False) -> None:
     """
     Write the static KB.md files for non-DDL sections using sample content.
@@ -471,7 +657,9 @@ def generate_all_kb_files(
     1. DDL table files (one .md per table, LLM-generated from CREATE TABLE SQL)
     2. DDL section KB.md index  (LLM-generated listing of all tables)
     3. Root KB.md               (LLM-generated overview of all sections)
-    4. Static section files     (sql_guidelines, business_rules, response_guidelines)
+    4. Static section KB.md files (sql_guidelines, business_rules, response_guidelines)
+    5. SQL guidelines sub-files (joins.md, aggregations.md, filters.md, etc.)
+       — skipped if they already exist on disk (they are pre-written static files)
 
     After running this, review and edit the .md files, then run:
         python main.py build
@@ -497,12 +685,17 @@ def generate_all_kb_files(
     print("\n[kb_generator] Generating DDL table files + index files via LLM...")
     generate_all_table_files(ddl_dict=ddl_dict, overwrite=overwrite)
 
-    print("\n[kb_generator] Writing static section files (sql/business/response guidelines)...")
+    print("\n[kb_generator] Writing static section KB.md files (sql/business/response guidelines)...")
     generate_static_section_files(overwrite=overwrite)
+
+    print("\n[kb_generator] Writing SQL guidelines sub-files (joins, aggregations, filters, etc.)...")
+    generate_sql_guidelines_sub_files(overwrite=overwrite)
 
     print("\n" + "=" * 60)
     print("  Generation complete.")
     print("  Review the files in knowledge_base_files/, then run:")
     print("      python main.py build")
     print("=" * 60 + "\n")
+
+
 
