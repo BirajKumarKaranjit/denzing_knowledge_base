@@ -201,53 +201,20 @@ def retrieve_with_rrf(
     rrf_k: int = RRF_K,
 ) -> list[dict[str, Any]]:
     """
-    Retrieve the top-K most relevant files using Reciprocal Rank Fusion (RRF).
-
-    RRF merges ranked result lists from multiple queries into a single
-    consensus ranking. Each query variant produces its own ranked list;
-    RRF scores each document as:
-
-        rrf_score(d) = sum over all lists L: 1 / (k + rank_of_d_in_L)
-
-    where k=60 is the standard smoothing constant. Documents that appear
-    near the top of multiple lists score highest, giving RRF its robustness
-    against any single query phrasing failing to retrieve a relevant table.
-
-    Why this beats a single-query search for Text2SQL:
-    - "LeBron James points 2022" vs "player scoring regular season 2022-23"
-      both expand to retrieve dwh_f_player_boxscore, but via different angles.
-    - RRF rewards consistent relevance across phrasings over accidental
-      high similarity in one phrasing, reducing noise from embedding geometry.
-
+    Retrieve the top-K most relevant files using Reciprocal Rank Fusion (RRF).\
     Parameters
     ----------
     conn : psycopg2.connection
-        Open database connection.
     query_embeddings : list[list[float]]
-        List of query embedding vectors — one per query variant produced by
-        the multi-query expansion step. Typically 4-5 embeddings.
     section : str
-        KB section to search within (e.g., "ddl", "sql_guidelines").
     top_k : int
-        Number of final results to return after RRF re-ranking.
     per_query_k : int
-        How many candidates to fetch from Postgres per individual query.
-        Should be larger than top_k to give RRF enough candidates to fuse.
-        Default: 10 (safe ceiling for typical 8-table NBA schemas).
     rrf_k : int
-        RRF smoothing constant. Standard value is 60 (from original paper).
-        Lower values amplify rank differences; higher values smooth them.
 
     Returns
     -------
     list[dict]
-        Top-K results re-ranked by RRF score, each containing:
-            - file_path, section, metadata (dict), content
-            - rrf_score (float): the fused rank score
-            - best_cosine_score (float): highest individual cosine similarity
-        Sorted by rrf_score descending.
     """
-    # Collect per-query ranked lists: list of list of records
     all_ranked_lists: list[list[dict]] = []
 
     for emb in query_embeddings:
@@ -282,12 +249,8 @@ def retrieve_with_rrf(
 
         all_ranked_lists.append(ranked)
 
-    # ── Apply Reciprocal Rank Fusion ──────────────────────────────────────────
-    # rrf_scores: file_path → cumulative RRF score
     rrf_scores: dict[str, float] = {}
-    # best_cosine: file_path → best individual cosine score seen across all lists
     best_cosine: dict[str, float] = {}
-    # record_cache: file_path → the record dict (to avoid re-querying)
     record_cache: dict[str, dict] = {}
 
     for ranked_list in all_ranked_lists:
@@ -300,7 +263,6 @@ def retrieve_with_rrf(
             if fp not in record_cache:
                 record_cache[fp] = record
 
-    # Sort by RRF score descending, take top_k
     sorted_paths = sorted(rrf_scores, key=lambda fp: rrf_scores[fp], reverse=True)[:top_k]
 
     results: list[dict] = []
@@ -308,7 +270,6 @@ def retrieve_with_rrf(
         record = dict(record_cache[fp])
         record["rrf_score"] = round(rrf_scores[fp], 6)
         record["best_cosine_score"] = round(best_cosine.get(fp, 0.0), 4)
-        # Expose as relevance_score so downstream code (prompt_builder, citations) works unchanged
         record["relevance_score"] = record["best_cosine_score"]
         results.append(record)
 
@@ -325,10 +286,6 @@ def retrieve_similar_tables(
     """
     Find the top-K most relevant table files using cosine similarity.
 
-    Executes a pgvector similarity search restricted to a specific section
-    (e.g., "ddl") and only against non-entry-point files (individual table
-    files like players.md). Returns results sorted by relevance score descending.
-
     Parameters
     ----------
     conn : psycopg2.connection
@@ -339,9 +296,6 @@ def retrieve_similar_tables(
     Returns
     -------
     list[dict]
-        List of matching records, each containing:
-            - file_path, section, metadata (dict), content, relevance_score
-        Sorted by relevance_score descending (most relevant first).
     """
     embedding_str = _format_embedding(query_embedding)
 
@@ -353,26 +307,22 @@ def retrieve_similar_tables(
                 section,
                 metadata,
                 content,
-                -- Convert cosine DISTANCE to cosine SIMILARITY
-                -- pgvector's <=> returns distance (0=identical, 2=opposite)
-                -- so similarity = 1 - distance
                 1 - (embedding <=> %s::vector) AS relevance_score
             FROM kb_files
             WHERE
                 section         = %s
                 AND is_entry_point = FALSE
                 AND embedding   IS NOT NULL
-                -- Pre-filter by threshold in SQL to avoid fetching irrelevant rows
                 AND 1 - (embedding <=> %s::vector) >= %s
-            ORDER BY embedding <=> %s::vector  -- ORDER BY distance ASC = similarity DESC
+            ORDER BY embedding <=> %s::vector
             LIMIT %s;
             """,
             (
-                embedding_str,  # for SELECT similarity calculation
+                embedding_str,
                 section,
-                embedding_str,  # for WHERE threshold filter
+                embedding_str,
                 similarity_threshold,
-                embedding_str,  # for ORDER BY
+                embedding_str,
                 top_k,
             ),
         )

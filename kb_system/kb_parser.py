@@ -116,7 +116,6 @@ def parse_markdown_file(md_path: Path, kb_root: Path) -> ParsedKBFile:
 
     # Derive relative file_path (e.g., "ddl/players.md")
     relative_path = str(md_path.relative_to(kb_root))
-    # Normalise to forward slashes on Windows
     relative_path = relative_path.replace("\\", "/")
 
     # Derive section from the first path component
