@@ -128,13 +128,14 @@ def parse_markdown_file(md_path: Path, kb_root: Path) -> ParsedKBFile:
     # Entry points don't need embedding_text (they're not similarity-searched)
     name = metadata.get("name", "")
     description = metadata.get("description", "")
+    tags = metadata.get("tags", [])
 
     if is_entry_point:
         embedding_text = ""  # Entry points are never embedded
     else:
         # This is the text the OpenAI embedding model will encode.
         # Format: "players — Use this when user asks about player profiles..."
-        embedding_text = f"{name} — {description}".strip(" —")
+        embedding_text = f"{name} — {description}  — {tags}".strip(" —")
 
     return ParsedKBFile(
         file_path=relative_path,

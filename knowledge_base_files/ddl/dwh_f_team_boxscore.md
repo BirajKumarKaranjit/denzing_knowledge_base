@@ -3,6 +3,13 @@ name: dwh_f_team_boxscore
 description: "Use when the query involves analyzing team performance metrics in basketball games. This table captures comprehensive statistics for each team per game, including shooting efficiency, rebounding, assists, turnovers, and advanced metrics like offensive and defensive ratings. It is essential for queries that require detailed breakdowns of team performance by quarters or overtime, and for calculating derived statistics such as pace and usage percentages. Ideal for performance analysis, trend identification, and comparative studies between teams."
 tags: [basketball, team performance, analytics, game statistics]
 priority: high
+fk_to:
+  - column: team_id
+    ref_table: dwh_d_teams
+    ref_column: team_id
+  - column: game_id
+    ref_table: dwh_d_games
+    ref_column: game_id
 ---
 
 # DDL

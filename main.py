@@ -66,19 +66,19 @@ def cmd_query(user_query: str) -> None:
     print(f"  Query: {user_query}")
     print(f"{'=' * 60}")
 
-    relevant, reason, suggested_questions = is_query_relevant(user_query, _SCHEMA_SUMMARY)
-    if not relevant:
-        print(f"\n[main] Query rejected by relevance gate.")
-        print(f"  Reason: {reason}")
-        formatted_questions = "\n".join(
-            f"{i + 1}. {q}" for i, q in enumerate(suggested_questions)
-        )
-        print(
-            "This question cannot be answered from the available database.\n"
-            "Please ask a question related to your NBA analytics data, such as:\n"
-            f"{formatted_questions}"
-        )
-        return
+    # relevant, reason, suggested_questions = is_query_relevant(user_query, _SCHEMA_SUMMARY)
+    # if not relevant:
+    #     print(f"\n[main] Query rejected by relevance gate.")
+    #     print(f"  Reason: {reason}")
+    #     formatted_questions = "\n".join(
+    #         f"{i + 1}. {q}" for i, q in enumerate(suggested_questions)
+    #     )
+    #     print(
+    #         "This question cannot be answered from the available database.\n"
+    #         "Please ask a question related to your NBA analytics data, such as:\n"
+    #         f"{formatted_questions}"
+    #     )
+    #     return
 
     conn = get_connection()
     retrieval_result = retrieve_context_for_query(conn, user_query)
