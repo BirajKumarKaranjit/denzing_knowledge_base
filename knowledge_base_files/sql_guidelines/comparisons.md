@@ -1,23 +1,96 @@
 ---
 name: comparisons
-description: "Use when the query involves complex comparisons such as CASE WHEN expressions, subquery comparisons against aggregated values, side-by-side entity comparisons, HAVING threshold filters, and conditional aggregations using FILTER (WHERE ...). This guideline is particularly useful for scenarios where you need to derive insights from player and team performance metrics, compare game outcomes, or filter data based on specific conditions. It helps in constructing queries that require nuanced logic and precise filtering to extract meaningful analytics from the dataset."
-tags: [SQL, comparisons, CASE WHEN, subqueries, HAVING, FILTER]
+description: "Use when the query involves CASE WHEN expressions, subquery comparisons, side-by-side entity comparisons, HAVING threshold filters, conditional aggregations, playoff round ordering, or back-to-back/streak comparisons. Critical rules for avoiding non-existent column references and lexicographic ordering errors on categorical fields."
+tags: [SQL, comparisons, CASE WHEN, subqueries, HAVING, FILTER, playoff rounds, column validation, streak]
 priority: high
 ---
 
 # SQL Comparisons Guide
 
-This guide provides practical SQL patterns and templates for performing various types of comparisons using the tables and columns defined in the provided DDL. These patterns are essential for extracting insights from complex datasets, particularly in sports analytics.
+## Playoff Round Ordering — Never Use MAX() on String Columns
+Playoff round names (e.g., "First Round", "Conference Semifinals", "Finals") are strings. `MAX()` or `ORDER BY` on these fields uses **alphabetical order**, not playoff progression order.
+```sql
+-- CORRECT: map round names to numeric order first
+WITH round_order AS (
+    SELECT game_id, playoff_round,
+        CASE playoff_round
+            WHEN 'First Round'              THEN 1
+            WHEN 'Conference Semifinals'    THEN 2
+            WHEN 'Conference Finals'        THEN 3
+            WHEN 'Finals'                   THEN 4
+            ELSE 0
+        END AS round_num
+    FROM dwh_d_games
+    WHERE game_type = 'Playoffs'
+)
+SELECT playoff_round, MAX(round_num) AS furthest_round
+FROM round_order
+GROUP BY playoff_round
+ORDER BY MAX(round_num) DESC LIMIT 1;
+
+--WRONG: alphabetical MAX gives "First Round" > "Finals"
+SELECT MAX(playoff_round) FROM dwh_d_games WHERE game_type = 'Playoffs';
+```
+---
+
+## Column Existence — Verify Schema Before Writing SQL
+
+Before referencing any column, confirm it exists in the schema. Common mistakes from benchmarking:
+
+| Wrong Column | Correct Column |
+|---|---|
+| `rebounds_chances_offensive` | `rebounds_offensive` |
+| `rebounds_chances_defensive` | `rebounds_defensive` |
+| `net_rating` | Compute as `offensive_rating - defensive_rating` |
+| `fast_break_points_allowed` | May not exist — check team boxscore schema |
+
+**Rule:** If a derived metric (PER, net rating, eFG%) is not explicitly stored, compute it from available columns using standard formulas. If the required base columns don't exist either, state that clearly rather than referencing a non-existent column.
+
+```sql
+-- Computing net rating from available columns
+SELECT team_id,
+    AVG(offensive_rating) - AVG(defensive_rating) AS net_rating
+FROM dwh_f_team_boxscore
+GROUP BY team_id;
+
+-- WRONG: assumes column exists without verification
+SELECT net_rating FROM dwh_f_team_boxscore;  -- column may not exist
+```
+---
+
+## Back-to-Back / Consecutive-Date Streaks
+
+When checking for back-to-back performances (e.g., consecutive 40-point games), use `LAG()` to compare actual game dates — not row numbers on a pre-filtered set.
+```sql
+-- CORRECT: uses LAG on unfiltered game sequence, then checks date proximity
+WITH all_games AS (
+    SELECT player_id, game_date, points,
+        LAG(game_date) OVER (PARTITION BY player_id ORDER BY game_date) AS prev_game_date,
+        LAG(points)    OVER (PARTITION BY player_id ORDER BY game_date) AS prev_points
+    FROM dwh_f_player_boxscore
+    WHERE player_id = :player_id
+)
+SELECT game_date, points, prev_game_date, prev_points
+FROM all_games
+WHERE points >= 40
+  AND prev_points >= 40
+  AND game_date - prev_game_date <= 2;  -- allow for back-to-back or one rest day
+
+-- WRONG: filters 40-pt games first; consecutive row numbers no longer mean consecutive dates
+WITH high_games AS (
+    SELECT *, ROW_NUMBER() OVER (ORDER BY game_date) AS rn
+    FROM dwh_f_player_boxscore
+    WHERE player_id = :player_id AND points >= 40  -- gaps removed!
+)
+SELECT * FROM high_games WHERE rn = LAG(rn) OVER (...) + 1;
+```
+---
 
 ## CASE WHEN Expressions
 
-Use `CASE WHEN` expressions to create conditional logic within your queries. This is useful for categorizing data or creating new calculated fields based on existing data.
-
 ```sql
-SELECT
-    player_id,
-    full_name,
-    CASE 
+SELECT player_id, full_name,
+    CASE
         WHEN player_height > 200 THEN 'Tall'
         WHEN player_height BETWEEN 180 AND 200 THEN 'Average'
         ELSE 'Short'
@@ -25,99 +98,52 @@ SELECT
 FROM dwh_d_players;
 ```
 
-### Gotchas
-- Ensure that all possible conditions are covered to avoid unexpected NULL results.
-- Be mindful of the order of conditions; they are evaluated sequentially.
+**Gotchas:** Conditions are evaluated sequentially; cover all cases to avoid unexpected NULLs.
+
+---
 
 ## Subquery Comparisons Against Aggregated Values
-
-Subqueries can be used to compare individual records against aggregated values, such as averages or totals.
-
 ```sql
-SELECT
-    game_id,
-    home_team_id,
-    visitor_team_id,
-    home_score,
-    visitor_score
+SELECT game_id, home_team_id, home_score
 FROM dwh_d_games
-WHERE home_score > (
-    SELECT AVG(home_score) FROM dwh_d_games
-);
+WHERE home_score > (SELECT AVG(home_score) FROM dwh_d_games);
 ```
 
-### Gotchas
-- Subqueries can be performance-intensive; consider indexing columns involved in subqueries.
-- Ensure subqueries return a single value when used in comparison operations.
+**Gotcha:** Subqueries in comparisons must return a single scalar value.
+---
 
-## Side-by-Side Entity Comparisons
-
-Perform side-by-side comparisons to evaluate differences or similarities between entities, such as teams or players.
-
+## Conditional Aggregations Using FILTER
 ```sql
-SELECT
-    t1.team_id AS team_id_1,
-    t1.full_name AS team_name_1,
-    t2.team_id AS team_id_2,
-    t2.full_name AS team_name_2
-FROM dwh_d_teams t1
-JOIN dwh_d_teams t2 ON t1.conference = t2.conference
-WHERE t1.team_id <> t2.team_id;
-```
-
-### Gotchas
-- Ensure that the join conditions are correctly set to avoid Cartesian products.
-- Use aliases to differentiate between columns from different instances of the same table.
-
-## HAVING Threshold Filters
-
-Use the `HAVING` clause to filter groups based on aggregated values.
-
-```sql
-SELECT
-    team_id,
-    COUNT(game_id) AS games_played
-FROM dwh_f_player_team_seasons
-GROUP BY team_id
-HAVING COUNT(game_id) > 50;
-```
-
-### Gotchas
-- The `HAVING` clause is used after `GROUP BY` and is applied to aggregated results.
-- Avoid using `HAVING` for conditions that can be placed in the `WHERE` clause for better performance.
-
-## Conditional Aggregations Using FILTER (WHERE ...)
-
-The `FILTER` clause allows for conditional aggregation, which is useful for calculating metrics under specific conditions.
-
-```sql
-SELECT
-    player_id,
+SELECT player_id,
     SUM(points) FILTER (WHERE game_type = 'Regular') AS regular_season_points,
-    SUM(points) FILTER (WHERE game_type = 'Playoff') AS playoff_points
+    SUM(points) FILTER (WHERE game_type = 'Playoffs') AS playoff_points
 FROM dwh_f_player_boxscore
 GROUP BY player_id;
 ```
+---
 
-### Gotchas
-- Ensure that the conditions in the `FILTER` clause are correctly specified to avoid incorrect aggregations.
-- The `FILTER` clause is only available in PostgreSQL 9.4 and later.
-
-## Multi-Table Query Example
-
-Combining multiple tables to derive insights can be powerful. Here is an example that combines player and game data to calculate average points per game for each player.
-
+## Side-by-Side Entity Comparisons
 ```sql
+-- Head-to-head player comparison (e.g., Jokić vs Embiid matchups)
 SELECT
-    p.player_id,
-    p.full_name,
-    AVG(b.points) AS avg_points_per_game
-FROM dwh_d_players p
-JOIN dwh_f_player_boxscore b ON p.player_id = b.player_id
-GROUP BY p.player_id, p.full_name
-HAVING AVG(b.points) > 10;
+    pb1.player_id AS player1_id, p1.full_name AS player1,
+    pb2.player_id AS player2_id, p2.full_name AS player2,
+    AVG(pb1.points) AS p1_avg_pts, AVG(pb2.points) AS p2_avg_pts
+FROM dwh_f_player_boxscore pb1
+JOIN dwh_f_player_boxscore pb2 ON pb1.game_id = pb2.game_id
+    AND pb1.player_id <> pb2.player_id
+JOIN dwh_d_players p1 ON pb1.player_id = p1.player_id
+JOIN dwh_d_players p2 ON pb2.player_id = p2.player_id
+WHERE p1.full_name ILIKE '%Jokić%' AND p2.full_name ILIKE '%Embiid%'
+GROUP BY pb1.player_id, p1.full_name, pb2.player_id, p2.full_name;
 ```
+**Note:** Use `ILIKE` for player names in comparisons — accent variations (Jokić vs Jokic) can cause misses.
+---
 
-### Gotchas
-- Ensure that join conditions are correctly specified to avoid incorrect data merging.
-- Use `HAVING` to filter aggregated results, not individual records.
+## Anti-Pattern Summary
+| Bad Pattern | Fix |
+|---|---|
+| `MAX(playoff_round)` on string | Map rounds to integers with CASE WHEN, then MAX |
+| Reference non-existent column | Verify schema; compute derived metrics from base columns |
+| Filter rows before consecutive-date check | Use LAG() on full game sequence; check date diff |
+| `=` for player name in comparison | Use `ILIKE '%name%'` |
