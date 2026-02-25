@@ -121,3 +121,8 @@ GROUP BY
 ```
 
 This query joins player box scores with player and team details, filtering for games in the 2023 season and aggregating total points by team.
+
+### Important Rule for Consistency Calculation
+- For queries involving consistency, stability, reliability, or variance — never rank purely on raw variance or standard deviation.
+- Always incorporate sample size as a confidence weight. Compute a weighted score that discounts entities with fewer observations relative to the dataset. 
+- Derive the minimum meaningful sample size dynamically from the data distribution, never hardcode it.

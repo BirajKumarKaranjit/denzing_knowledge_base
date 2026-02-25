@@ -211,30 +211,50 @@ def relevance_check_user_prompt(user_query: str, schema_summary: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Cross-encoder re-ranking prompts
+# Cross-encoder re-ranking prompts  (batched — one LLM call for all candidates)
 # ---------------------------------------------------------------------------
 
 CROSS_ENCODER_SYSTEM_PROMPT = (
     "You are a relevance scoring assistant for a Text2SQL retrieval system.\n"
-    "Given a user query and a database table description, score how relevant the table is\n"
-    "to answering the query on a scale from 0.0 to 1.0.\n\n"
+    "You will be given a user query and a numbered list of database tables.\n"
+    "Score each table's relevance to answering the query on a scale from 0.0 to 1.0.\n\n"
     "Scoring guide:\n"
     "  1.0 — The table directly contains the data needed to answer the query.\n"
-    "  0.7 — The table is likely needed as part of a join to answer the query.\n"
+    "  0.7 — The table is likely needed as part of a JOIN to answer the query.\n"
     "  0.4 — The table might provide supporting context.\n"
     "  0.1 — The table is probably not needed.\n"
     "  0.0 — The table is completely unrelated.\n\n"
-    'Return ONLY a JSON object: {"score": <float between 0.0 and 1.0>}'
+    "Return ONLY a JSON array of objects, one per table, in the same order as the input.\n"
+    'Each object must have exactly two keys: "table" (the table name) and "score" (float).\n'
+    'Example for 3 tables: [{"table": "orders", "score": 1.0}, {"table": "products", "score": 0.7}, {"table": "logs", "score": 0.0}]'
 )
 
 
-def cross_encoder_user_prompt(user_query: str, table_name: str, table_description: str) -> str:
-    """Return the user prompt for scoring one (query, table) pair."""
+def cross_encoder_user_prompt(user_query: str, candidates: list[dict]) -> str:
+    """Return the user prompt for scoring all (query, candidate) pairs in one call.
+
+    Parameters
+    ----------
+    user_query:
+        The original user question.
+    candidates:
+        List of dicts with keys ``name`` and ``description``.
+
+    Returns
+    -------
+    str
+        Prompt that instructs the LLM to return a JSON array of scores.
+    """
+    table_lines = "\n".join(
+        f"{i + 1}. Table: {c['name']}\n   Description: {c['description']}"
+        for i, c in enumerate(candidates)
+    )
     return (
         f"User query: {user_query}\n\n"
-        f"Table name: {table_name}\n"
-        f"Table description: {table_description}\n\n"
-        "How relevant is this table to answering the query? "
-        'Return JSON: {"score": <float>}'
+        f"Tables to score:\n{table_lines}\n\n"
+        "Return a JSON array with one score object per table, in the same order. "
+        'Format: [{"table": "<name>", "score": <float>}, ...]'
     )
+
+
 

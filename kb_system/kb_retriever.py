@@ -178,57 +178,80 @@ def expand_query_with_llm(user_query: str, n: int = MULTI_QUERY_EXPANSION_COUNT)
         return [user_query]
 
 
-def _score_candidate_with_llm(
+def _score_candidates_batched(
     user_query: str,
-    table_name: str,
-    table_description: str,
-) -> float:
-    """Score a single (query, table) pair using a lightweight LLM call.
+    candidates: list[dict],
+) -> list[float]:
+    """Score all candidates in a single LLM call (batched cross-encoder).
 
-    This is the cross-encoder step: unlike bi-encoder similarity which scores
-    query and document independently, this call sees both together, enabling
-    term-level interaction matching (e.g. "scoring" → "points" column).
+    Sends all (query, table) pairs in one prompt and parses the returned
+    JSON array — replacing the previous per-candidate loop that made N
+    separate API calls.
 
     Parameters
     ----------
     user_query:
         The original user question.
-    table_name:
-        Name of the candidate table.
-    table_description:
-        The table's frontmatter description text.
+    candidates:
+        List of records from RRF retrieval. Each must have a ``metadata``
+        dict containing at least ``name`` and ``description``.
 
     Returns
     -------
-    float
-        Relevance score in [0.0, 1.0]. Returns 0.0 on parse failure.
+    list[float]
+        Relevance scores in [0.0, 1.0], one per candidate in the same
+        order as the input. Falls back to 0.0 for any unparseable entry.
     """
+    payload = [
+        {
+            "name": c.get("metadata", {}).get("name", c.get("file_path", f"table_{i}")),
+            "description": c.get("metadata", {}).get("description", ""),
+        }
+        for i, c in enumerate(candidates)
+    ]
+
+    fallback = [0.0] * len(candidates)
+
     try:
-        _msgs_score: list[
+        _msgs: list[
             ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam
         ] = [
-            ChatCompletionSystemMessageParam(role="system", content=CROSS_ENCODER_SYSTEM_PROMPT),
+            ChatCompletionSystemMessageParam(
+                role="system", content=CROSS_ENCODER_SYSTEM_PROMPT
+            ),
             ChatCompletionUserMessageParam(
                 role="user",
-                content=cross_encoder_user_prompt(user_query, table_name, table_description),
+                content=cross_encoder_user_prompt(user_query, payload),
             ),
         ]
         response = _client.chat.completions.create(
             model=OPENAI_GENERATION_MODEL,
-            messages=_msgs_score,
+            messages=_msgs,
             temperature=0.0,
-            max_tokens=30,
+            max_tokens=256,
         )
         raw = response.choices[0].message.content.strip()
-        # Extract JSON even if the model adds minor surrounding text
-        match = re.search(r'\{[^}]+}', raw)
-        if match:
-            data = json.loads(match.group())
-            score = float(data.get("score", 0.0))
-            return max(0.0, min(1.0, score))
-    except (json.JSONDecodeError, ValueError, openai.OpenAIError, KeyError):
-        pass
-    return 0.0
+
+        # Extract JSON array even if the model wraps it in markdown fences
+        match = re.search(r'\[.*]', raw, re.DOTALL)
+        if not match:
+            return fallback
+
+        scored: list[dict] = json.loads(match.group())
+        if not isinstance(scored, list) or len(scored) != len(candidates):
+            return fallback
+
+        scores: list[float] = []
+        for entry in scored:
+            try:
+                scores.append(max(0.0, min(1.0, float(entry.get("score", 0.0)))))
+            except (TypeError, ValueError):
+                scores.append(0.0)
+        return scores
+
+    except (json.JSONDecodeError, openai.OpenAIError, KeyError):
+        return fallback
+
 
 
 def _extract_foreign_key_refs(ddl_content: str) -> list[str]:
@@ -333,15 +356,13 @@ def _apply_cross_encoder_reranking(
     import json as _json
     import psycopg2.extras
 
-    # --- Step 1: Score each candidate and sort descending ---
-    print(f"[kb_retriever] Cross-encoder: scoring {len(candidates)} candidate(s)...")
-    for record in candidates:
-        metadata = record.get("metadata") or {}
-        description = metadata.get("description", "")
-        table_name = metadata.get("name", record.get("file_path", ""))
-        score = _score_candidate_with_llm(user_query, table_name, description)
+    # --- Step 1: Score all candidates in one batched LLM call, then sort ---
+    print(f"[kb_retriever] Cross-encoder: scoring {len(candidates)} candidate(s) in one call...")
+    scores = _score_candidates_batched(user_query, candidates)
+    for record, score in zip(candidates, scores):
         record["cross_encoder_score"] = score
         record["relevance_score"] = score
+        table_name = record.get("metadata", {}).get("name", record.get("file_path", ""))
         print(f"       • {table_name}: cross={score:.3f}  rrf={record.get('rrf_score', 0):.5f}")
 
     reranked = sorted(candidates, key=lambda r: r["cross_encoder_score"], reverse=True)
