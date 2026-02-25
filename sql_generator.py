@@ -27,21 +27,24 @@ from utils.prompts.kb_generation_prompts import (
 _client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 
-def is_query_relevant(user_query: str, schema_summary: str) -> tuple[bool, str]:
-    """Check whether a query is answerable from the database before running the pipeline.
+def is_query_relevant(
+    user_query: str, schema_context: str
+) -> tuple[bool, str, str, list[str]]:
+    """Unified relevance gate: garbage, greeting, out-of-domain, or SQL-relevant.
 
     Parameters
     ----------
     user_query:
-        Raw user question.
-    schema_summary:
-        Brief description of the database domain and available tables.
-        Used to ground the relevance decision.
+        Raw user input.
+    schema_context:
+        Table and column names derived from the actual DDL, used to infer
+        the domain and entity vocabulary. Generated dynamically — not hardcoded.
 
     Returns
     -------
-    tuple[bool, str]
-        (is_relevant, reason) — if False, pass `reason` back to the user.
+    tuple[bool, str, str, list[str]]
+        (is_relevant, category, response_message, suggested_questions).
+        If is_relevant is True, response_message and suggested_questions are empty.
     """
     try:
         response = _client.chat.completions.create(
@@ -52,21 +55,27 @@ def is_query_relevant(user_query: str, schema_summary: str) -> tuple[bool, str]:
                 ),
                 ChatCompletionUserMessageParam(
                     role="user",
-                    content=relevance_check_user_prompt(user_query, schema_summary),
+                    content=relevance_check_user_prompt(user_query, schema_context),
                 ),
             ],
             temperature=0.0,
-            max_tokens=100,
+            max_tokens=300,
         )
         raw = response.choices[0].message.content.strip()
-        match = re.search(r'\{[^}]+}', raw, re.DOTALL)
+        match = re.search(r'\{.*}', raw, re.DOTALL)
         if match:
             data = json.loads(match.group())
-            return bool(data.get("is_relevant", True)), str(data.get("reason", "")), data.get("suggested_questions", "")
+            is_relevant = bool(data.get("is_relevant", True))
+            category = str(data.get("category", "SQL_RELEVANT"))
+            msg = str(data.get("response", ""))
+            suggestions = data.get("suggested_questions", [])
+            if not isinstance(suggestions, list):
+                suggestions = []
+            return is_relevant, category, msg, suggestions
     except (json.JSONDecodeError, openai.OpenAIError, KeyError):
         pass
-    # Fail open — if we cannot parse the response, let the pipeline continue
-    return True, "", []
+    # Fail open — if parsing fails, allow SQL generation
+    return True, "SQL_RELEVANT", "", []
 
 
 def generate_sql(prompt: str, temperature: float = 0.25) -> str:

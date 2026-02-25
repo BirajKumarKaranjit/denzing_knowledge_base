@@ -183,30 +183,91 @@ def sql_guideline_sub_file_user_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Query relevance check prompts
+# Query relevance gate — single LLM call for garbage, greeting, and domain check
 # ---------------------------------------------------------------------------
 
 RELEVANCE_CHECK_SYSTEM_PROMPT = (
-    "You are a query routing assistant for a Text2SQL system.\n"
-    "Your job is to determine whether a user's question can be answered by querying\n"
-    "the database described in the schema context.\n\n"
-    "Respond with a JSON object:\n"
-    '  {"is_relevant": true/false, "reason": "one sentence explanation"}\n\n'
-    "Return is_relevant=true only if the question asks for data that could plausibly\n"
-    "exist in the provided database schema. Return false for general knowledge questions,\n"
-    "questions about topics entirely unrelated to the domain, or impossible queries."
+    "You are a query classification gate for a Text2SQL analytics system.\n"
+    "You will receive a user query and a schema context (table names and columns)\n"
+    "derived from the actual database. Classify the query into exactly one category.\n\n"
+
+    "### Categories (evaluate in this order)\n\n"
+
+    "1. GARBAGE\n"
+    "   Random characters, keyboard mash, or completely unintelligible text with no\n"
+    "   discernible intent.\n"
+    '   Examples: "asldkjf", "xyzzy 123", "@@##$$"\n\n'
+
+    "2. GREETING\n"
+    "   Purely conversational — no data retrieval intent whatsoever.\n"
+    '   Examples: "Hello", "How are you?", "Thanks", "Good job", "Who created you?"\n'
+    "   IMPORTANT: if the message contains BOTH a greeting AND any data question,\n"
+    '   classify as SQL_RELEVANT (e.g. "Hi, show me top results" → SQL_RELEVANT).\n\n'
+
+    "3. OUT_OF_DOMAIN\n"
+    "   The query asks about a topic that provably cannot map to any table, column,\n"
+    "   or entity type in the provided schema.\n\n"
+    "   ### CRITICAL RULE FOR NAMES AND ENTITIES ###\n"
+    "   Any human name, organisation name, product name, or proper noun must be\n"
+    "   treated as SQL_RELEVANT if the schema contains columns that could store such\n"
+    "   values (e.g. name, full_name, player_name, team_name, title, label, etc.).\n"
+    "   You CANNOT know in advance which names exist in the database. Therefore:\n"
+    "   - 'Who is <any person>?' → SQL_RELEVANT (name may exist in a name column)\n"
+    "   - 'Tell me about <any entity>?' → SQL_RELEVANT\n"
+    "   Only classify as OUT_OF_DOMAIN when the query is about a concept that\n"
+    "   fundamentally cannot exist in any column — e.g. scientific phenomena,\n"
+    "   recipes, geography unrelated to the domain, or programming questions.\n\n"
+
+    "4. SQL_RELEVANT (DEFAULT)\n"
+    "   Anything that could plausibly require a database query. This is the default\n"
+    "   category. Includes:\n"
+    "   - Data questions: stats, comparisons, rankings, aggregations, filters\n"
+    "   - Any proper noun (person, place, organisation) — may exist in a name column\n"
+    "   - Analytics vocabulary: top, count, list, compare, show, total, average\n"
+    "   - Ambiguous or underspecified queries\n"
+    "   - Follow-up phrases implying prior data context\n\n"
+
+    "### Core principle\n"
+    "Rejecting a valid query is far more costly than passing an irrelevant one.\n"
+    "When uncertain, ALWAYS classify as SQL_RELEVANT.\n"
+    "You must be 100% certain a query is unrelated before returning anything other\n"
+    "than SQL_RELEVANT.\n\n"
+
+    "### Output format — return ONLY this raw JSON, no extra text\n"
+    "{\n"
+    '  "category": "GARBAGE" | "GREETING" | "OUT_OF_DOMAIN" | "SQL_RELEVANT",\n'
+    '  "is_relevant": true if SQL_RELEVANT else false,\n'
+    '  "reason": "<one sentence>",\n'
+    '  "response": "<user-facing message if not relevant, else empty string>",\n'
+    '  "suggested_questions": ["<q1>", "<q2>", "<q3>", "<q4>"] if not relevant else []\n'
+    "}"
 )
 
 
-def relevance_check_user_prompt(user_query: str, schema_summary: str) -> str:
-    """Return the user prompt for the query relevance gate."""
+def relevance_check_user_prompt(user_query: str, schema_context: str) -> str:
+    """Build the user prompt for the unified relevance gate.
+
+    Parameters
+    ----------
+    user_query:
+        Raw user input to classify.
+    schema_context:
+        Table names and column names derived from the actual DDL. Used by the
+        LLM to infer the domain and decide whether a name or entity could
+        plausibly appear in the data. Generated dynamically — not hardcoded.
+
+    Returns
+    -------
+    str
+        Formatted prompt string.
+    """
     return (
-        f"Database domain summary:\n{schema_summary}\n\n"
-        f"User question: {user_query}\n\n"
-        "Is this question answerable by querying this database? "
-        "Also, suggest four relevant questions if the user query is not suitable for this domain to help the user understand what types of questions they can ask.\n\n"
-        "Strictly check the schema summary and relevancy of the user query to the database domain. Do not make assumptions or guesses about what data might be in the database beyond what is stated in the schema summary.\n\n"
-        'Return JSON: {"is_relevant": true/false, "reason": "...", "suggested_questions": ["...", "...", "...", "..."]}'
+        f"Schema context (table and column names from the database):\n"
+        f"{schema_context}\n\n"
+        f"User query: {user_query}\n\n"
+        "Classify this query. Remember: any proper noun could be a value in a name "
+        "column — default to SQL_RELEVANT when uncertain.\n"
+        "Return JSON only."
     )
 
 

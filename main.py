@@ -24,11 +24,39 @@ from utils.config import overwrite
 from utils.sample_values_for_testing import Sample_NBA_DDL_DICT
 import sys
 
-_SCHEMA_SUMMARY = (
-    "NBA basketball analytics database containing tables for players, teams, games, "
-    "player box scores, team box scores, player awards, player tracking, "
-    "player season stats, and team championships."
-)
+
+def _build_schema_context(ddl_dict: dict[str, str]) -> str:
+    """Derive a compact table+column context string from the DDL dict.
+
+    Extracts table names and column names from each CREATE TABLE statement
+    so the relevance gate can infer domain vocabulary without a hardcoded
+    schema summary. Works for any domain — not NBA-specific.
+
+    Parameters
+    ----------
+    ddl_dict:
+        Mapping of table_name -> raw CREATE TABLE SQL string.
+
+    Returns
+    -------
+    str
+        Compact multi-line string listing each table and its columns.
+    """
+    import re
+    lines: list[str] = []
+    for table_name, ddl_sql in ddl_dict.items():
+        # Extract column names: first word on each indented line inside the CREATE TABLE body
+        col_matches = re.findall(r'^\s{2,}(\w+)\s+\w+', ddl_sql, re.MULTILINE)
+        # Fall back: grab all word tokens that look like column names
+        if not col_matches:
+            col_matches = re.findall(r'\b([a-z][a-z0-9_]{2,})\b', ddl_sql)
+        cols = ", ".join(col_matches[:15])  # cap at 15 columns to keep context compact
+        lines.append(f"- {table_name}: {cols}")
+    return "\n".join(lines)
+
+
+# Build schema context once at module load from the actual DDL
+_SCHEMA_CONTEXT = _build_schema_context(Sample_NBA_DDL_DICT)
 
 
 def cmd_generate() -> None:
@@ -66,19 +94,18 @@ def cmd_query(user_query: str) -> None:
     print(f"  Query: {user_query}")
     print(f"{'=' * 60}")
 
-    # relevant, reason, suggested_questions = is_query_relevant(user_query, _SCHEMA_SUMMARY)
-    # if not relevant:
-    #     print(f"\n[main] Query rejected by relevance gate.")
-    #     print(f"  Reason: {reason}")
-    #     formatted_questions = "\n".join(
-    #         f"{i + 1}. {q}" for i, q in enumerate(suggested_questions)
-    #     )
-    #     print(
-    #         "This question cannot be answered from the available database.\n"
-    #         "Please ask a question related to your NBA analytics data, such as:\n"
-    #         f"{formatted_questions}"
-    #     )
-    #     return
+    relevant, category, response_msg, suggested_questions = is_query_relevant(
+        user_query, _SCHEMA_CONTEXT
+    )
+    if not relevant:
+        print(f"\n[main] Query rejected — category: {category}")
+        if response_msg:
+            print(f"  {response_msg}")
+        if suggested_questions:
+            print("\n  Try one of these instead:")
+            for i, q in enumerate(suggested_questions, 1):
+                print(f"    {i}. {q}")
+        return
 
     conn = get_connection()
     retrieval_result = retrieve_context_for_query(conn, user_query)
@@ -133,5 +160,7 @@ def main() -> None:
         sys.exit(1)
 
 
+
 if __name__ == "__main__":
-    main()
+    # main()
+    cmd_query(input("\nEnter a natural language question to convert to SQL: "))
