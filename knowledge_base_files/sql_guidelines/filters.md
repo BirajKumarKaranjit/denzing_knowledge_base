@@ -1,101 +1,84 @@
 ---
 name: filters
-description: "Use when the query filters data by player name, team name, season, game type (regular season vs playoffs), position, award type, draft class, or active status. Covers WHERE clause patterns, IN/NOT IN lists, LIKE/ILIKE for partial name matches, and filtering by game type or season. Choose this for any query that narrows results to a specific player, team, time period, or category."
-tags: [filters, where-clause, season, game-type, player-lookup, team-lookup]
+description: "Use when the query involves filtering data based on text lookup, categorical values, numeric ranges, status flags, or handling NULL values in a Postgres database. This guideline is essential for crafting efficient WHERE clauses, especially when dealing with case-insensitive text searches using ILIKE, filtering with IN/ANY for multiple values, and ensuring correct handling of NULLs. It is particularly useful for queries that need to filter player statistics, game details, or team information based on specific criteria."
+tags: [filters, WHERE clause, text lookup, numeric range, NULL handling]
 priority: high
 ---
 
-# Filter Patterns for NBA Analytics
+# SQL Filtering Guidelines
 
-## Player Filtering
+## Text Lookup with ILIKE
 
-### By exact player_id (preferred — always use ID for joins/filters)
-```sql
-WHERE bs.player_id = '2544'   -- LeBron James NBA player ID
-```
-
-### By full_name when player_id is unknown (case-insensitive partial match)
-```sql
-WHERE LOWER(p.full_name) LIKE '%lebron%'
-```
-
-### By active status
-```sql
-WHERE p.roster_status = 'Active'
--- or
-WHERE p.to_year = '2024'   -- still playing in 2024-25 season
-```
-
-## Season Filtering
+When performing case-insensitive text searches, use the `ILIKE` operator. This is particularly useful for searching player names or team nicknames.
 
 ```sql
--- Single season
-WHERE g.season_year = '2022'   -- means the 2022-23 NBA season
-
--- Range of seasons
-WHERE g.season_year BETWEEN '2020' AND '2023'
+SELECT player_id, full_name
+FROM dwh_d_players
+WHERE full_name ILIKE '%john%';
 ```
 
-> **Convention**: `season_year` stores the year the season STARTS.
-> '2022' = the 2022-23 season. Always clarify with the user if ambiguous.
+**Gotcha:** Avoid using `ILIKE` with leading wildcards (`%`) as it can lead to full table scans, which are inefficient.
 
-## Game Type Filtering
+## Categorical Filtering with IN
+
+Use the `IN` operator to filter rows based on a list of categorical values. This is effective for filtering games by type or players by position.
 
 ```sql
--- Regular season only (default when not specified by user)
-WHERE g.game_type = 'regular'
-
--- Playoffs only
-WHERE g.game_type = 'playoff'
-
--- All games (remove the game_type filter entirely)
+SELECT game_id, game_date, game_type
+FROM dwh_d_games
+WHERE game_type IN ('Regular Season', 'Playoffs');
 ```
 
-## Team Filtering
+**Anti-pattern:** Using `OR` for multiple categorical conditions can be less readable and harder to maintain than `IN`.
+
+## Numeric Range Filters
+
+For filtering based on numeric ranges, use comparison operators. This is useful for filtering player statistics or game scores.
 
 ```sql
--- By team abbreviation (e.g., LAL = Los Angeles Lakers)
-WHERE t.abbreviation = 'LAL'
-
--- By full name (case-insensitive)
-WHERE LOWER(t.full_name) LIKE '%lakers%'
-
--- By conference/division
-WHERE t.conference = 'West'
-WHERE t.division   = 'Pacific'
+SELECT player_id, points
+FROM dwh_f_player_boxscore
+WHERE points BETWEEN 20 AND 30;
 ```
 
-## Award Filtering
+**Gotcha:** Ensure that the column used in the range filter is indexed for better performance.
+
+## Status/Flag Filtering
+
+Filter data based on status or flag columns to retrieve active or specific flagged records.
 
 ```sql
--- Filter award type
-WHERE a.description ILIKE '%MVP%'
-WHERE a.description ILIKE '%All-NBA%'
-
--- Season of award
-WHERE a.season = '2022-23'
+SELECT team_id, full_name
+FROM dwh_d_teams
+WHERE active_status = 'Active';
 ```
 
-## Position Filtering
+**Anti-pattern:** Avoid using non-boolean columns as flags without clear documentation, as it can lead to confusion.
+
+## NULL Handling
+
+Use `IS NULL` or `IS NOT NULL` to handle NULL values in your filters. This is crucial for columns that may have missing data.
 
 ```sql
-WHERE p.position = 'Guard'
-WHERE p.position IN ('Point Guard', 'Shooting Guard')
+SELECT player_id, school
+FROM dwh_d_players
+WHERE school IS NOT NULL;
 ```
 
-## Draft Filtering
+**Gotcha:** Remember that `NULL` is not equal to anything, including another `NULL`. Use `IS NULL` instead of `=` for comparisons.
+
+## Multi-Table Query Example
+
+Combine filters across multiple tables to extract comprehensive insights. This example retrieves player statistics for a specific team and season.
 
 ```sql
-WHERE p.draft_year = '2003'   -- 2003 draft class (LeBron, Carmelo, etc.)
-WHERE p.draft_round = '1'
+SELECT p.full_name, pb.points, pb.assists, pb.rebounds_offensive
+FROM dwh_d_players p
+JOIN dwh_f_player_boxscore pb ON p.player_id = pb.player_id
+JOIN dwh_f_player_team_seasons pts ON p.player_id = pts.player_id
+WHERE pts.team_id = 'LAL'
+  AND pts.season = '2022'
+  AND pb.points > 15;
 ```
 
-## Combining Filters Safely
-
-Always place the most selective filter first in the WHERE clause:
-```sql
-WHERE g.season_year = '2022'   -- most selective (reduces rows first)
-  AND g.game_type = 'regular'
-  AND bs.player_id = '2544'
-```
-
+**Gotcha:** Ensure that join conditions are correctly specified to avoid Cartesian products, which can lead to performance issues.

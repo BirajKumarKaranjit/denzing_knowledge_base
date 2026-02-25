@@ -1,7 +1,7 @@
 ---
 name: dwh_f_player_team_seasons
-description: "Use when the query involves analyzing player participation across different NBA seasons and teams. This table is essential for understanding a player's career trajectory, including which teams they played for in specific seasons and how many games they participated in. It is particularly useful for queries related to player movement, team composition over time, and game type distinctions such as regular season versus playoffs. This table helps in evaluating player consistency and team dynamics across multiple seasons."
-tags: [player, team, season, games]
+description: "Use when the query involves analyzing player performance across different seasons and teams. This table is crucial for understanding how many games a player participated in during a specific season, under various game types. It is often used in conjunction with player and team analytics to evaluate performance trends over time. Queries may focus on aggregating player participation data, filtering by specific seasons or teams, and comparing game types."
+tags: [player, team, season, games, analytics]
 priority: high
 ---
 
@@ -13,37 +13,37 @@ CREATE TABLE dwh_f_player_team_seasons (player_id text, season text, team_id tex
 
 ## Column Semantics
 
-- **player_id**: Represents the unique identifier for each player. This is typically a foreign key that links to a player dimension table. Used in WHERE clauses to filter data for specific players or in JOINs to gather more player-specific information.
+- **player_id**: Represents the unique identifier for each player. Typically used in WHERE clauses to filter data for specific players or in JOINs with player dimension tables. Values are alphanumeric strings.
   
-- **season**: Denotes the NBA season, usually formatted as 'YYYY-YYYY' (e.g., '2022-2023'). This column is crucial for temporal analysis and is often used in WHERE and GROUP BY clauses to segment data by season.
+- **season**: Indicates the season during which the games were played. Commonly used in WHERE and GROUP BY clauses to segment data by time periods. Values are usually in a 'YYYY-YYYY' format, such as '2022-2023'.
 
-- **team_id**: Identifies the team for which the player played during the specified season. This is a foreign key that usually links to a team dimension table. Commonly used in JOINs to fetch team details or in WHERE clauses to filter by team.
+- **team_id**: Denotes the unique identifier for each team. Often used in WHERE clauses to filter data for specific teams or in JOINs with team dimension tables. Values are alphanumeric strings.
 
-- **game_type**: Specifies the type of games the data pertains to, such as 'Regular Season' or 'Playoffs'. This column is important for distinguishing between different competitive contexts and is often used in WHERE clauses.
+- **game_type**: Specifies the type of game, such as 'regular', 'playoff', etc. Useful for filtering and grouping data by game type. Values are typically categorical strings.
 
-- **games_played**: Indicates the number of games the player participated in during the specified season and game type. This numeric value is used in SELECT statements to calculate averages or totals and can be used in WHERE clauses to filter players based on participation.
+- **games_played**: Represents the number of games a player has participated in during the specified season and game type. This numeric field is often aggregated in SELECT statements to calculate totals or averages.
 
 ## Common Query Patterns
 
-- Retrieve the number of games played by a specific player in a given season: 
+- Retrieve the total number of games played by a specific player in a given season:
   ```sql
-  SELECT games_played FROM dwh_f_player_team_seasons WHERE player_id = '123' AND season = '2022-2023';
+  SELECT SUM(games_played) FROM dwh_f_player_team_seasons WHERE player_id = 'P123' AND season = '2022-2023';
   ```
 
-- Analyze player participation across multiple seasons for a specific team:
+- Compare the number of games played by players across different teams in a specific season:
   ```sql
-  SELECT season, games_played FROM dwh_f_player_team_seasons WHERE team_id = '456' AND player_id = '123';
+  SELECT team_id, SUM(games_played) FROM dwh_f_player_team_seasons WHERE season = '2022-2023' GROUP BY team_id;
   ```
 
-- Compare regular season and playoff participation for players:
+- Filter games played by game type for a particular player:
   ```sql
-  SELECT player_id, SUM(games_played) FROM dwh_f_player_team_seasons WHERE game_type = 'Playoffs' GROUP BY player_id;
+  SELECT game_type, games_played FROM dwh_f_player_team_seasons WHERE player_id = 'P123' AND season = '2022-2023';
   ```
 
 ## Join Relationships
 
-- **player_id**: Typically joins with a player dimension table to fetch player details such as name, position, and career stats.
-  
-- **team_id**: Joins with a team dimension table to obtain team information like team name, location, and historical performance.
+- **player_id**: Typically joins with a player dimension table on player_id to enrich data with player details such as name, position, etc.
 
-- This table is often joined with a game results table to correlate player participation with game outcomes, providing insights into player impact on team success.
+- **team_id**: Commonly joins with a team dimension table on team_id to access team-specific information like team name, location, etc.
+
+- **season**: May be used in conjunction with a calendar or season dimension table to provide additional temporal context or attributes related to the season.

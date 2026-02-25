@@ -1,7 +1,7 @@
 ---
 name: dwh_d_players
-description: "Use when the query involves retrieving detailed information about NBA players, such as their personal details, career history, and draft information. This table is essential for queries that need to filter or group players by team, position, or experience level. It is also useful for analyzing player demographics, such as country of origin or educational background, and for identifying players who are part of the NBA's 75 greatest players list. Ideal for constructing player profiles or conducting historical player comparisons."
-tags: [players, demographics, career, draft]
+description: "Use when the query involves player demographics, career history, or team affiliations in an analytics context. This table provides detailed information about players, including their physical attributes, career timeline, and draft details, which are essential for performance analysis and historical comparisons. It is particularly useful for queries that require filtering by player attributes such as height, weight, or position, and for aggregating statistics based on player experience or draft information. Ideal for generating reports on player career progression, team compositions, or historical player data."
+tags: [players, demographics, career, analytics]
 priority: medium
 ---
 
@@ -35,35 +35,35 @@ CREATE TABLE dwh_d_players (
 ## Column Semantics
 
 - **player_id**: Unique identifier for each player. Used in joins and WHERE clauses.
-- **team_id**: Identifier for the team the player is associated with. Useful for joining with team tables.
-- **full_name**: The player's full name, e.g., "LeBron James". Used in SELECT and WHERE for display and filtering.
-- **player_slug**: A URL-friendly version of the player's name, often used in web applications.
-- **birthdate**: The player's date of birth. Useful for calculating age or filtering by age range.
-- **school**: The college or high school the player attended. Important for analyzing player development.
-- **country**: The player's country of origin. Useful for demographic analysis.
-- **last_affiliation**: The last team or league the player was affiliated with before joining the NBA.
-- **player_height**: Height in inches. Used in SELECT for player profiles.
-- **player_weight**: Weight in pounds. Often used alongside height for physical analysis.
-- **season_experience**: Number of seasons the player has played in the NBA. Used in WHERE or SELECT for experience-based queries.
-- **jersey_number**: The player's jersey number. Often used in SELECT for display purposes.
-- **position**: The player's position, e.g., "Guard", "Forward". Used in WHERE and GROUP BY for role-based analysis.
-- **roster_status**: Indicates if the player is active, inactive, or retired. Critical for filtering current players.
-- **from_year**: The year the player started their NBA career. Useful for historical analysis.
-- **to_year**: The year the player ended their NBA career. Important for career span analysis.
-- **draft_year**: The year the player was drafted. Used in historical draft analysis.
-- **draft_round**: The round in which the player was drafted. Important for draft strategy analysis.
-- **draft_number**: The overall pick number in the draft. Used for evaluating draft success.
-- **greatest_75_flag**: Indicates if the player is part of the NBA's 75 greatest players list. Used in SELECT for special recognition.
+- **team_id**: Identifier for the team the player is associated with. Commonly used in joins with team tables.
+- **full_name**: The player's full name. Useful for display purposes and SELECT statements.
+- **player_slug**: A URL-friendly version of the player's name. Used in web applications and SELECT statements.
+- **birthdate**: The player's date of birth. Can be used to calculate age or filter players by age range.
+- **school**: The educational institution the player attended. Useful for demographic analysis.
+- **country**: The player's country of origin. Important for international player analysis.
+- **last_affiliation**: The last team or organization the player was affiliated with before joining the current team. Used in historical analysis.
+- **player_height**: The player's height, typically in inches or centimeters. Used in SELECT and WHERE clauses for physical attribute analysis.
+- **player_weight**: The player's weight, typically in pounds or kilograms. Used similarly to player_height.
+- **season_experience**: Number of seasons the player has participated in. Useful for experience-based analysis.
+- **jersey_number**: The player's jersey number. Often used in SELECT statements for display.
+- **position**: The player's position on the team (e.g., guard, forward). Critical for role-based analysis.
+- **roster_status**: Indicates if the player is active, inactive, or on a different status. Used in WHERE clauses.
+- **from_year**: The year the player started their professional career. Useful for career duration analysis.
+- **to_year**: The year the player ended their professional career. Used similarly to from_year.
+- **draft_year**: The year the player was drafted. Important for draft analysis.
+- **draft_round**: The round in which the player was drafted. Used in draft-related queries.
+- **draft_number**: The overall pick number of the player in the draft. Used in SELECT and WHERE clauses.
+- **greatest_75_flag**: Indicates if the player is part of the league's greatest 75 players. Used for historical significance analysis.
 
 ## Common Query Patterns
 
-- Retrieve all players currently active on a specific team: `WHERE team_id = 'XYZ' AND roster_status = 'active'`
-- List players drafted in a specific year and round: `WHERE draft_year = '2020' AND draft_round = '1'`
-- Analyze player demographics by country: `SELECT country, COUNT(*) FROM dwh_d_players GROUP BY country`
-- Identify players with more than 10 years of experience: `WHERE season_experience > 10`
+- Retrieve all players from a specific team: `SELECT * FROM dwh_d_players WHERE team_id = 'XYZ';`
+- Find players drafted in a specific year and round: `SELECT full_name FROM dwh_d_players WHERE draft_year = '2020' AND draft_round = '1';`
+- List players with more than 10 years of experience: `SELECT full_name FROM dwh_d_players WHERE season_experience > 10;`
+- Filter players by position and roster status: `SELECT full_name FROM dwh_d_players WHERE position = 'Guard' AND roster_status = 'Active';`
 
 ## Join Relationships
 
-- **team_id**: Typically joined with a team dimension table to get team details.
-- **player_id**: Used to join with performance or statistics tables to analyze player performance.
-- **draft_year, draft_round, draft_number**: Can be joined with draft tables for detailed draft analysis.
+- **team_id**: Typically joined with a team dimension table to get detailed team information.
+- **player_id**: Used to join with other player-related tables, such as performance statistics or contract details.
+- **country**: Can be joined with a country reference table for additional geographic data.

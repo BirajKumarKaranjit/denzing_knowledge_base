@@ -169,16 +169,12 @@ def get_embeddings_batch(
     if not texts:
         raise ValueError("texts list is empty — nothing to embed.")
 
-    # Replace empty strings with a space to avoid API validation errors
     sanitized = [t.strip() if t and t.strip() else " " for t in texts]
 
     response = _client.embeddings.create(
         model=model,
         input=sanitized,
     )
-
-    # The API returns embeddings in the same order as the input.
-    # Sort by index to be safe (API spec guarantees order but let's be explicit).
     sorted_data = sorted(response.data, key=lambda item: item.index)
     return [item.embedding for item in sorted_data]
 

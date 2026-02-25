@@ -1,7 +1,7 @@
 ---
 name: dwh_f_team_championships
-description: "Use when the query involves identifying NBA teams that have won championships, the years they won, and their opponents in the finals. This table is essential for analyzing team success over time, comparing championship wins, and understanding historical matchups between teams. Ideal for queries about team performance, championship history, and rivalries in the NBA."
-tags: [championships, teams, NBA history]
+description: "Use when the query involves analyzing team championship victories, historical performance, or competitive matchups. This table provides insights into which teams have won championships, the years they were awarded, and the opposing teams they faced. It is essential for understanding team success over time and comparing performance against specific competitors. Ideal for queries focusing on championship trends, rivalry analysis, and historical sports data analytics."
+tags: [championships, teams, sports, analytics]
 priority: high
 ---
 
@@ -13,31 +13,31 @@ CREATE TABLE dwh_f_team_championships (team_id text, yearawarded text, oppositet
 
 ## Column Semantics
 
-- **team_id**: Represents the unique identifier for an NBA team. This is crucial for linking to other tables containing team-specific data. Typically used in SELECT and JOIN clauses. Example values include 'LAL' for Los Angeles Lakers or 'BOS' for Boston Celtics.
-
-- **yearawarded**: Indicates the year in which the team won the championship. This is a text field but represents a year, such as '2020' or '1996'. Commonly used in WHERE clauses to filter results by specific years or ranges.
-
-- **oppositeteam**: The name of the team that was defeated in the finals. This provides context for the championship win, highlighting historical rivalries and matchups. Example values might include 'Miami Heat' or 'Golden State Warriors'. Used in SELECT statements to display or analyze opponent data.
+- **team_id**: Represents the unique identifier for a team that has won a championship. Typically a text string, it is used to filter results for specific teams. Commonly used in WHERE and JOIN clauses to connect with other team-related tables.
+  
+- **yearawarded**: Indicates the year in which the championship was awarded to the team. Stored as text, but represents a year (e.g., '2020', '2021'). This column is crucial for temporal analysis and is often used in WHERE clauses to filter by specific years or in GROUP BY clauses to aggregate data by year.
+  
+- **oppositeteam**: Denotes the team that was the opponent in the championship match. Like team_id, it is a text string and is used to analyze matchups and rivalries. This column is useful in SELECT statements to display opponent information and in WHERE clauses to filter by specific opponents.
 
 ## Common Query Patterns
 
-- Retrieve all championship wins for a specific team:
+- Retrieve all championships won by a specific team:
   ```sql
-  SELECT yearawarded FROM dwh_f_team_championships WHERE team_id = 'LAL';
+  SELECT * FROM dwh_f_team_championships WHERE team_id = 'TeamA';
   ```
 
-- Compare championship wins between two teams over a period:
+- List all championships in a particular year:
   ```sql
-  SELECT team_id, COUNT(*) as championships FROM dwh_f_team_championships WHERE yearawarded BETWEEN '2000' AND '2020' GROUP BY team_id;
+  SELECT * FROM dwh_f_team_championships WHERE yearawarded = '2021';
   ```
 
-- List all teams that defeated a specific team in the finals:
+- Find all opponents a team has faced in championship matches:
   ```sql
-  SELECT team_id FROM dwh_f_team_championships WHERE oppositeteam = 'Boston Celtics';
+  SELECT oppositeteam FROM dwh_f_team_championships WHERE team_id = 'TeamA';
   ```
 
 ## Join Relationships
 
-- **team_id**: This column can be joined with a team dimension table (e.g., `dwh_dim_teams`) on `team_id` to retrieve additional team details such as team name, location, and conference.
-- **yearawarded**: Can be used to join with a calendar or season table to provide more context about the season, such as regular season records or playoff performance.
-- **oppositeteam**: While not a direct foreign key, this can be used in conjunction with a team dimension table to gather more information about the opposing teams in championship matchups.
+- This table can be joined with a team dimension table using `team_id` to enrich data with team details such as team name, location, or league.
+- Potential joins with a calendar table using `yearawarded` to integrate additional temporal data like season start and end dates.
+- Join with a match results table using `team_id` and `oppositeteam` to analyze detailed match statistics and outcomes.

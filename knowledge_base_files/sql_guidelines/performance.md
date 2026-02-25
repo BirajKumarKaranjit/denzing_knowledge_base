@@ -1,78 +1,104 @@
 ---
 name: performance
-description: "Use when writing queries that need to be fast and efficient on large datasets. Covers index-aware filtering, partition pruning, scan reduction strategies, and common NBA query optimisation patterns. Choose this for queries on large tables like dwh_f_player_boxscore or dwh_f_player_tracking, or when the query involves full season scans, large GROUP BY operations, or multiple large joins."
-tags: [performance, optimisation, indexes, query-planning, scan-reduction]
-priority: low
+description: "Use when the query involves optimizing SQL performance by filtering data before joining tables, indexing primary and foreign keys, using LIMIT for large result sets, choosing between EXISTS and IN for subqueries, and avoiding expensive full-table scans by pushing predicates early. This guidance is crucial for improving query efficiency in analytics databases, especially when dealing with large datasets and complex joins."
+tags: [performance, optimization, indexing, filtering]
+priority: high
 ---
 
-# Query Performance for NBA Analytics
+## Filter-Before-Join Optimization
 
-## Core Optimisation Rules
-
-1. **Filter before joining** — always apply `WHERE season_year = ...` and `game_type = ...`
-   before the JOIN to reduce the number of rows being joined.
-2. **Use IDs for joins and filters** — `player_id`, `team_id`, `game_id` are indexed.
-   Never join or filter on `full_name`, `player_slug`, or `abbreviation`.
-3. **Avoid SELECT *** — always name the columns you need; avoids transferring unused data.
-4. **Use CTEs for readability AND optimisation** — Postgres materialises CTEs in some versions,
-   which can help avoid repeated full scans.
-
-## Filter-First Pattern
+When joining large tables, always apply filters before the join to reduce the dataset size and improve performance.
 
 ```sql
--- ✅ Good: filter season before joining
-SELECT bs.player_id, SUM(bs.points)
-FROM dwh_f_player_boxscore bs
-JOIN dwh_d_games g ON bs.game_id = g.game_id
-WHERE g.season_year = '2022'          -- applied before join evaluation
-  AND g.game_type   = 'regular'
-GROUP BY bs.player_id;
-
--- ❌ Avoid: joining everything then filtering
-SELECT bs.player_id, SUM(bs.points)
-FROM dwh_f_player_boxscore bs
-JOIN dwh_d_games g ON bs.game_id = g.game_id
-GROUP BY bs.player_id, g.season_year
-HAVING g.season_year = '2022';        -- filter applied after full aggregation
+SELECT g.game_id, g.game_date, t.full_name
+FROM dwh_d_games g
+JOIN dwh_d_teams t ON g.home_team_id = t.team_id
+WHERE g.season_year = '2023'
+  AND t.conference = 'East';
 ```
 
-## Indexed Columns (use these in WHERE / JOIN)
+**Gotcha:** Avoid applying filters after the join, as this can lead to unnecessary data processing and slower queries.
 
-| Table | Indexed columns |
-|---|---|
-| `dwh_f_player_boxscore` | `game_id`, `player_id`, `team_id` |
-| `dwh_f_team_boxscore` | `game_id`, `team_id` |
-| `dwh_d_games` | `game_id`, `season_year`, `game_type` |
-| `dwh_d_players` | `player_id` |
-| `dwh_d_teams` | `team_id` |
+## Indexing Strategy
 
-## Reducing Large Table Scans
+Index columns that are frequently used in WHERE clauses, JOIN conditions, and as foreign keys to speed up data retrieval.
+
+- **Primary Keys**: Typically indexed by default.
+- **Foreign Keys**: Consider indexing `home_team_id`, `visitor_team_id` in `dwh_d_games`, and `player_id` in `dwh_f_player_boxscore`.
+
+**Example:**
 
 ```sql
--- For dwh_f_player_tracking (very wide table), only select needed columns
-SELECT pt.player_id, pt.speed, pt.distance
-FROM dwh_f_player_tracking pt
-WHERE pt.game_id = :game_id;   -- always filter by game_id or player_id first
+-- Create an index on the foreign key column
+CREATE INDEX idx_home_team_id ON dwh_d_games(home_team_id);
 ```
 
-## LIMIT for Exploratory Queries
+**Gotcha:** Over-indexing can lead to increased storage and maintenance overhead. Index only where necessary.
 
-When a query may return many rows, always add a LIMIT:
+## Using LIMIT for Large Result Sets
+
+When querying large tables, use the `LIMIT` clause to restrict the number of rows returned, which can significantly reduce query execution time.
+
 ```sql
-ORDER BY points_per_game DESC
-LIMIT 20;
+SELECT player_id, full_name, position
+FROM dwh_d_players
+WHERE country = 'USA'
+LIMIT 100;
 ```
 
-## EXISTS vs IN for Large Sets
+**Gotcha:** Be cautious with LIMIT in pagination; combine with ORDER BY to ensure consistent results.
+
+## EXISTS vs IN for Subqueries
+
+Use `EXISTS` for subqueries when checking for the existence of rows, as it can be more efficient than `IN` with large datasets.
 
 ```sql
--- ✅ Prefer EXISTS when checking membership in a large subquery
+-- Using EXISTS
+SELECT p.player_id, p.full_name
+FROM dwh_d_players p
 WHERE EXISTS (
-    SELECT 1 FROM dwh_f_player_awards a
-    WHERE a.player_id = p.player_id AND a.season = '2022-23'
-)
-
--- ⚠ IN with a large subquery can be slow on older Postgres versions
-WHERE player_id IN (SELECT player_id FROM dwh_f_player_awards WHERE season = '2022-23')
+  SELECT 1
+  FROM dwh_f_player_awards a
+  WHERE a.player_id = p.player_id
+    AND a.season = '2023'
+);
 ```
 
+**Gotcha:** `IN` can be less efficient with subqueries returning a large number of rows.
+
+## Avoiding Full-Table Scans
+
+Push predicates early in the query to avoid full-table scans, which are costly in terms of performance.
+
+```sql
+SELECT g.game_id, g.game_date, t.full_name
+FROM dwh_d_games g
+JOIN dwh_d_teams t ON g.home_team_id = t.team_id
+WHERE g.game_date BETWEEN '2023-01-01' AND '2023-12-31'
+  AND t.active_status = 'Active';
+```
+
+**Gotcha:** Ensure that predicates are applied before joins to minimize the data processed.
+
+## Complete Multi-Table Query Example
+
+Here's a comprehensive example that combines several performance optimization techniques:
+
+```sql
+SELECT g.game_id, g.game_date, ht.full_name AS home_team, vt.full_name AS visitor_team
+FROM dwh_d_games g
+JOIN dwh_d_teams ht ON g.home_team_id = ht.team_id
+JOIN dwh_d_teams vt ON g.visitor_team_id = vt.team_id
+WHERE g.season_year = '2023'
+  AND ht.conference = 'East'
+  AND vt.conference = 'West'
+  AND EXISTS (
+    SELECT 1
+    FROM dwh_f_team_championships c
+    WHERE c.team_id = ht.team_id
+      AND c.yearawarded = '2023'
+  )
+LIMIT 50;
+```
+
+This query efficiently retrieves game details by filtering on season year and team conferences before joining, using EXISTS for subquery optimization, and limiting the result set.

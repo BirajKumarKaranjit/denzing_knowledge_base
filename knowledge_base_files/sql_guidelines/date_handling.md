@@ -1,84 +1,106 @@
 ---
 name: date_handling
-description: "Use when the query involves filtering or grouping by date, season year, game date, or time periods. Covers DATE_TRUNC usage, season year conventions (2022 means 2022-23 season), date range filters, and avoiding CURRENT_DATE anti-patterns. Choose this for any query with words like 'last season', 'in 2022', 'during the season', or any time-based analysis."
-tags: [dates, season, date-trunc, time-filter, season-year]
-priority: medium
+description: "Use when the query involves manipulating dates for period grouping, filtering by date ranges, extracting specific date components like year or month, and dynamically finding the latest available period using MAX(). This guideline is essential for avoiding hard-coded dates in production queries, ensuring flexibility and accuracy in time-based data analysis. It is particularly useful in scenarios involving game schedules, player statistics over time, and team performance metrics."
+tags: [date_trunc, extract, date_range, max_date]
+priority: high
 ---
 
-# Date Handling for NBA Analytics
+## Grouping by Period with DATE_TRUNC
 
-## Season Year Convention
-
-> **Critical:** `season_year` stores the STARTING year of the season.
-> `'2022'` = the 2022-23 NBA season (Oct 2022 – Jun 2023).
-> Always confirm with the user if "2022" means the 2022 calendar year or the 2022-23 season.
+When you need to group data by specific time periods such as month or year, `DATE_TRUNC` is your friend. This function truncates a date or timestamp to the specified precision.
 
 ```sql
--- Regular season 2022-23
-WHERE g.season_year = '2022' AND g.game_type = 'regular'
-
--- Multiple seasons
-WHERE g.season_year IN ('2021', '2022', '2023')
-
--- Range of seasons
-WHERE g.season_year::integer BETWEEN 2019 AND 2022
+SELECT 
+    DATE_TRUNC('month', game_date) AS month,
+    COUNT(game_id) AS games_played
+FROM 
+    dwh_d_games
+GROUP BY 
+    DATE_TRUNC('month', game_date)
+ORDER BY 
+    month;
 ```
 
-## Game Date Filtering
+### Gotcha
+- Ensure the column you are truncating is of type `date` or `timestamp`. Truncating other types will result in errors.
 
-`game_date` is stored as `DATE` in `dwh_d_games`.
+## Filtering by Date Range
+
+To filter records within a specific date range, use the `BETWEEN` operator for clarity and readability.
 
 ```sql
--- Specific calendar date
-WHERE g.game_date = '2022-12-25'
-
--- Date range (Christmas to New Year's)
-WHERE g.game_date BETWEEN '2022-12-25' AND '2022-12-31'
-
--- All games in a calendar month
-WHERE DATE_TRUNC('month', g.game_date) = '2022-12-01'
+SELECT 
+    game_id, 
+    game_date, 
+    home_team_id, 
+    visitor_team_id
+FROM 
+    dwh_d_games
+WHERE 
+    game_date BETWEEN '2023-01-01' AND '2023-12-31';
 ```
 
-## Grouping by Time Period
+### Anti-pattern
+- Avoid using hard-coded dates directly in your queries. Instead, use parameters or variables to make your queries more flexible and maintainable.
+
+## Extracting Year and Month with EXTRACT
+
+The `EXTRACT` function is useful for pulling out specific components of a date, such as the year or month.
 
 ```sql
--- Monthly breakdown of player scoring
-SELECT
-    DATE_TRUNC('month', g.game_date) AS month,
-    SUM(bs.points)                   AS total_points
-FROM dwh_f_player_boxscore bs
-JOIN dwh_d_games g ON bs.game_id = g.game_id
-WHERE g.season_year = '2022' AND bs.player_id = :player_id
-GROUP BY DATE_TRUNC('month', g.game_date)
-ORDER BY month;
+SELECT 
+    EXTRACT(YEAR FROM game_date) AS year,
+    EXTRACT(MONTH FROM game_date) AS month,
+    COUNT(game_id) AS games_played
+FROM 
+    dwh_d_games
+GROUP BY 
+    year, month
+ORDER BY 
+    year, month;
 ```
 
-## Anti-Patterns to Avoid
+### Gotcha
+- The `EXTRACT` function returns a double precision value, so be mindful of this when using it in calculations or comparisons.
+
+## Finding the Latest Period with MAX()
+
+To dynamically find the latest available date or period, use the `MAX()` function. This is particularly useful for reports that need to show the most recent data.
 
 ```sql
--- ❌ NEVER use CURRENT_DATE — data may not be live/current
-WHERE g.game_date = CURRENT_DATE
-
--- ✅ Instead, find the latest available date in the data
-WHERE g.game_date = (SELECT MAX(game_date) FROM dwh_d_games)
-
--- ❌ NEVER cast game_date to text for comparison
-WHERE CAST(g.game_date AS TEXT) LIKE '2022%'
-
--- ✅ Use proper date functions
-WHERE EXTRACT(YEAR FROM g.game_date) = 2022
+SELECT 
+    MAX(game_date) AS latest_game_date
+FROM 
+    dwh_d_games;
 ```
 
-## Season vs Calendar Year Queries
+### Anti-pattern
+- Avoid assuming the latest date is today or a fixed date. Always calculate it dynamically to ensure accuracy.
+
+## Multi-Table Query Example
+
+Combining date handling with joins across multiple tables can provide comprehensive insights. Here’s how you can find the latest game for each team and their scores.
 
 ```sql
--- "Last season" = most recent season_year in data
-WITH latest_season AS (
-    SELECT MAX(season_year) AS season_year FROM dwh_d_games
-)
-SELECT ...
-FROM dwh_f_player_boxscore bs
-JOIN dwh_d_games g ON bs.game_id = g.game_id
-JOIN latest_season ls ON g.season_year = ls.season_year;
+SELECT 
+    g.home_team_id,
+    t.full_name AS home_team_name,
+    g.visitor_team_id,
+    vt.full_name AS visitor_team_name,
+    g.game_date,
+    g.home_score,
+    g.visitor_score
+FROM 
+    dwh_d_games g
+JOIN 
+    dwh_d_teams t ON g.home_team_id = t.team_id
+JOIN 
+    dwh_d_teams vt ON g.visitor_team_id = vt.team_id
+WHERE 
+    g.game_date = (SELECT MAX(game_date) FROM dwh_d_games)
+ORDER BY 
+    g.game_date DESC;
 ```
 
+### Gotcha
+- Ensure that the subquery for the latest date is correctly correlated if needed, to avoid performance issues or incorrect results.

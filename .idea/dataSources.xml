@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="DataSourceManagerImpl" format="xml" multifile-model="true">
-    <data-source source="LOCAL" name="nba_kb@localhost" uuid="ad8d08f3-7c55-4cce-8c9b-c89cb6fda2c5">
+    <data-source source="LOCAL" name="knowledge_base@localhost" uuid="69811557-7d4f-43f4-ad2f-0ddb702f5059">
       <driver-ref>postgresql</driver-ref>
       <synchronize>true</synchronize>
       <jdbc-driver>org.postgresql.Driver</jdbc-driver>
-      <jdbc-url>jdbc:postgresql://localhost:5432/nba_kb</jdbc-url>
+      <jdbc-url>jdbc:postgresql://localhost:5432/knowledge_base</jdbc-url>
       <working-dir>$ProjectFileDir$</working-dir>
     </data-source>
   </component>

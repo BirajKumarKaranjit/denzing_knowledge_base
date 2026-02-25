@@ -1,86 +1,123 @@
 ---
 name: aggregations
-description: "Use when the query requires summarising, totalling, counting, averaging, or ranking data. Covers GROUP BY patterns, aggregate functions (SUM, AVG, COUNT), per-game calculations, season totals, leaderboard ranking, and window functions. Choose this for queries about scoring leaders, season averages, team totals, top-N rankings, or any stat that aggregates across multiple rows."
-tags: [aggregations, group-by, sum, avg, count, rankings, window-functions]
+description: "Use when the query involves calculating totals, averages, or counts across dimensions such as games, players, or teams. This includes scenarios where you need to group data by specific columns, apply aggregate functions like SUM, AVG, or COUNT, and filter results using HAVING clauses. Additionally, this category covers the use of window functions for ranking or calculating running totals, and techniques like NULLIF to safely handle division operations that might result in divide-by-zero errors."
+tags: [aggregations, group by, window functions, safe division]
 priority: high
 ---
 
-# Aggregation Patterns for NBA Analytics
+## GROUP BY Patterns
 
-## Foundational Rules
+When aggregating data, the `GROUP BY` clause is essential for organizing results by specific dimensions. Here's how you can calculate the total points scored by each team in each game:
 
-- Always use `COUNT(DISTINCT game_id)` for game counts — never `COUNT(*)` which counts rows.
-- Always wrap denominators in `NULLIF(denominator, 0)` to guard against division-by-zero.
-- Use `ROUND(..., 2)` for percentage columns; `ROUND(..., 1)` for per-game averages.
-
-## Season Per-Game Averages
 ```sql
-SELECT
-    p.full_name,
-    COUNT(DISTINCT bs.game_id)                                       AS games_played,
-    ROUND(SUM(bs.points) / NULLIF(COUNT(DISTINCT bs.game_id), 0), 1) AS points_per_game,
-    ROUND(SUM(bs.assists) / NULLIF(COUNT(DISTINCT bs.game_id), 0), 1) AS assists_per_game,
-    ROUND(
-        SUM(bs.rebounds_offensive + bs.rebounds_defensive)
-        / NULLIF(COUNT(DISTINCT bs.game_id), 0), 1
-    ) AS rebounds_per_game
-FROM dwh_f_player_boxscore bs
-JOIN dwh_d_players p ON bs.player_id = p.player_id
-JOIN dwh_d_games g ON bs.game_id = g.game_id
-WHERE g.season_year = '2022'
-  AND g.game_type   = 'regular'
-GROUP BY p.player_id, p.full_name
-ORDER BY points_per_game DESC;
+SELECT 
+    game_id,
+    team_id,
+    SUM(points) AS total_points
+FROM 
+    dwh_f_team_boxscore
+GROUP BY 
+    game_id, team_id;
 ```
 
-## Season Totals
+### Gotcha: Missing GROUP BY Columns
+
+Ensure that all non-aggregated columns in the `SELECT` clause are included in the `GROUP BY` clause to avoid SQL errors.
+
+## Using Aggregate Functions
+
+Aggregate functions like `SUM`, `AVG`, and `COUNT` are commonly used in analytics queries. Here's an example of calculating the average player height by team:
+
 ```sql
-SELECT
-    p.full_name,
-    SUM(bs.points)  AS total_points,
-    SUM(bs.assists) AS total_assists
-FROM dwh_f_player_boxscore bs
-JOIN dwh_d_players p ON bs.player_id = p.player_id
-JOIN dwh_d_games g ON bs.game_id = g.game_id
-WHERE g.season_year = '2022'
-GROUP BY p.player_id, p.full_name;
+SELECT 
+    team_id,
+    AVG(player_height) AS average_height
+FROM 
+    dwh_d_players
+GROUP BY 
+    team_id;
 ```
 
-## Top-N Leaderboard with RANK / DENSE_RANK
+### Anti-pattern: Aggregating Without GROUP BY
+
+Avoid using aggregate functions without a `GROUP BY` clause unless you intend to aggregate over the entire dataset.
+
+## HAVING Clauses
+
+The `HAVING` clause is used to filter results after aggregation. For example, to find teams with an average player weight over 200:
+
 ```sql
-WITH season_stats AS (
-    SELECT
-        p.full_name,
-        ROUND(SUM(bs.points) / NULLIF(COUNT(DISTINCT bs.game_id), 0), 1) AS ppg
-    FROM dwh_f_player_boxscore bs
-    JOIN dwh_d_players p ON bs.player_id = p.player_id
-    JOIN dwh_d_games g    ON bs.game_id = g.game_id
-    WHERE g.season_year = '2022' AND g.game_type = 'regular'
-    GROUP BY p.player_id, p.full_name
-)
-SELECT full_name, ppg, RANK() OVER (ORDER BY ppg DESC) AS rank
-FROM season_stats
-WHERE ppg IS NOT NULL
-ORDER BY rank
-LIMIT 10;
+SELECT 
+    team_id,
+    AVG(player_weight) AS average_weight
+FROM 
+    dwh_d_players
+GROUP BY 
+    team_id
+HAVING 
+    AVG(player_weight) > 200;
 ```
 
-## Team-Level Aggregations
+### Gotcha: HAVING vs WHERE
+
+Remember that `HAVING` is used for conditions on aggregated data, while `WHERE` is used for row-level filtering before aggregation.
+
+## Window Functions
+
+Window functions allow calculations across a set of table rows related to the current row. Here's how to rank players by points scored in each game:
+
 ```sql
-SELECT
+SELECT 
+    player_id,
+    game_id,
+    points,
+    RANK() OVER (PARTITION BY game_id ORDER BY points DESC) AS player_rank
+FROM 
+    dwh_f_player_boxscore;
+```
+
+### Anti-pattern: Misusing Window Functions
+
+Avoid using window functions when a simple `GROUP BY` would suffice, as they can be more computationally expensive.
+
+## Safe Division with NULLIF
+
+To prevent divide-by-zero errors, use `NULLIF` in division operations. Here's an example calculating the field goal percentage:
+
+```sql
+SELECT 
+    player_id,
+    game_id,
+    field_goals_made,
+    field_goals_attempted,
+    (field_goals_made::numeric / NULLIF(field_goals_attempted, 0)) * 100 AS field_goal_percentage
+FROM 
+    dwh_f_player_boxscore;
+```
+
+## Multi-Table Query Example
+
+Combining data from multiple tables can provide richer insights. Here's how to calculate the total points scored by players from each team in a specific season:
+
+```sql
+SELECT 
+    t.team_id,
     t.full_name AS team_name,
-    ROUND(AVG(tbs.points), 1) AS avg_points_per_game
-FROM dwh_f_team_boxscore tbs
-JOIN dwh_d_teams t   ON tbs.team_id  = t.team_id
-JOIN dwh_d_games g   ON tbs.game_id  = g.game_id
-WHERE g.season_year = '2022' AND g.game_type = 'regular'
-GROUP BY t.team_id, t.full_name
-ORDER BY avg_points_per_game DESC;
+    SUM(pb.points) AS total_points
+FROM 
+    dwh_f_player_boxscore pb
+JOIN 
+    dwh_d_players p ON pb.player_id = p.player_id
+JOIN 
+    dwh_d_teams t ON p.team_id = t.team_id
+WHERE 
+    pb.game_id IN (
+        SELECT game_id 
+        FROM dwh_d_games 
+        WHERE season_year = '2023'
+    )
+GROUP BY 
+    t.team_id, t.full_name;
 ```
 
-## Minimum Games Filter
-Always apply a minimum-games filter for statistical relevance:
-```sql
-HAVING COUNT(DISTINCT bs.game_id) >= 20
-```
-
+This query joins player box scores with player and team details, filtering for games in the 2023 season and aggregating total points by team.

@@ -1,42 +1,14 @@
-"""
-kb_system/kb_generator.py
---------------------------
+"""kb_system/kb_generator.py
+
 Generates knowledge base markdown files from raw DDL SQL using GPT-4.
 
-This is the script you run ONCE (or when schema changes) to bootstrap your
-knowledge base. It takes raw CREATE TABLE statements from your DDL extraction
-script and produces structured .md files in the format:
-
-    ---
-    name: table_name
-    description: "Routing description for embedding-based retrieval."
-    tags: [tag1, tag2]
-    priority: high | medium | low
-    ---
-
-    # DDL
-
-    ```sql
-    CREATE TABLE ...
-    ```
-
-    ## Column Semantics
-    - col_name: business meaning, value ranges, nullability notes
-    - ...
-
-    ## Common Query Patterns
-    - How this table is typically joined/filtered
-
-The output files are written to knowledge_base_files/ddl/ and can (and should)
-be manually edited after generation to add domain-specific knowledge that
-GPT-4 cannot infer from DDL alone.
+Run once (or when schema changes) to bootstrap the knowledge base.
 
 Workflow:
-    1. Run your DDL extraction script → get raw SQL strings per table
-    2. Call generate_all_kb_files() → writes ALL .md files to disk
-       (DDL table files + section KB.md index files + root KB.md)
-    3. Review and edit the .md files manually for accuracy
-    4. Run `python main.py build` to embed + load into Postgres
+    1. Run DDL extraction script → get raw SQL strings per table.
+    2. Call generate_all_kb_files() → writes all .md files to disk.
+    3. Review and edit the generated files.
+    4. Run `python main.py build` to embed and load into Postgres.
 """
 
 from __future__ import annotations
@@ -51,6 +23,7 @@ import openai
 from openai.types.chat import ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from utils.config import (
     OPENAI_API_KEY,
     OPENAI_GENERATION_MODEL,
@@ -64,153 +37,96 @@ from utils.sample_values_for_testing import (
     biz_rules_content,
     response_guidelines_content,
 )
+from utils.prompts.kb_generation_prompts import (
+    TABLE_FILE_SYSTEM_PROMPT,
+    SECTION_KB_SYSTEM_PROMPT,
+    ROOT_KB_SYSTEM_PROMPT,
+    SQL_GUIDELINES_SUB_SYSTEM_PROMPT,
+    table_file_user_prompt,
+    section_kb_user_prompt,
+    root_kb_user_prompt,
+    sql_guideline_sub_file_user_prompt,
+)
 
 _client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
+# Generic, schema-agnostic descriptions for each SQL guideline category.
+# Domain-specific examples are produced by the LLM using the actual DDL.
+_SQL_GUIDELINE_HINTS: dict[str, str] = {
+    "joins": (
+        "JOIN patterns for linking tables across the schema. Include standard join pairs, "
+        "double-join gotchas (e.g., self-referencing tables or joining the same table twice), "
+        "and the correct columns to join on based on the DDL foreign key relationships."
+    ),
+    "aggregations": (
+        "GROUP BY patterns, SUM/AVG/COUNT usage, per-record calculations, totals by dimension, "
+        "HAVING clauses, window functions (RANK, DENSE_RANK, ROW_NUMBER, LAG/LEAD), "
+        "and the NULLIF trick for safe division to avoid divide-by-zero errors."
+    ),
+    "filters": (
+        "WHERE clause patterns for text lookup, categorical filtering, numeric range filters, "
+        "status/flag filtering, and NULL handling. Include ILIKE for case-insensitive text "
+        "matching and IN/ANY for multi-value filters."
+    ),
+    "comparisons": (
+        "CASE WHEN expressions, subquery comparisons against aggregated values, "
+        "side-by-side entity comparisons, HAVING threshold filters, "
+        "and conditional aggregations using FILTER (WHERE ...)."
+    ),
+    "date_handling": (
+        "DATE_TRUNC for period grouping, date range filters, EXTRACT for year/month components, "
+        "finding the latest available period dynamically with MAX(), "
+        "and avoiding hard-coded dates in production queries."
+    ),
+    "performance": (
+        "Filter-before-join optimisation, which columns are typically indexed (PKs, FKs, common "
+        "filter columns), LIMIT for large result sets, EXISTS vs IN for subqueries, "
+        "and avoiding expensive full-table scans by pushing predicates early."
+    ),
+}
 
-# ── LLM Response Helpers ──────────────────────────────────────────────────────
 
 def _strip_llm_fences(llm_output: str) -> str:
-    """
-    Strip outer markdown code fences if the LLM wraps its response in them.
-
-    GPT-4 sometimes wraps the entire .md file output in a ```markdown ... ```
-    block even when instructed not to. This helper detects and removes those
-    outer fences so the raw frontmatter (---) is at the very top of the file.
-
-    Parameters
-    ----------
-    llm_output : str
-        Raw string returned by the OpenAI chat completion.
-
-    Returns
-    -------
-    str
-        Cleaned content guaranteed to start with --- if the LLM correctly
-        generated YAML frontmatter.
-    """
+    """Strip outer markdown code fences if the LLM wraps its response in them."""
     stripped = llm_output.strip()
-
     outer_fence = re.match(r"^```[a-zA-Z]*\n(.*)\n```$", stripped, re.DOTALL)
     if outer_fence:
         return outer_fence.group(1).strip()
-
     return stripped
 
 
-_TABLE_FILE_SYSTEM_PROMPT = """
-        You are a technical documentation expert specializing in NBA basketball analytics databases.
-        Your job is to generate structured knowledge base files in a specific markdown format.
-        
-        These files are used by an AI SQL generation system. The files have two parts:
-        1. YAML frontmatter (the "metadata field"): used for semantic routing via embedding similarity
-        2. Markdown body (the "data field"): the actual DDL + column semantics injected into SQL prompts
-        
-        RULES:
-        - The frontmatter 'description' field is CRITICAL — it must be a rich, natural-language description
-          of when this table should be used. Write it as: "Use when the query involves X, Y, Z."
-          This description is what gets embedded and compared against user queries.
-        - The description should include NBA-specific terminology users would naturally use in questions.
-        - In the body, add semantic meaning beyond what the DDL states — explain what each column means
-          in basketball context, common value ranges, business rules, and join patterns.
-        - Tags should be 2-5 lowercase keywords relevant to the table.
-        - Priority: high = core fact tables, medium = dimension tables, low = lookup/reference tables.
-        - Return ONLY the markdown content. No explanations, no code fences around the whole output.
-    """
-
-_SECTION_KB_SYSTEM_PROMPT = """
-        You are a technical documentation expert. Generate a KB.md index file for a knowledge base section.
-        This file describes what the section covers and is used by humans navigating the KB.
-        It is NOT embedded for vector retrieval — it's injected as context alongside retrieved table files.
-        
-        Return ONLY the markdown content. No explanations outside the format.
-    """
-
-_ROOT_KB_SYSTEM_PROMPT = """
-        You are a technical documentation expert. Generate the root KB.md index file for an NBA analytics
-        knowledge base. This file gives an overview of all sections.
-        
-        Return ONLY the markdown content. No explanations outside the format.
-    """
+def _build_ddl_summary(ddl_dict: dict[str, str]) -> str:
+    """Concatenate all DDL statements into a single string for prompt injection."""
+    return "\n\n".join(f"-- Table: {name}\n{sql}" for name, sql in ddl_dict.items())
 
 
 def generate_table_md_file(
     table_name: str,
     ddl_sql: str,
-    domain: str = "NBA basketball analytics",
+    domain: str = "analytics",
 ) -> str:
-    """
-    Call GPT-4 to generate a structured KB markdown file for a single database table.
-
-    The generated file contains YAML frontmatter (metadata field used for embedding-based
-    routing) and a markdown body (data field with DDL + column semantics injected into
-    the SQL prompt at query time).
+    """Call the LLM to generate a structured KB markdown file for a single table.
 
     Parameters
     ----------
-    table_name : str
-        Database table name (e.g., "players", "box_scores").
-        Used in the frontmatter ``name`` field and in the LLM prompt.
-    ddl_sql : str
+    table_name:
+        Database table name.
+    ddl_sql:
         Raw CREATE TABLE SQL string for this table.
-        Comes directly from your DDL extraction script.
-    domain : str
-        Domain context string passed to the LLM to improve description quality.
-        Default is "NBA basketball analytics".
+    domain:
+        Domain context string (e.g. "NBA basketball analytics").
+
     Returns
     -------
     str
-        Generated markdown content as a string (not yet written to disk).
-        Caller should write this to knowledge_base_files/ddl/{table_name}.md.
-
-    Raises
-    ------
-    openai.OpenAIError
-        If the GPT-4 API call fails after retries.
+        Generated markdown content (not yet written to disk).
     """
-    user_prompt = f"""
-        Generate a knowledge base markdown file for the following database table.
-        
-        Domain: {domain}
-        Table name: {table_name}
-        
-        DDL:
-        {ddl_sql}
-        
-        Required format:
-        ---
-        name: {table_name}
-        description: "WRITE A RICH DESCRIPTION HERE. Start with: Use when the query involves..."
-          Include all {domain} relevant terminology users might use when asking about this data.
-          This is the most important field — make it comprehensive (3-5 sentences).
-        tags: [tag1, tag2, tag3]
-        priority: high | medium | low
-        ---
-        
-        # DDL
-        
-        ```sql
-        {ddl_sql}
-        ```
-        
-        ## Column Semantics
-        For each column, explain:
-        - Business meaning in {domain} context
-        - Value ranges or example values if inferrable
-        - Whether it's typically used in WHERE, GROUP BY, or SELECT
-        - Any gotchas (nullable, approximate values, etc.)
-        
-        ## Common Query Patterns
-        2-4 bullet points showing how this table is typically used in queries.
-        Include example WHERE conditions or JOIN patterns.
-        
-        ## Join Relationships
-        How this table relates to other tables (foreign keys, typical join conditions).
-        """
-
     messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
-        ChatCompletionSystemMessageParam(role="system", content=_TABLE_FILE_SYSTEM_PROMPT),
-        ChatCompletionUserMessageParam(role="user", content=user_prompt),
+        ChatCompletionSystemMessageParam(role="system", content=TABLE_FILE_SYSTEM_PROMPT),
+        ChatCompletionUserMessageParam(
+            role="user",
+            content=table_file_user_prompt(table_name, ddl_sql, domain),
+        ),
     ]
     response = _client.chat.completions.create(
         model=OPENAI_GENERATION_MODEL,
@@ -218,7 +134,6 @@ def generate_table_md_file(
         temperature=0.2,
         max_tokens=2000,
     )
-
     return _strip_llm_fences(response.choices[0].message.content.strip())
 
 
@@ -227,53 +142,28 @@ def generate_section_kb_md(
     table_names: list[str],
     section_description: str,
 ) -> str:
-    """
-    Generate the KB.md index file for a KB section (e.g., ddl/KB.md).
-
-    This file is not embedded for vector retrieval. Instead it is injected
-    alongside matched table files to give the LLM section-level context.
-    Humans also use it to navigate the KB.
+    """Generate the KB.md index file for a KB section.
 
     Parameters
     ----------
-    section_name : str
-        Name of the KB section (e.g., "ddl", "business_rules").
-    table_names : list[str]
-        Names of all files/tables in this section (for listing in the index).
-    section_description : str
-        What this section covers — used by the LLM to understand section scope.
+    section_name:
+        Name of the KB section (e.g. "ddl", "business_rules").
+    table_names:
+        Names of all files/tables in this section.
+    section_description:
+        What this section covers.
 
     Returns
     -------
     str
-        Generated KB.md content ready to write to knowledge_base_files/{section}/KB.md.
+        Generated KB.md content.
     """
-    user_prompt = f"""
-        Generate a KB.md index file for the '{section_name}' section of an NBA analytics knowledge base.
-        
-        Section description: {section_description}
-        
-        Files in this section:
-        {chr(10).join(f'- {name}' for name in table_names)}
-        
-        Required format:
-        ---
-        name: {section_name}_index
-        description: "Brief description of what this section covers and when to use it."
-        ---
-        
-        # {section_name.replace('_', ' ').title()} Section
-        
-        [2-3 sentence overview of what this section contains]
-        
-        ## Contents
-        
-        [List each file with a one-line description of what it covers]
-        """
-
     messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
-        ChatCompletionSystemMessageParam(role="system", content=_SECTION_KB_SYSTEM_PROMPT),
-        ChatCompletionUserMessageParam(role="user", content=user_prompt),
+        ChatCompletionSystemMessageParam(role="system", content=SECTION_KB_SYSTEM_PROMPT),
+        ChatCompletionUserMessageParam(
+            role="user",
+            content=section_kb_user_prompt(section_name, table_names, section_description),
+        ),
     ]
     response = _client.chat.completions.create(
         model=OPENAI_GENERATION_MODEL,
@@ -281,56 +171,30 @@ def generate_section_kb_md(
         temperature=0.1,
         max_tokens=800,
     )
-
     return _strip_llm_fences(response.choices[0].message.content.strip())
 
 
-def generate_root_kb_md(sections: dict[str, str], domain: str = "NBA basketball analytics") -> str:
-    """
-    Generate the root KB.md file that describes the entire knowledge base.
-
-    The root KB.md gives the LLM (and humans) an overview of what sections
-    exist and what each covers. It is injected into the SQL prompt as
-    high-level context.
+def generate_root_kb_md(sections: dict[str, str], domain: str = "analytics") -> str:
+    """Generate the root KB.md file that describes the entire knowledge base.
 
     Parameters
     ----------
-    sections : dict[str, str]
-        Mapping of section_name → brief description.
-        e.g., {"ddl": "Table schemas...", "business_rules": "..."}
+    sections:
+        Mapping of section_name to brief description.
+    domain:
+        Domain label for the knowledge base.
 
     Returns
     -------
     str
-        Generated root KB.md content ready to write to knowledge_base_files/KB.md.
+        Generated root KB.md content.
     """
-    section_list = "\n".join(
-        f"- {name}: {desc}" for name, desc in sections.items()
-    )
-
-    user_prompt = f"""
-        Generate the root KB.md for the {domain} knowledge base.
-        
-        Sections:
-        {section_list}
-        
-        Required format:
-        ---
-        name: root_knowledge_base
-        description: "Root index of the {domain} knowledge base."
-        ---
-        
-        # {domain} Knowledge Base
-        
-        [2-3 sentence overview of the entire KB]
-        
-        ## Sections
-        [List each section with description]
-        """
-
     messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
-        ChatCompletionSystemMessageParam(role="system", content=_ROOT_KB_SYSTEM_PROMPT),
-        ChatCompletionUserMessageParam(role="user", content=user_prompt),
+        ChatCompletionSystemMessageParam(role="system", content=ROOT_KB_SYSTEM_PROMPT),
+        ChatCompletionUserMessageParam(
+            role="user",
+            content=root_kb_user_prompt(sections, domain),
+        ),
     ]
     response = _client.chat.completions.create(
         model=OPENAI_GENERATION_MODEL,
@@ -338,7 +202,49 @@ def generate_root_kb_md(sections: dict[str, str], domain: str = "NBA basketball 
         temperature=0.1,
         max_tokens=600,
     )
+    return _strip_llm_fences(response.choices[0].message.content.strip())
 
+
+def generate_sql_guideline_sub_file(
+    sub_section: str,
+    ddl_dict: dict[str, str],
+) -> str:
+    """Call the LLM to generate a SQL guideline sub-file for one category.
+
+    The full DDL is injected into the prompt so all SQL examples use only
+    real column names and table names — eliminating hallucinated columns.
+
+    Parameters
+    ----------
+    sub_section:
+        Guideline category name (e.g. "joins", "aggregations", "filters").
+    ddl_dict:
+        Mapping of table_name to CREATE TABLE SQL. Used to ground examples.
+
+    Returns
+    -------
+    str
+        Generated markdown content.
+    """
+    hint = _SQL_GUIDELINE_HINTS.get(
+        sub_section,
+        f"SQL patterns and best practices for the '{sub_section}' category.",
+    )
+    ddl_summary = _build_ddl_summary(ddl_dict)
+
+    messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
+        ChatCompletionSystemMessageParam(role="system", content=SQL_GUIDELINES_SUB_SYSTEM_PROMPT),
+        ChatCompletionUserMessageParam(
+            role="user",
+            content=sql_guideline_sub_file_user_prompt(sub_section, hint, ddl_summary),
+        ),
+    ]
+    response = _client.chat.completions.create(
+        model=OPENAI_GENERATION_MODEL,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=2500,
+    )
     return _strip_llm_fences(response.choices[0].message.content.strip())
 
 
@@ -346,41 +252,30 @@ def generate_all_table_files(
     ddl_dict: dict[str, str],
     output_dir: Optional[Path] = None,
     overwrite: bool = False,
+    domain: str = "analytics",
 ) -> list[Path]:
-    """
-    Generate KB markdown files for all tables in ddl_dict and write to disk.
-
-    This is the internal entry point for bootstrapping the DDL section of the KB.
-    Prefer calling generate_all_kb_files() which also generates the static sections.
-
-    The files are written to knowledge_base_files/ddl/{table_name}.md.
-    After generation, REVIEW and EDIT the files manually — GPT-4 generates
-    a solid first draft but you should add domain-specific knowledge it cannot
-    infer from DDL alone (e.g., "salary data is only available from 2000 onward").
+    """Generate KB markdown files for all tables and write to disk.
 
     Parameters
     ----------
-    ddl_dict : dict[str, str]
-        Mapping of table_name → raw CREATE TABLE SQL string.
-        This comes directly from your DDL extraction script.
-        Example: {"players": "CREATE TABLE players (id UUID, ...)", ...}
-    output_dir : Path | None
-        Directory to write .md files into. Defaults to KB_SECTIONS["ddl"]
-        from config.py (i.e., knowledge_base_files/ddl/).
-    overwrite : bool
-        If False (default), skip tables that already have a .md file.
-        Set to True to regenerate all files (e.g., after schema changes).
+    ddl_dict:
+        Mapping of table_name to raw CREATE TABLE SQL string.
+    output_dir:
+        Directory to write files into. Defaults to KB_SECTIONS["ddl"].
+    overwrite:
+        If False, skip tables that already have a .md file.
+    domain:
+        Domain context string passed to the LLM.
 
     Returns
     -------
     list[Path]
-        Paths of all .md files that were written (skipped files excluded).
+        Paths of all .md files that were written.
     """
     if output_dir is None:
         output_dir = KB_SECTIONS["ddl"]
 
     output_dir.mkdir(parents=True, exist_ok=True)
-
     written_files: list[Path] = []
     table_names = list(ddl_dict.keys())
 
@@ -388,12 +283,11 @@ def generate_all_table_files(
         output_path = output_dir / f"{table_name}.md"
 
         if output_path.exists() and not overwrite:
-            print(f"[kb_generator] Skipping {table_name}.md Use overwrite=True to regenerate.")
+            print(f"[kb_generator] Skipping {table_name}.md — use overwrite=True to regenerate.")
             continue
 
         print(f"[kb_generator] Generating {table_name}.md ...")
-        content = generate_table_md_file(table_name, ddl_sql)
-
+        content = generate_table_md_file(table_name, ddl_sql, domain=domain)
         output_path.write_text(content, encoding="utf-8")
         written_files.append(output_path)
         print(f"[kb_generator] Written: {output_path}")
@@ -404,11 +298,14 @@ def generate_all_table_files(
         ddl_kb_content = generate_section_kb_md(
             section_name="ddl",
             table_names=table_names,
-            section_description="Database table schemas, column definitions, and semantic descriptions for the NBA analytics database.",
+            section_description=(
+                f"Database table schemas, column definitions, and semantic descriptions "
+                f"for the {domain} database."
+            ),
         )
         ddl_kb_path.write_text(ddl_kb_content, encoding="utf-8")
         written_files.append(ddl_kb_path)
-        print(f"[kb_generator] ✓ Written: {ddl_kb_path}")
+        print(f"[kb_generator] Written: {ddl_kb_path}")
 
     root_kb_path = KB_ROOT / "KB.md"
     if not root_kb_path.exists() or overwrite:
@@ -416,11 +313,12 @@ def generate_all_table_files(
         print("[kb_generator] Generating root KB.md ...")
         root_content = generate_root_kb_md(
             sections={
-                "ddl": "Table schemas and column definitions for all NBA database tables.",
-                "business_rules": "NBA domain metrics, KPI definitions, and calculation formulas.",
-                "sql_guidelines": "SQL query patterns, join conventions, and dialect-specific gotchas.",
+                "ddl": "Table schemas and column definitions for all database tables.",
+                "business_rules": "Domain metric definitions, KPI formulas, and business logic.",
+                "sql_guidelines": "SQL query patterns, join conventions, and best practices.",
                 "response_guidelines": "Output formatting and response quality guidelines.",
-            }
+            },
+            domain=domain,
         )
         root_kb_path.write_text(root_content, encoding="utf-8")
         written_files.append(root_kb_path)
@@ -429,202 +327,58 @@ def generate_all_table_files(
     return written_files
 
 
-_SQL_GUIDELINES_SUB_SYSTEM_PROMPT = """
-    You are a SQL expert specialising in Postgres and NBA analytics databases.
-    Generate a knowledge base markdown file for a specific SQL guideline category.
-
-    The file has two parts:
-    1. YAML frontmatter — contains name, description, tags, priority.
-       The 'description' field MUST start with "Use when the query involves..."
-       and must be rich and specific so that a vector search can match it
-       against user queries that need this type of SQL guidance.
-    2. Markdown body — practical SQL patterns, templates, and gotchas for this
-       guideline category. Include concrete SQL code blocks for the NBA schema.
-
-    Tables available in the NBA schema:
-    - dwh_d_players, dwh_d_teams, dwh_d_games, dwh_d_player_nicknames
-    - dwh_f_player_boxscore, dwh_f_team_boxscore, dwh_f_player_tracking
-    - dwh_f_player_awards, dwh_f_player_team_seasons, dwh_f_team_championships
-
-    Return ONLY the markdown content. No explanations, no code fences around the whole output.
-"""
-
-
-def generate_sql_guideline_sub_file(sub_section: str) -> str:
-    """
-    Call GPT-4 to generate a SQL guideline sub-file for one guideline category.
-
-    Each sub-file (joins.md, aggregations.md, filters.md, etc.) is an
-    independently embeddable document with rich frontmatter description and
-    practical SQL patterns for that specific category. At retrieval time, only
-    the sub-files relevant to the user's query are injected into the prompt.
-
-    Unlike the monolithic sql_guidelines/KB.md (which is always injected),
-    these sub-files are retrieved by vector similarity — so a simple player
-    lookup query won't get aggregation or join guidelines injected.
+def generate_sql_guidelines_sub_files(
+    ddl_dict: Optional[dict[str, str]] = None,
+    overwrite: bool = False,
+) -> list[Path]:
+    """Generate all SQL guideline sub-files (joins.md, aggregations.md, etc.).
 
     Parameters
     ----------
-    sub_section : str
-        Name of the SQL guideline category (e.g., "joins", "aggregations",
-        "filters", "comparisons", "date_handling", "performance").
-
-    Returns
-    -------
-    str
-        Generated markdown content ready to write to
-        knowledge_base_files/sql_guidelines/{sub_section}.md.
-
-    Raises
-    ------
-    openai.OpenAIError
-        If the GPT-4 API call fails.
-    """
-    # Human-readable descriptions of each sub-section to guide the LLM
-    sub_section_hints: dict[str, str] = {
-        "joins": (
-            "JOIN patterns for linking players, games, teams, box scores, awards, "
-            "and tracking data. Include standard join pairs, gotchas (e.g., double "
-            "join on games for home/away teams), and which columns to join on."
-        ),
-        "aggregations": (
-            "GROUP BY patterns, SUM/AVG/COUNT usage, per-game calculations, "
-            "season totals, HAVING clauses, window functions (RANK, DENSE_RANK, ROW_NUMBER), "
-            "and the NULLIF trick for safe division."
-        ),
-        "filters": (
-            "WHERE clause patterns for player name lookup, season filtering, "
-            "game type (regular/playoff), team filtering, position, draft year, "
-            "and active status. Include ILIKE patterns for text matching."
-        ),
-        "comparisons": (
-            "CASE WHEN expressions, subquery comparisons vs league average, "
-            "head-to-head player/team comparisons, HAVING threshold filters, "
-            "and conditional aggregations."
-        ),
-        "date_handling": (
-            "Season year convention (2022 = 2022-23 season), DATE_TRUNC for "
-            "month/season grouping, date range filters on game_date, avoiding "
-            "CURRENT_DATE, and finding the latest available season dynamically."
-        ),
-        "performance": (
-            "Index-aware query patterns, filter-before-join optimisation, "
-            "which columns are indexed, LIMIT for large result sets, "
-            "EXISTS vs IN for subqueries, and avoiding expensive full scans."
-        ),
-    }
-
-    hint = sub_section_hints.get(
-        sub_section,
-        f"SQL patterns and best practices for {sub_section} in NBA analytics queries.",
-    )
-
-    user_prompt = f"""
-        Generate a knowledge base markdown file for the '{sub_section}' SQL guideline category.
-
-        Category focus: {hint}
-
-        Required frontmatter:
-        ---
-        name: {sub_section}
-        description: "Use when the query involves [SPECIFIC SCENARIOS FOR THIS CATEGORY].
-          Include all the NBA-specific situations where these SQL patterns are needed.
-          Be detailed (3-4 sentences) — this text is embedded for vector retrieval."
-        tags: [tag1, tag2, tag3, tag4]
-        priority: high | medium | low
-        ---
-
-        Then write the markdown body with:
-        - At least 4 practical SQL code blocks referencing the NBA schema tables
-        - A clear structure with ## headers for each sub-topic
-        - Specific gotchas / anti-patterns to avoid
-        - At least one complete query example with JOINs
-
-        Make the description rich enough that these queries will vector-match it:
-        - "How do I join players to their box scores?"
-        - "Calculate season averages for all players"
-        - "Filter by regular season games in 2022"
-    """
-
-    messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
-        ChatCompletionSystemMessageParam(role="system", content=_SQL_GUIDELINES_SUB_SYSTEM_PROMPT),
-        ChatCompletionUserMessageParam(role="user", content=user_prompt),
-    ]
-    response = _client.chat.completions.create(
-        model=OPENAI_GENERATION_MODEL,
-        messages=messages,
-        temperature=0.2,
-        max_tokens=2000,
-    )
-
-    return _strip_llm_fences(response.choices[0].message.content.strip())
-
-
-def generate_sql_guidelines_sub_files(overwrite: bool = False) -> list[Path]:
-    """
-    Generate all SQL guideline sub-files (joins.md, aggregations.md, etc.).
-
-    These are the embeddable, individually-retrievable markdown files inside
-    the sql_guidelines/ section. Unlike KB.md (which is always injected),
-    each sub-file is retrieved by vector similarity at query time — so only
-    the relevant guideline categories are included in each SQL prompt.
-
-    Sub-files that already exist on disk are SKIPPED unless overwrite=True.
-    This is safe to call repeatedly; it only generates missing files.
-
-    NOTE: If the sub-files were created manually (as static files in this
-    project), this function will skip them because they already exist.
-    Only use overwrite=True when you want the LLM to regenerate them fresh.
-
-    Parameters
-    ----------
-    overwrite : bool
-        If False (default), skip sub-files that already exist on disk.
-        Set to True to regenerate all sub-files via LLM.
+    ddl_dict:
+        Mapping of table_name to CREATE TABLE SQL used to ground SQL examples.
+        If None, uses Sample_NBA_DDL_DICT.
+    overwrite:
+        If False, skip sub-files that already exist on disk.
 
     Returns
     -------
     list[Path]
         Paths of all sub-files that were written.
     """
+    if ddl_dict is None:
+        ddl_dict = Sample_NBA_DDL_DICT
+
     section_dir = KB_SECTIONS["sql_guidelines"]
     section_dir.mkdir(parents=True, exist_ok=True)
-
     written_files: list[Path] = []
 
     for sub_section in SQL_GUIDELINES_SUB_SECTIONS:
         output_path = section_dir / f"{sub_section}.md"
 
         if output_path.exists() and not overwrite:
-            print(f"[kb_generator] Skipping sql_guidelines/{sub_section}.md (already exists). "
-                  "Use overwrite=True to regenerate.")
+            print(
+                f"[kb_generator] Skipping sql_guidelines/{sub_section}.md (already exists). "
+                "Use overwrite=True to regenerate."
+            )
             continue
 
         print(f"[kb_generator] Generating sql_guidelines/{sub_section}.md via LLM...")
-        content = generate_sql_guideline_sub_file(sub_section)
+        content = generate_sql_guideline_sub_file(sub_section, ddl_dict)
         output_path.write_text(content, encoding="utf-8")
         written_files.append(output_path)
-        print(f"[kb_generator] ✓ Written: {output_path}")
+        print(f"[kb_generator] Written: {output_path}")
 
     return written_files
 
 
 def generate_static_section_files(overwrite: bool = False) -> None:
-    """
-    Write the static KB.md files for non-DDL sections using sample content.
-
-    Unlike DDL files (generated from raw SQL via GPT-4), the business_rules,
-    sql_guidelines, and response_guidelines sections are bootstrapped from
-    the pre-written sample content in utils/sample_values_for_testing.py.
-
-    Edit the generated files heavily after generation — the samples are
-    solid starting points but you should tailor them to your exact domain.
+    """Write static KB.md files for non-DDL sections using sample content.
 
     Parameters
     ----------
-    overwrite : bool
-        If False (default), skip files that already exist.
-        Set to True to overwrite with fresh sample content.
+    overwrite:
+        If False, skip files that already exist.
     """
     _static_files: list[tuple[str, str]] = [
         ("sql_guidelines", sql_guidelines_content),
@@ -641,41 +395,36 @@ def generate_static_section_files(overwrite: bool = False) -> None:
             print(f"[kb_generator] Skipping {section_name}/KB.md (already exists).")
             continue
 
-        # Strip leading indentation that may exist in the sample string
         cleaned = "\n".join(line.lstrip() for line in content.splitlines())
         kb_path.write_text(cleaned.strip() + "\n", encoding="utf-8")
-        print(f"[kb_generator] ✓ Written: {kb_path}")
+        print(f"[kb_generator] Written: {kb_path}")
 
 
 def generate_all_kb_files(
     ddl_dict: Optional[dict[str, str]] = None,
     overwrite: bool = False,
+    domain: str = "analytics",
 ) -> None:
-    """
-    Top-level entry point: generate ALL KB markdown files in one call.
+    """Top-level entry point: generate ALL KB markdown files.
 
-    1. DDL table files (one .md per table, LLM-generated from CREATE TABLE SQL)
-    2. DDL section KB.md index  (LLM-generated listing of all tables)
-    3. Root KB.md               (LLM-generated overview of all sections)
-    4. Static section KB.md files (sql_guidelines, business_rules, response_guidelines)
-    5. SQL guidelines sub-files (joins.md, aggregations.md, filters.md, etc.)
-       — skipped if they already exist on disk (they are pre-written static files)
-
-    After running this, review and edit the .md files, then run:
-        python main.py build
-    to embed + load everything into Postgres.
+    Steps:
+        1. DDL table files (LLM-generated from CREATE TABLE SQL).
+        2. DDL section KB.md index (LLM-generated).
+        3. Root KB.md (LLM-generated).
+        4. Static section KB.md files (sql_guidelines, business_rules, response_guidelines).
+        5. SQL guideline sub-files grounded with real DDL.
 
     Parameters
     ----------
-    ddl_dict : dict[str, str] | None
-        Mapping of table_name → raw CREATE TABLE SQL string.
-        If None, uses Sample_NBA_DDL_DICT from sample_values_for_testing.py.
-    overwrite : bool
-        If False (default), existing .md files are not regenerated.
-        Set to True to force-regenerate all files (e.g. after schema changes).
+    ddl_dict:
+        Mapping of table_name to raw CREATE TABLE SQL. Defaults to Sample_NBA_DDL_DICT.
+    overwrite:
+        If False, existing .md files are not regenerated.
+    domain:
+        Domain label used in LLM prompts (e.g. "NBA basketball analytics").
     """
     print("\n" + "=" * 60)
-    print("  NBA Knowledge Base — File Generation")
+    print("  Knowledge Base — File Generation")
     print("=" * 60)
 
     if ddl_dict is None:
@@ -683,19 +432,17 @@ def generate_all_kb_files(
         ddl_dict = Sample_NBA_DDL_DICT
 
     print("\n[kb_generator] Generating DDL table files + index files via LLM...")
-    generate_all_table_files(ddl_dict=ddl_dict, overwrite=overwrite)
+    generate_all_table_files(ddl_dict=ddl_dict, overwrite=overwrite, domain=domain)
 
-    print("\n[kb_generator] Writing static section KB.md files (sql/business/response guidelines)...")
+    print("\n[kb_generator] Writing static section KB.md files...")
     generate_static_section_files(overwrite=overwrite)
 
-    print("\n[kb_generator] Writing SQL guidelines sub-files (joins, aggregations, filters, etc.)...")
-    generate_sql_guidelines_sub_files(overwrite=overwrite)
+    print("\n[kb_generator] Writing SQL guideline sub-files (grounded with DDL)...")
+    generate_sql_guidelines_sub_files(ddl_dict=ddl_dict, overwrite=overwrite)
 
     print("\n" + "=" * 60)
     print("  Generation complete.")
     print("  Review the files in knowledge_base_files/, then run:")
     print("      python main.py build")
     print("=" * 60 + "\n")
-
-
 
