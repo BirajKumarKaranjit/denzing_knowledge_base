@@ -3,6 +3,8 @@ name: dwh_d_teams
 description: "Use when the query involves retrieving or analyzing team information such as team identity, location, historical data, or current status. This table is essential for understanding team demographics, including their full names, abbreviations, and nicknames, as well as geographical data like city and state. It also provides insights into the team's history with the year founded, and competitive context with conference and division details. The active status column is crucial for filtering current teams from historical data."
 tags: [teams, sports, demographics, history, status]
 priority: medium
+fk_to: []
+related_tables: [dwh_f_team_boxscore, dwh_f_team_championships, dwh_f_player_boxscore, dwh_d_games]
 ---
 
 # DDL

@@ -3,6 +3,11 @@ name: dwh_f_team_championships
 description: "Use when the query involves analyzing team championship victories, historical performance, or competitive matchups. This table provides insights into which teams have won championships, the years they were awarded, and the opposing teams they faced. It is essential for understanding team success over time and comparing performance against specific competitors. Ideal for queries focusing on championship trends, rivalry analysis, and historical sports data analytics."
 tags: [championships, teams, sports, analytics]
 priority: high
+fk_to:
+  - column: team_id
+    ref_table: dwh_d_teams
+    ref_column: team_id
+related_tables: [dwh_d_teams]
 ---
 
 # DDL

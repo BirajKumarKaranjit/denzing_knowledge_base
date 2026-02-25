@@ -3,6 +3,17 @@ name: dwh_f_player_tracking
 description: "Use when the query involves detailed player performance metrics during games, such as tracking player speed, distance covered, and various shooting statistics. This table is essential for analyzing player efficiency, defensive capabilities, and offensive contributions in basketball games. It provides granular data on player movements and actions, which can be used to evaluate performance trends, compare players, and optimize team strategies. Ideal for queries focused on player tracking analytics, game performance analysis, and sports data insights."
 tags: [player tracking, performance metrics, basketball analytics]
 priority: high
+fk_to:
+  - column: game_id
+    ref_table: dwh_d_games
+    ref_column: game_id
+  - column: team_id
+    ref_table: dwh_d_teams
+    ref_column: team_id
+  - column: player_id
+    ref_table: dwh_d_players
+    ref_column: player_id
+related_tables: [dwh_d_players, dwh_d_teams, dwh_d_games]
 ---
 
 # DDL

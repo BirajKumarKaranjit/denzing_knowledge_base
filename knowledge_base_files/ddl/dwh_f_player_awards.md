@@ -3,6 +3,11 @@ name: dwh_f_player_awards
 description: "Use when the query involves analyzing player awards in the context of basketball analytics, tracking player achievements across seasons, or evaluating team performance based on player accolades. This table captures detailed information about individual player awards, including the specific NBA team recognition, the season of the award, and the time frame within which the award was given. It is essential for queries that require filtering by player, team, or conference, and for aggregating awards data over time."
 tags: [player awards, nba, basketball analytics, team performance]
 priority: high
+fk_to:
+  - column: player_id
+    ref_table: dwh_d_players
+    ref_column: player_id
+related_tables: [dwh_d_players]
 ---
 
 # DDL

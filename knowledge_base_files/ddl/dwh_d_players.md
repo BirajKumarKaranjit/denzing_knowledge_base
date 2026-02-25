@@ -3,6 +3,11 @@ name: dwh_d_players
 description: "Use when the query involves player demographics, career history, or team affiliations in an analytics context. This table provides detailed information about players, including their physical attributes, career timeline, and draft details, which are essential for performance analysis and historical comparisons. It is particularly useful for queries that require filtering by player attributes such as height, weight, or position, and for aggregating statistics based on player experience or draft information. Ideal for generating reports on player career progression, team compositions, or historical player data."
 tags: [players, demographics, career, analytics]
 priority: medium
+fk_to:
+  - column: team_id
+    ref_table: dwh_d_teams
+    ref_column: team_id
+related_tables: [dwh_d_teams, dwh_d_player_nicknames]
 ---
 
 # DDL

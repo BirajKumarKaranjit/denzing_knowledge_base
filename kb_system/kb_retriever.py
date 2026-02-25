@@ -232,17 +232,18 @@ def _score_candidate_with_llm(
 
 
 def _extract_foreign_key_refs(ddl_content: str) -> list[str]:
-    """Parse REFERENCES clauses from a DDL string to find FK-linked tables.
+    """Parse REFERENCES clauses from a DDL body string.
 
     Parameters
     ----------
     ddl_content:
-        Raw markdown content of a table KB file (contains CREATE TABLE SQL).
+        Raw markdown body of a table KB file (the CREATE TABLE SQL block).
 
     Returns
     -------
     list[str]
-        Table names found in REFERENCES clauses.
+        Table names found in SQL REFERENCES clauses. Empty when the DDL
+        was generated without explicit FK constraint declarations.
     """
     return re.findall(
         r'REFERENCES\s+["\'`]?(\w+)["\'`]?\s*\(',
@@ -251,19 +252,66 @@ def _extract_foreign_key_refs(ddl_content: str) -> list[str]:
     )
 
 
+def _extract_fk_refs_from_metadata(metadata: dict) -> list[str]:
+    """Extract referenced table names from the frontmatter ``fk_to`` field.
+
+    This is the primary FK resolution path for schemas where DDL was generated
+    without explicit REFERENCES clauses. The ``fk_to`` list in frontmatter
+    is structured as::
+
+        fk_to:
+          - column: team_id
+            ref_table: dwh_d_teams
+            ref_column: team_id
+
+    Parameters
+    ----------
+    metadata:
+        Parsed YAML frontmatter dict from a KB table file.
+
+    Returns
+    -------
+    list[str]
+        Unique list of ``ref_table`` values from ``fk_to`` entries, plus any
+        names listed under ``related_tables``.
+    """
+    refs: list[str] = []
+
+    fk_to = metadata.get("fk_to") or []
+    for entry in fk_to:
+        if isinstance(entry, dict):
+            ref_table = entry.get("ref_table", "")
+            if ref_table:
+                refs.append(ref_table)
+
+    related = metadata.get("related_tables") or []
+    for name in related:
+        if isinstance(name, str) and name:
+            refs.append(name)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for r in refs:
+        if r not in seen:
+            seen.add(r)
+            unique.append(r)
+    return unique
+
+
 def _apply_cross_encoder_reranking(
     user_query: str,
     candidates: list[dict],
     conn: psycopg2.extensions.connection,
 ) -> list[dict]:
-    """Re-rank RRF candidates using a cross-encoder LLM call, then apply FK expansion.
+    """Re-rank RRF candidates: cross-encoder → FK expansion → elbow cutoff.
 
-    Steps:
-        1. Score each candidate with a joint (query, description) LLM call.
-        2. Re-sort by cross-encoder score descending.
-        3. Apply elbow detection: drop everything below a 30% score gap.
-        4. For the top-3 tables, parse their DDL for REFERENCES clauses and
-           pull in any referenced tables not already in the result set.
+    Pipeline order:
+        1. Score + sort by cross-encoder (joint query/description LLM call).
+        2. FK expansion for top-N tables — BEFORE elbow cutoff so that
+           joinable dimension tables are never pruned before they are added.
+        3. Elbow detection — FK-expanded tables are marked protected and
+           are never dropped regardless of score gap.
 
     Parameters
     ----------
@@ -277,12 +325,15 @@ def _apply_cross_encoder_reranking(
     Returns
     -------
     list[dict]
-        Re-ranked and FK-expanded list of table records.
+        Re-ranked, FK-expanded, and elbow-pruned list of table records.
     """
     if not candidates:
         return candidates
 
-    # --- Step 1 & 2: Score and sort ---
+    import json as _json
+    import psycopg2.extras
+
+    # --- Step 1: Score each candidate and sort descending ---
     print(f"[kb_retriever] Cross-encoder: scoring {len(candidates)} candidate(s)...")
     for record in candidates:
         metadata = record.get("metadata") or {}
@@ -290,52 +341,60 @@ def _apply_cross_encoder_reranking(
         table_name = metadata.get("name", record.get("file_path", ""))
         score = _score_candidate_with_llm(user_query, table_name, description)
         record["cross_encoder_score"] = score
+        record["relevance_score"] = score
         print(f"       • {table_name}: cross={score:.3f}  rrf={record.get('rrf_score', 0):.5f}")
 
     reranked = sorted(candidates, key=lambda r: r["cross_encoder_score"], reverse=True)
 
-    # --- Step 3: Elbow detection ---
-    scores = [r["cross_encoder_score"] for r in reranked]
-    cutoff_idx = len(reranked)
-    for i in range(1, len(scores)):
-        if scores[i - 1] > 0 and (scores[i - 1] - scores[i]) / scores[i - 1] > _ELBOW_DROP_THRESHOLD:
-            cutoff_idx = i
-            break
-
-    if cutoff_idx < len(reranked):
-        dropped = len(reranked) - cutoff_idx
-        print(
-            f"[kb_retriever] Elbow cutoff at index {cutoff_idx} "
-            f"(gap {scores[cutoff_idx - 1]:.3f} → {scores[cutoff_idx]:.3f}): "
-            f"dropping {dropped} low-relevance candidate(s)."
-        )
-    reranked = reranked[:cutoff_idx]
-
-    # Update relevance_score to reflect the cross-encoder result
-    for r in reranked:
-        r["relevance_score"] = r["cross_encoder_score"]
-
-    # --- Step 4: FK expansion for top-N tables ---
-    import psycopg2.extras
-
+    # --- Step 2: FK expansion (runs BEFORE elbow cutoff) ---
+    # Dimension tables referenced by fact tables often score lower on semantic
+    # similarity but are required for JOIN-correct SQL generation. Expanding
+    # here ensures they are present and protected before the cutoff runs.
     existing_paths = {r["file_path"] for r in reranked}
     top_tables = reranked[:_FK_EXPANSION_TOP_N]
 
     for table_record in top_tables:
         content = table_record.get("content", "")
-        fk_refs = _extract_foreign_key_refs(content)
+        record_metadata = table_record.get("metadata") or {}
 
-        for ref_table in fk_refs:
-            # Check if this table already appears in results
-            already_present = any(
-                r.get("metadata", {}).get("name", "") == ref_table
-                or ref_table in r.get("file_path", "")
-                for r in reranked
-            )
-            if already_present:
+        # Primary path: fk_to / related_tables in frontmatter metadata.
+        # Most generated DDL files have no REFERENCES clauses, so this is
+        # the reliable source for FK relationships.
+        fk_refs = _extract_fk_refs_from_metadata(record_metadata)
+
+        # Fallback path: REFERENCES clauses in the DDL body.
+        fk_refs += _extract_foreign_key_refs(content)
+
+        # Deduplicate across both sources
+        seen_refs: set[str] = set()
+        unique_fk_refs: list[str] = []
+        for ref in fk_refs:
+            if ref not in seen_refs:
+                seen_refs.add(ref)
+                unique_fk_refs.append(ref)
+
+        for ref_table in unique_fk_refs:
+            # If the referenced table is already in the candidate list, mark it
+            # as FK-protected in-place so the elbow cutoff cannot drop it.
+            # This is the common case: dwh_d_teams is in the RRF top-10 at a
+            # low score but must survive because the top fact table references it.
+            in_place_protected = False
+            for r in reranked:
+                if (
+                    r.get("metadata", {}).get("name", "") == ref_table
+                    or ref_table in r.get("file_path", "")
+                ):
+                    r["_fk_expanded"] = True
+                    in_place_protected = True
+                    print(
+                        f"[kb_retriever] FK protection: preserved '{ref_table}' "
+                        f"(referenced by {table_record.get('metadata', {}).get('name', '')})"
+                    )
+                    break
+
+            if in_place_protected:
                 continue
 
-            # Look it up in the database
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     """
@@ -349,7 +408,6 @@ def _apply_cross_encoder_reranking(
                 row = cur.fetchone()
 
             if row and row["file_path"] not in existing_paths:
-                import json as _json
                 fk_record = dict(row)
                 if isinstance(fk_record.get("metadata"), str):
                     fk_record["metadata"] = _json.loads(fk_record["metadata"])
@@ -365,7 +423,36 @@ def _apply_cross_encoder_reranking(
                     f"(referenced by {table_record.get('metadata', {}).get('name', '')})"
                 )
 
-    return reranked
+    # --- Step 3: Elbow detection (FK-expanded tables are protected) ---
+    # Only scored records participate in gap analysis; FK-expanded records
+    # are always preserved after the survivors.
+    scored = [r for r in reranked if not r.get("_fk_expanded")]
+    fk_protected = [r for r in reranked if r.get("_fk_expanded")]
+
+    scores = [r["cross_encoder_score"] for r in scored]
+    cutoff_idx = len(scored)
+    for i in range(1, len(scores)):
+        if scores[i - 1] > 0 and (scores[i - 1] - scores[i]) / scores[i - 1] > _ELBOW_DROP_THRESHOLD:
+            cutoff_idx = i
+            break
+
+    if cutoff_idx < len(scored):
+        dropped = len(scored) - cutoff_idx
+        print(
+            f"[kb_retriever] Elbow cutoff at index {cutoff_idx} "
+            f"(gap {scores[cutoff_idx - 1]:.3f} → {scores[cutoff_idx]:.3f}): "
+            f"dropping {dropped} low-relevance candidate(s)."
+        )
+
+    survivors = scored[:cutoff_idx]
+
+    if fk_protected:
+        print(
+            f"[kb_retriever] Preserving {len(fk_protected)} FK-protected table(s) "
+            "past elbow cutoff."
+        )
+
+    return survivors + fk_protected
 
 
 def retrieve_context_for_query(

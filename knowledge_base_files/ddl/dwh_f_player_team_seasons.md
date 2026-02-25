@@ -3,6 +3,14 @@ name: dwh_f_player_team_seasons
 description: "Use when the query involves analyzing player performance across different seasons and teams. This table is crucial for understanding how many games a player participated in during a specific season, under various game types. It is often used in conjunction with player and team analytics to evaluate performance trends over time. Queries may focus on aggregating player participation data, filtering by specific seasons or teams, and comparing game types."
 tags: [player, team, season, games, analytics]
 priority: high
+fk_to:
+  - column: player_id
+    ref_table: dwh_d_players
+    ref_column: player_id
+  - column: team_id
+    ref_table: dwh_d_teams
+    ref_column: team_id
+related_tables: [dwh_d_players, dwh_d_teams]
 ---
 
 # DDL

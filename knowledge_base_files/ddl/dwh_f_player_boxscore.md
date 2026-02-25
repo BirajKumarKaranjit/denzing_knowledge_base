@@ -3,6 +3,17 @@ name: dwh_f_player_boxscore
 description: "Use when the query involves detailed player performance metrics in basketball games, such as shooting efficiency, scoring distribution, and advanced analytics like usage percentage and player impact estimate (PIE). This table is essential for analyzing individual player contributions, comparing player performances across games, and understanding the impact of specific actions like assists and turnovers. It is particularly useful for generating player statistics reports, conducting game-by-game performance analysis, and evaluating player efficiency and effectiveness in various game situations."
 tags: [basketball, player performance, analytics, boxscore]
 priority: high
+fk_to:
+  - column: game_id
+    ref_table: dwh_d_games
+    ref_column: game_id
+  - column: team_id
+    ref_table: dwh_d_teams
+    ref_column: team_id
+  - column: player_id
+    ref_table: dwh_d_players
+    ref_column: player_id
+related_tables: [dwh_d_players, dwh_d_teams, dwh_d_games]
 ---
 
 # DDL

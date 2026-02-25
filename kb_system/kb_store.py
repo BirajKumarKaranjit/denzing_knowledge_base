@@ -97,14 +97,15 @@ def init_schema(conn: PgConnection) -> None:
             );
         """)
 
-        # IVFFlat index for fast approximate nearest-neighbor search.
-        # Only indexes rows that HAVE an embedding (table files, not KB.md files).
-        # lists=100 is a good default for up to ~1M rows; tune based on table count.
+        # HNSW index for fast and accurate nearest-neighbor search at any dataset size.
+        # Unlike IVFFlat (which requires hundreds of rows to train its clusters),
+        # HNSW works correctly with as few as 1 row and scales to millions.
+        # m=16 and ef_construction=64 are safe defaults for a KB of this size.
         cur.execute(f"""
             CREATE INDEX IF NOT EXISTS idx_kb_embedding
             ON kb_files
-            USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 50)
+            USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64)
             WHERE embedding IS NOT NULL;
         """)
 

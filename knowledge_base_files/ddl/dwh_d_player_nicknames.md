@@ -3,6 +3,11 @@ name: dwh_d_player_nicknames
 description: "Use when the query involves retrieving or analyzing player nicknames and their descriptions within the analytics database. This table is essential for understanding the aliases or alternate names that players might use, which can be crucial for personalized marketing, user engagement analysis, or behavioral studies. It helps in linking player identities across different datasets where nicknames are used instead of formal identifiers. Queries often involve filtering by specific nicknames or descriptions to segment players based on their chosen identifiers."
 tags: [player, nickname, identity]
 priority: medium
+fk_to:
+  - column: player_id
+    ref_table: dwh_d_players
+    ref_column: player_id
+related_tables: [dwh_d_players]
 ---
 
 # DDL

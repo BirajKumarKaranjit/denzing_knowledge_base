@@ -3,6 +3,14 @@ name: dwh_d_games
 description: "Use when the query involves analyzing game details, scores, and team matchups in a sports analytics context. This table provides comprehensive information about each game, including identifiers, season details, and scores, making it essential for performance analysis, historical data retrieval, and trend analysis over seasons. It is particularly useful for queries that require filtering by game date, team performance, or specific game types such as playoffs. The table supports detailed breakdowns of home and visitor team statistics and is crucial for generating reports on game outcomes and team comparisons."
 tags: [games, sports, analytics, scores, teams]
 priority: high
+fk_to:
+  - column: home_team_id
+    ref_table: dwh_d_teams
+    ref_column: team_id
+  - column: visitor_team_id
+    ref_table: dwh_d_teams
+    ref_column: team_id
+related_tables: [dwh_d_teams, dwh_f_team_boxscore, dwh_f_player_boxscore]
 ---
 
 # DDL
