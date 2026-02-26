@@ -124,7 +124,7 @@ def parse_markdown_file(md_path: Path, kb_root: Path) -> ParsedKBFile:
     # Determine if this is a KB.md entry point
     is_entry_point = md_path.name == "KB.md"
 
-    # Build embedding text from name + description
+    # Build embedding text from name + description + tags
     # Entry points don't need embedding_text (they're not similarity-searched)
     name = metadata.get("name", "")
     description = metadata.get("description", "")
@@ -186,9 +186,9 @@ def scan_kb_directory(kb_root: Path) -> list[ParsedKBFile]:
         try:
             parsed = parse_markdown_file(md_path, kb_root)
             parsed_files.append(parsed)
-            print(f"[kb_parser] ✓ Parsed: {parsed.file_path} "
+            print(f"[kb_parser] Parsed: {parsed.file_path} "
                   f"(entry_point={parsed.is_entry_point})")
         except (ValueError, yaml.YAMLError) as exc:
-            print(f"[kb_parser] ✗ Skipped '{md_path.name}': {exc}")
+            print(f"[kb_parser] Skipped '{md_path.name}': {exc}")
 
     return parsed_files

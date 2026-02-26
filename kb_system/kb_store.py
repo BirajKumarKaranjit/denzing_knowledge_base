@@ -32,7 +32,7 @@ from psycopg2.extensions import connection as PgConnection
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.config import POSTGRES_DSN, EMBEDDING_DIMENSION, RRF_K
+from utils.config import POSTGRES_DSN, EMBEDDING_DIMENSION, RRF_K, MANDATORY_FILES
 from kb_system.kb_parser import ParsedKBFile
 
 
@@ -193,6 +193,63 @@ def upsert_kb_file(
     return row_id
 
 
+def _fetch_mandatory_files(
+    conn: PgConnection,
+    section: str,
+    filenames: list[str],
+) -> list[dict[str, Any]]:
+    """Fetch specific files from the DB by their basename within a section.
+
+    Used to guarantee that foundational guideline files are always present
+    in the retrieved context, regardless of their semantic similarity score.
+
+    Parameters
+    ----------
+    conn : psycopg2.connection
+    section : str
+        Section to restrict the lookup to (e.g., ``"sql_guidelines"``).
+    filenames : list[str]
+        Bare filenames to look up (e.g., ``["joins.md", "filters.md"]``).
+
+    Returns
+    -------
+    list[dict]
+        One record per found file. Files not present in the DB are silently
+        skipped so a missing file never raises an exception.
+    """
+    results: list[dict] = []
+    for filename in filenames:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT file_path, section, metadata, content
+                FROM kb_files
+                WHERE section = %s
+                  AND is_entry_point = FALSE
+                  AND file_path LIKE %s
+                LIMIT 1;
+                """,
+                (section, f"%/{filename}"),
+            )
+            row = cur.fetchone()
+
+        if row is None:
+            continue
+
+        record = dict(row)
+        if isinstance(record.get("metadata"), str):
+            record["metadata"] = json.loads(record["metadata"])
+
+        # These records are injected, not ranked — assign neutral scores.
+        record["rrf_score"] = 0.0
+        record["best_cosine_score"] = 0.0
+        record["relevance_score"] = 0.0
+        record["_mandatory"] = True
+        results.append(record)
+
+    return results
+
+
 def retrieve_with_rrf(
     conn: PgConnection,
     query_embeddings: list[list[float]],
@@ -201,8 +258,16 @@ def retrieve_with_rrf(
     per_query_k: int = 10,
     rrf_k: int = RRF_K,
 ) -> list[dict[str, Any]]:
-    """
-    Retrieve the top-K most relevant files using Reciprocal Rank Fusion (RRF).\
+    """Retrieve the top-K most relevant files using Reciprocal Rank Fusion (RRF).
+
+    For sections listed in ``MANDATORY_FILES`` (e.g., ``sql_guidelines``),
+    certain files are always appended to the result regardless of their
+    similarity rank.  The semantic pool is limited to ``top_k`` results
+    *after* removing any mandatory files that were already retrieved — so
+    the final list is:  semantic_results[:top_k] + missing_mandatory_files.
+
+    For all other sections the behaviour is unchanged: top-K by RRF score.
+
     Parameters
     ----------
     conn : psycopg2.connection
@@ -264,15 +329,57 @@ def retrieve_with_rrf(
             if fp not in record_cache:
                 record_cache[fp] = record
 
-    sorted_paths = sorted(rrf_scores, key=lambda fp: rrf_scores[fp], reverse=True)[:top_k]
+    mandatory_filenames: list[str] = MANDATORY_FILES.get(section, [])
 
+    # Separate mandatory files from the semantic pool so that they do not
+    # consume slots from the top_k semantic budget.
+    mandatory_paths: set[str] = set()
+    semantic_paths: list[str] = []
+
+    all_sorted = sorted(rrf_scores, key=lambda fp: rrf_scores[fp], reverse=True)
+    for fp in all_sorted:
+        basename = fp.split("/")[-1]
+        if basename in mandatory_filenames:
+            mandatory_paths.add(fp)
+        else:
+            semantic_paths.append(fp)
+
+    # Build semantic results capped at top_k.
     results: list[dict] = []
-    for fp in sorted_paths:
+    for fp in semantic_paths[:top_k]:
         record = dict(record_cache[fp])
         record["rrf_score"] = round(rrf_scores[fp], 6)
         record["best_cosine_score"] = round(best_cosine.get(fp, 0.0), 4)
         record["relevance_score"] = record["best_cosine_score"]
         results.append(record)
+
+    if not mandatory_filenames:
+        return results
+
+    # Collect mandatory files that were already retrieved semantically (from the
+    # full RRF pool, not just the top_k slice) so we can deduplicate correctly.
+    already_present: set[str] = {r["file_path"] for r in results}
+    already_present.update(mandatory_paths)
+
+    # Inject mandatory files that appeared in the RRF pool but were pushed out
+    # of the semantic top_k, annotating them so callers can tell them apart.
+    for fp in mandatory_paths:
+        record = dict(record_cache[fp])
+        record["rrf_score"] = round(rrf_scores[fp], 6)
+        record["best_cosine_score"] = round(best_cosine.get(fp, 0.0), 4)
+        record["relevance_score"] = record["best_cosine_score"]
+        record["_mandatory"] = True
+        results.append(record)
+
+    # Fetch any mandatory files that did not appear in the RRF pool at all
+    # (e.g., their embeddings scored below the per_query_k cut-off).
+    missing_filenames = [
+        fn for fn in mandatory_filenames
+        if not any(fp.split("/")[-1] == fn for fp in already_present)
+    ]
+    if missing_filenames:
+        fetched = _fetch_mandatory_files(conn, section, missing_filenames)
+        results.extend(fetched)
 
     return results
 

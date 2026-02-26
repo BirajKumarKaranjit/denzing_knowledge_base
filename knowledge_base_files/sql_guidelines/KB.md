@@ -8,7 +8,7 @@ description: "Query patterns, join conventions, and SQL best practices for the N
 ## General Conventions
 - Always use table aliases for readability (e.g., p for players, g for games)
 - Use DATE_TRUNC('season', game_date) for season-level aggregations
-- Exclude preseason games unless explicitly requested (filter by game_type = 'regular')
+- Exclude preseason games unless explicitly requested (filter by UPPER(game_type) LIKE UPPER('%regular%'))
 
 ## Common Join Patterns
 - box_scores JOIN players ON box_scores.player_id = players.id

@@ -356,7 +356,6 @@ def _apply_cross_encoder_reranking(
     import json as _json
     import psycopg2.extras
 
-    # --- Step 1: Score all candidates in one batched LLM call, then sort ---
     print(f"[kb_retriever] Cross-encoder: scoring {len(candidates)} candidate(s) in one call...")
     scores = _score_candidates_batched(user_query, candidates)
     for record, score in zip(candidates, scores):
@@ -566,7 +565,7 @@ def retrieve_context_for_query(
         conn=conn,
         query_embeddings=all_embeddings,
         section="sql_guidelines",
-        top_k=2,
+        top_k=3,
         per_query_k=8,
         rrf_k=RRF_K,
     )
