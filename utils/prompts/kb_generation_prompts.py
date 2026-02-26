@@ -182,11 +182,23 @@ RELEVANCE_CHECK_SYSTEM_PROMPT = (
 
     "2. GREETING\n"
     "   Purely conversational — no data retrieval intent whatsoever.\n"
-    '   Examples: "Hello", "How are you?", "Thanks", "Good job", "Who created you?"\n'
+    '   Examples: "Hello", "How are you?", "Thanks", "Good job"\n'
     "   IMPORTANT: if the message contains BOTH a greeting AND any data question,\n"
     '   classify as SQL_RELEVANT (e.g. "Hi, show me top results" → SQL_RELEVANT).\n\n'
 
-    "3. OUT_OF_DOMAIN\n"
+    "3. META_QUERY\n"
+    "   Questions about the system, platform, product, agent, or knowledge base itself —\n"
+    "   not about data in the database tables.\n"
+    "   These are answered from project/product documentation, not SQL.\n"
+    "   Examples:\n"
+    '   - "What is this system?", "What does this agent do?"\n'
+    '   - "What is Denzing?", "Who built this?", "What data do you have access to?"\n'
+    '   - "What kinds of questions can I ask?", "How does this work?"\n'
+    '   - "What is this project about?", "Tell me about this platform"\n'
+    "   IMPORTANT: classify as META_QUERY only when the question is clearly about the\n"
+    "   system/product/platform itself, not about the underlying data.\n\n"
+
+    "4. OUT_OF_DOMAIN\n"
     "   The query asks about a topic that provably cannot map to any table, column,\n"
     "   or entity type in the provided schema.\n\n"
     "   ### CRITICAL RULE FOR NAMES AND ENTITIES ###\n"
@@ -200,7 +212,7 @@ RELEVANCE_CHECK_SYSTEM_PROMPT = (
     "   fundamentally cannot exist in any column — e.g. scientific phenomena,\n"
     "   recipes, geography unrelated to the domain, or programming questions.\n\n"
 
-    "4. SQL_RELEVANT (DEFAULT)\n"
+    "5. SQL_RELEVANT (DEFAULT)\n"
     "   Anything that could plausibly require a database query. This is the default\n"
     "   category. Includes:\n"
     "   - Data questions: stats, comparisons, rankings, aggregations, filters\n"
@@ -210,18 +222,18 @@ RELEVANCE_CHECK_SYSTEM_PROMPT = (
     "   - Follow-up phrases implying prior data context\n\n"
 
     "### Core principle\n"
-    "Rejecting a valid query is far more costly than passing an irrelevant one.\n"
-    "When uncertain, ALWAYS classify as SQL_RELEVANT.\n"
-    "You must be 100% certain a query is unrelated before returning anything other\n"
-    "than SQL_RELEVANT.\n\n"
+    "Rejecting a valid SQL query is far more costly than passing an irrelevant one.\n"
+    "When uncertain between SQL_RELEVANT and META_QUERY, choose SQL_RELEVANT.\n"
+    "When uncertain between SQL_RELEVANT and OUT_OF_DOMAIN, choose SQL_RELEVANT.\n"
+    "You must be 100% certain a query is unrelated before returning OUT_OF_DOMAIN.\n\n"
 
     "### Output format — return ONLY this raw JSON, no extra text\n"
     "{\n"
-    '  "category": "GARBAGE" | "GREETING" | "OUT_OF_DOMAIN" | "SQL_RELEVANT",\n'
-    '  "is_relevant": true if SQL_RELEVANT else false,\n'
+    '  "category": "GARBAGE" | "GREETING" | "META_QUERY" | "OUT_OF_DOMAIN" | "SQL_RELEVANT",\n'
+    '  "is_relevant": true if SQL_RELEVANT or META_QUERY else false,\n'
     '  "reason": "<one sentence>",\n'
-    '  "response": "<user-facing message if not relevant, else empty string>",\n'
-    '  "suggested_questions": ["<q1>", "<q2>", "<q3>", "<q4>"] if not relevant else []\n'
+    '  "response": "<user-facing message if GARBAGE/GREETING/OUT_OF_DOMAIN, else empty string>",\n'
+    '  "suggested_questions": ["<q1>", "<q2>", "<q3>", "<q4>"] if OUT_OF_DOMAIN else []\n'
     "}"
 )
 
@@ -235,6 +247,27 @@ def relevance_check_user_prompt(user_query: str, schema_context: str) -> str:
         "Classify this query. Remember: any proper noun could be a value in a name "
         "column — default to SQL_RELEVANT when uncertain.\n"
         "Return JSON only."
+    )
+
+
+META_QUERY_SYSTEM_PROMPT = (
+    "You are a knowledgeable assistant for an AI analytics platform.\n"
+    "You will be given a user's question about the system, platform, or project,\n"
+    "along with relevant documentation excerpts from the knowledge base.\n\n"
+    "Answer the user's question clearly and concisely using only the provided documentation.\n"
+    "If the documentation does not cover the question, say so honestly.\n"
+    "Do not invent capabilities or features not mentioned in the documentation.\n"
+    "Keep the response focused — 2-5 sentences unless the question requires more detail.\n"
+    "Do not mention that you are reading from a knowledge base or documentation."
+)
+
+
+def meta_query_user_prompt(user_query: str, kb_context: str) -> str:
+    """User prompt for answering meta/project questions from KB documentation."""
+    return (
+        f"User question: {user_query}\n\n"
+        f"Relevant documentation:\n{kb_context}\n\n"
+        "Answer the question using the documentation above."
     )
 
 

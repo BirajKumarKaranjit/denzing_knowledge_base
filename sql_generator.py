@@ -20,7 +20,9 @@ from openai.types.chat import ChatCompletionSystemMessageParam, ChatCompletionUs
 
 from utils.config import OPENAI_API_KEY, OPENAI_SQL_MODEL
 from utils.prompts.kb_generation_prompts import (
+    META_QUERY_SYSTEM_PROMPT,
     RELEVANCE_CHECK_SYSTEM_PROMPT,
+    meta_query_user_prompt,
     relevance_check_user_prompt,
 )
 
@@ -76,6 +78,40 @@ def is_query_relevant(
         pass
     # Fail open — if parsing fails, allow SQL generation
     return True, "SQL_RELEVANT", "", []
+
+
+def answer_meta_query(user_query: str, kb_context: str) -> str:
+    """Answer a META_QUERY using knowledge base documentation instead of SQL.
+
+    Parameters
+    ----------
+    user_query:
+        The user's question about the system, platform, or project.
+    kb_context:
+        Concatenated content from relevant KB files (project_information.md,
+        business_rules/KB.md, root KB.md).
+
+    Returns
+    -------
+    str
+        Natural language answer derived from the KB documentation.
+    """
+    messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
+        ChatCompletionSystemMessageParam(
+            role="system", content=META_QUERY_SYSTEM_PROMPT
+        ),
+        ChatCompletionUserMessageParam(
+            role="user",
+            content=meta_query_user_prompt(user_query, kb_context),
+        ),
+    ]
+    response = _client.chat.completions.create(
+        model=OPENAI_SQL_MODEL,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=512,
+    )
+    return (response.choices[0].message.content or "").strip()
 
 
 def generate_sql(prompt: str, temperature: float = 0.25) -> str:

@@ -59,6 +59,34 @@ def _build_schema_context(ddl_dict: dict[str, str]) -> str:
 _SCHEMA_CONTEXT = _build_schema_context(Sample_NBA_DDL_DICT)
 
 
+def _load_meta_kb_context() -> str:
+    """Load KB files relevant to meta/project questions.
+
+    Reads the root KB.md and business_rules sub-files from the local filesystem.
+    This is intentionally a local file read — meta queries bypass the DB pipeline
+    and do not require embeddings or Postgres.
+
+    Returns
+    -------
+    str
+        Concatenated markdown content from root KB.md, business_rules/KB.md,
+        and project_information.md, separated by dividers.
+    """
+    import pathlib
+
+    kb_root = pathlib.Path(__file__).parent / "knowledge_base_files"
+    candidate_paths = [
+        kb_root / "KB.md",
+        kb_root / "business_rules" / "KB.md",
+        kb_root / "business_rules" / "project_information.md",
+    ]
+    chunks: list[str] = []
+    for path in candidate_paths:
+        if path.exists():
+            chunks.append(path.read_text(encoding="utf-8"))
+    return "\n\n---\n\n".join(chunks)
+
+
 def cmd_generate() -> None:
     """Generate KB markdown files for all tables using the LLM."""
     from kb_system import generate_all_kb_files
@@ -88,7 +116,7 @@ def cmd_query(user_query: str) -> None:
     from kb_system.kb_store import get_connection
     from kb_system.kb_retriever import retrieve_context_for_query
     from utils.prompt_builder import build_sql_prompt
-    from sql_generator import generate_sql, extract_sql_from_response, is_query_relevant
+    from sql_generator import generate_sql, extract_sql_from_response, is_query_relevant, answer_meta_query
 
     print(f"\n{'=' * 60}")
     print(f"  Query: {user_query}")
@@ -97,6 +125,14 @@ def cmd_query(user_query: str) -> None:
     relevant, category, response_msg, suggested_questions = is_query_relevant(
         user_query, _SCHEMA_CONTEXT
     )
+
+    if category == "META_QUERY":
+        print(f"\n[main] Meta query detected — answering from knowledge base documentation.")
+        kb_context = _load_meta_kb_context()
+        answer = answer_meta_query(user_query, kb_context)
+        print(f"\n{answer}\n")
+        return
+
     if not relevant:
         print(f"\n[main] Query rejected — category: {category}")
         if response_msg:
@@ -162,5 +198,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # main()
-    cmd_query(input("\nEnter a natural language question to convert to SQL: "))
+    main()
+    # cmd_query(input("\nEnter a natural language question to convert to SQL: "))
