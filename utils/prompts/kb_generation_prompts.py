@@ -1,14 +1,10 @@
 """utils/prompts/kb_generation_prompts.py
 
-System and user prompt templates used by kb_generator to produce KB markdown files.
-All prompts are domain-agnostic; domain-specific details are injected at call time.
+Prompt templates for KB markdown file generation and query classification.
+All generation prompts are domain-agnostic; domain context is injected at call time.
 """
 
 from __future__ import annotations
-
-# ---------------------------------------------------------------------------
-# System prompts
-# ---------------------------------------------------------------------------
 
 TABLE_FILE_SYSTEM_PROMPT = (
     "You are a technical documentation expert specialising in analytics databases.\n"
@@ -45,37 +41,27 @@ ROOT_KB_SYSTEM_PROMPT = (
     "Return ONLY the markdown content. No explanations outside the format."
 )
 
-SQL_GUIDELINES_SUB_SYSTEM_PROMPT = (
-    "You are a SQL expert specialising in Postgres analytics databases.\n"
-    "Generate a knowledge base markdown file for a specific SQL guideline category.\n\n"
+SECTION_SUB_FILE_SYSTEM_PROMPT = (
+    "You are a knowledge base authoring expert.\n"
+    "Generate a structured markdown knowledge base sub-file for the given section and topic.\n\n"
     "The file has two parts:\n"
-    "1. YAML frontmatter: contains name, description, tags, priority.\n"
+    "1. YAML frontmatter: name, description, tags, priority.\n"
     "   The 'description' field MUST start with 'Use when the query involves...'\n"
-    "   and be rich and specific so that a vector search can match it against user queries\n"
-    "   that need this type of SQL guidance.\n"
-    "2. Markdown body: practical SQL patterns, templates, and gotchas for this guideline category.\n"
-    "   Include concrete SQL code blocks that reference the ACTUAL column names from the provided DDL.\n\n"
-    "IMPORTANT: Use ONLY the column names and table names that appear in the provided DDL.\n"
-    "Do NOT invent or guess column names. If a column does not exist in the DDL, do not reference it.\n\n"
+    "   or 'Reference when users ask about...' and must be rich enough (3-4 sentences)\n"
+    "   for a vector search to correctly route queries to this file.\n"
+    "   When DDL is provided, use ONLY the column and table names from it.\n"
+    "2. Markdown body: comprehensive, well-structured content about the topic.\n"
+    "   Use ## headers, bullet lists, tables, and SQL code blocks where appropriate.\n\n"
     "Return ONLY the markdown content. No explanations, no code fences around the whole output."
 )
 
-# ---------------------------------------------------------------------------
-# User prompt templates (use .format() or f-strings to fill placeholders)
-# ---------------------------------------------------------------------------
 
-
-def table_file_user_prompt(
-    table_name: str,
-    ddl_sql: str,
-    domain: str,
-) -> str:
-    """Return the user prompt for generating a single table KB file."""
+def table_file_user_prompt(table_name: str, ddl_sql: str, domain: str) -> str:
+    """User prompt for generating a single table KB file."""
     return (
         f"Generate a knowledge base markdown file for the following database table.\n\n"
         f"Domain: {domain}\n"
         f"Table name: {table_name}\n\n"
-        f"DDL:\n{ddl_sql}\n\n"
         f"Required format:\n"
         f"---\n"
         f"name: {table_name}\n"
@@ -91,23 +77,16 @@ def table_file_user_prompt(
         f"related_tables: [<other_tables_often_joined_with_this_one>]\n"
         f"---\n\n"
         f"IMPORTANT: fk_to must list EVERY column in this table that is a foreign key,\n"
-        f"inferred from the column naming convention (e.g. team_id → dwh_d_teams.team_id,\n"
-        f"player_id → dwh_d_players.player_id, game_id → dwh_d_games.game_id).\n"
+        f"inferred from column naming conventions (e.g. team_id → dwh_d_teams.team_id).\n"
         f"Use an empty list [] if there are no FK columns.\n\n"
         f"# DDL\n\n"
         f"```sql\n{ddl_sql}\n```\n\n"
         f"## Column Semantics\n"
-        f"For each column in the DDL, explain:\n"
-        f"- Business meaning in {domain} context\n"
-        f"- Value ranges or example values if inferrable from the DDL\n"
-        f"- Whether it is typically used in WHERE, GROUP BY, or SELECT\n"
-        f"- Any gotchas (nullable, approximate values, etc.)\n\n"
+        f"For each column explain: business meaning, value ranges, typical usage (WHERE/GROUP BY/SELECT), gotchas.\n\n"
         f"## Common Query Patterns\n"
-        f"2-4 bullet points showing how this table is typically used.\n"
-        f"Include example WHERE conditions or JOIN patterns using ONLY columns from the DDL above.\n\n"
+        f"2-4 bullet points. Use ONLY columns from the DDL above.\n\n"
         f"## Join Relationships\n"
-        f"How this table relates to other tables (foreign keys, typical join conditions).\n"
-        f"Reference only columns that appear in the DDL."
+        f"Foreign keys and typical join conditions. Reference only columns in the DDL."
     )
 
 
@@ -116,7 +95,7 @@ def section_kb_user_prompt(
     table_names: list[str],
     section_description: str,
 ) -> str:
-    """Return the user prompt for generating a section KB.md index file."""
+    """User prompt for generating a section KB.md index file."""
     file_list = "\n".join(f"- {name}" for name in table_names)
     return (
         f"Generate a KB.md index file for the '{section_name}' section of an analytics knowledge base.\n\n"
@@ -128,14 +107,14 @@ def section_kb_user_prompt(
         f'description: "Brief description of what this section covers and when to use it."\n'
         f"---\n\n"
         f"# {section_name.replace('_', ' ').title()} Section\n\n"
-        f"[2-3 sentence overview of what this section contains]\n\n"
+        f"[2-3 sentence overview]\n\n"
         f"## Contents\n\n"
-        f"[List each file with a one-line description of what it covers]"
+        f"[List each file with a one-line description]"
     )
 
 
 def root_kb_user_prompt(sections: dict[str, str], domain: str) -> str:
-    """Return the user prompt for generating the root KB.md file."""
+    """User prompt for generating the root KB.md file."""
     section_list = "\n".join(f"- {name}: {desc}" for name, desc in sections.items())
     return (
         f"Generate the root KB.md for the {domain} knowledge base.\n\n"
@@ -146,45 +125,48 @@ def root_kb_user_prompt(sections: dict[str, str], domain: str) -> str:
         f'description: "Root index of the {domain} knowledge base."\n'
         f"---\n\n"
         f"# {domain} Knowledge Base\n\n"
-        f"[2-3 sentence overview of the entire KB]\n\n"
+        f"[2-3 sentence overview]\n\n"
         f"## Sections\n"
         f"[List each section with description]"
     )
 
 
-def sql_guideline_sub_file_user_prompt(
+def section_sub_file_user_prompt(
+    section: str,
     sub_section: str,
     hint: str,
-    ddl_summary: str,
+    ddl_summary: str | None = None,
 ) -> str:
-    """Return the user prompt for generating a SQL guideline sub-file."""
+    """User prompt for generating any section sub-file.
+
+    Pass ``ddl_summary`` for schema-grounded sections (e.g. sql_guidelines).
+    Pass ``None`` for content-only sections (e.g. business_rules).
+    """
+    ddl_block = (
+        f"Use ONLY the table and column names from the DDL below — do not invent any.\n\n"
+        f"--- DDL START ---\n{ddl_summary}\n--- DDL END ---\n\n"
+        if ddl_summary
+        else ""
+    )
     return (
-        f"Generate a knowledge base markdown file for the '{sub_section}' SQL guideline category.\n\n"
-        f"Category focus: {hint}\n\n"
-        f"The following DDL defines the EXACT tables and columns available in this database.\n"
-        f"Use ONLY these table names and column names in all SQL examples. Do not invent columns.\n\n"
-        f"--- DDL START ---\n"
-        f"{ddl_summary}\n"
-        f"--- DDL END ---\n\n"
+        f"Generate a knowledge base markdown file for the '{sub_section}' sub-topic "
+        f"inside the '{section}' section.\n\n"
+        f"Topic focus: {hint}\n\n"
+        f"{ddl_block}"
         f"Required frontmatter:\n"
         f"---\n"
         f"name: {sub_section}\n"
-        f'description: "Use when the query involves [SPECIFIC SCENARIOS FOR THIS CATEGORY].\n'
+        f'description: "Reference when users ask about [SPECIFIC SCENARIOS].\n'
         f"  Be detailed (3-4 sentences) — this text is embedded for vector retrieval.\"\n"
-        f"tags: [tag1, tag2, tag3, tag4]\n"
+        f"tags: [tag1, tag2, tag3]\n"
         f"priority: high | medium | low\n"
         f"---\n\n"
-        f"Then write the markdown body with:\n"
-        f"- At least 4 practical SQL code blocks referencing ONLY the tables/columns from the DDL above\n"
-        f"- A clear structure with ## headers for each sub-topic\n"
-        f"- Specific gotchas and anti-patterns to avoid\n"
-        f"- At least one complete multi-table query example"
+        f"Write a comprehensive markdown body with:\n"
+        f"- ## headers for each major sub-topic\n"
+        f"- Tables, bullet lists, or SQL code blocks where appropriate\n"
+        f"- Concrete, specific information — avoid vague generalities"
     )
 
-
-# ---------------------------------------------------------------------------
-# Query relevance gate — single LLM call for garbage, greeting, and domain check
-# ---------------------------------------------------------------------------
 
 RELEVANCE_CHECK_SYSTEM_PROMPT = (
     "You are a query classification gate for a Text2SQL analytics system.\n"
@@ -245,22 +227,7 @@ RELEVANCE_CHECK_SYSTEM_PROMPT = (
 
 
 def relevance_check_user_prompt(user_query: str, schema_context: str) -> str:
-    """Build the user prompt for the unified relevance gate.
-
-    Parameters
-    ----------
-    user_query:
-        Raw user input to classify.
-    schema_context:
-        Table names and column names derived from the actual DDL. Used by the
-        LLM to infer the domain and decide whether a name or entity could
-        plausibly appear in the data. Generated dynamically — not hardcoded.
-
-    Returns
-    -------
-    str
-        Formatted prompt string.
-    """
+    """User prompt for the unified relevance gate."""
     return (
         f"Schema context (table and column names from the database):\n"
         f"{schema_context}\n\n"
@@ -270,10 +237,6 @@ def relevance_check_user_prompt(user_query: str, schema_context: str) -> str:
         "Return JSON only."
     )
 
-
-# ---------------------------------------------------------------------------
-# Cross-encoder re-ranking prompts  (batched — one LLM call for all candidates)
-# ---------------------------------------------------------------------------
 
 CROSS_ENCODER_SYSTEM_PROMPT = (
     "You are a relevance scoring assistant for a Text2SQL retrieval system.\n"
@@ -287,25 +250,12 @@ CROSS_ENCODER_SYSTEM_PROMPT = (
     "  0.0 — The table is completely unrelated.\n\n"
     "Return ONLY a JSON array of objects, one per table, in the same order as the input.\n"
     'Each object must have exactly two keys: "table" (the table name) and "score" (float).\n'
-    'Example for 3 tables: [{"table": "orders", "score": 1.0}, {"table": "products", "score": 0.7}, {"table": "logs", "score": 0.0}]'
+    'Example: [{"table": "orders", "score": 1.0}, {"table": "products", "score": 0.7}]'
 )
 
 
 def cross_encoder_user_prompt(user_query: str, candidates: list[dict]) -> str:
-    """Return the user prompt for scoring all (query, candidate) pairs in one call.
-
-    Parameters
-    ----------
-    user_query:
-        The original user question.
-    candidates:
-        List of dicts with keys ``name`` and ``description``.
-
-    Returns
-    -------
-    str
-        Prompt that instructs the LLM to return a JSON array of scores.
-    """
+    """User prompt for batch cross-encoder scoring."""
     table_lines = "\n".join(
         f"{i + 1}. Table: {c['name']}\n   Description: {c['description']}"
         for i, c in enumerate(candidates)
@@ -316,6 +266,3 @@ def cross_encoder_user_prompt(user_query: str, candidates: list[dict]) -> str:
         "Return a JSON array with one score object per table, in the same order. "
         'Format: [{"table": "<name>", "score": <float>}, ...]'
     )
-
-
-
