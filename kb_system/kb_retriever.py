@@ -565,7 +565,7 @@ def retrieve_context_for_query(
         conn=conn,
         query_embeddings=all_embeddings,
         section="sql_guidelines",
-        top_k=3,
+        top_k=2,
         per_query_k=8,
         rrf_k=RRF_K,
     )

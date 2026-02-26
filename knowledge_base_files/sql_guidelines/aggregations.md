@@ -162,3 +162,4 @@ FROM dwh_f_player_boxscore;
 - For queries involving consistency, stability, reliability, or variance — never rank purely on raw variance or standard deviation.
 - Always incorporate sample size as a confidence weight. Compute a weighted score that discounts entities with fewer observations relative to the dataset.
 - Derive the minimum meaningful sample size dynamically from the data distribution, never hardcode it.
+- Compute consistency on the primary performance metric implied by the query context (e.g., the measure being compared or evaluated). If multiple metrics exist, choose the most representative aggregate performance measure available in the data.

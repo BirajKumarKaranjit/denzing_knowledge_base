@@ -105,6 +105,17 @@ JOIN dwh_d_teams vt   ON g.visitor_team_id = vt.team_id
 WHERE g.season_year = '2024';
 ```
 ---
+### Join Dimension Tables for Descriptive Entity Attributes
+When a query returns, groups, or ranks business entities, include the corresponding dimension table to provide human-readable descriptive attributes (such as names, titles, or labels) whenever that dimension table is available in the allowed schema set.
+Avoid returning only surrogate keys (e.g., *_id) if a descriptive attribute exists in a related dimension.
+
+***Guidelines***
+If a fact table contains only the entity key, join the related dimension on that key. Prefer descriptive attributes from dimensions in the SELECT clause when presenting entities.
+Apply this join whenever the dimension table is available in the allowed tables, regardless of retrieval rank or confidence.
+
+**Omit the dimension join only if:**
+the query explicitly requests identifiers only, or
+the dimension table is not available in the allowed schema.
 
 ## Gotchas and Anti-Patterns
 

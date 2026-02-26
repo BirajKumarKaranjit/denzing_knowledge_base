@@ -21,6 +21,7 @@ The upsert is idempotent — safe to re-run without duplicating data.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import os
 
@@ -32,126 +33,240 @@ from kb_system.kb_embeddings import get_embeddings_batch
 from kb_system.kb_store import get_connection, init_schema, upsert_kb_file, list_all_files
 
 
-def build_kb(verbose: bool = True) -> dict[str, int]:
+def _md5(text: str) -> str:
+    """Return an MD5 hex digest for a string — used for change detection."""
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def _fetch_stored_hashes(conn) -> dict[str, dict[str, str]]:
+    """Return a mapping of file_path → {content_hash, embed_hash} for all rows in the DB.
+
+    Used to skip unchanged files and avoid unnecessary embedding API calls.
+
+    The embed_hash must be computed from exactly the same string that
+    kb_parser.py writes into ``ParsedKBFile.embedding_text``::
+
+        f"{name} — {description}  — {tags_as_python_repr}".strip(" —")
+
+    YAML parses tags into a Python list, so ``str(tags)`` uses single-quoted
+    Python list repr (e.g. ``"['a', 'b']"``).  The DB stores tags as a JSON
+    array string (``'["a", "b"]'``), so we must parse it back to a Python list
+    and call ``str()`` to get an identical representation before hashing.
     """
-    Execute the full KB build pipeline end-to-end.
+    import json as _json
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                file_path,
+                content,
+                metadata->>'name'        AS name,
+                metadata->>'description' AS description,
+                metadata->'tags'         AS tags_json
+            FROM kb_files;
+            """
+        )
+        rows = cur.fetchall()
+
+    result: dict[str, dict[str, str]] = {}
+    for file_path, content, name, description, tags_json in rows:
+        # psycopg2 auto-deserializes JSONB columns to native Python types,
+        # so metadata->'tags' arrives as a list, not a JSON string.
+        # Guard against either form so this works regardless of psycopg2 version.
+        if isinstance(tags_json, list):
+            tags_list = tags_json
+        elif isinstance(tags_json, str):
+            try:
+                tags_list = _json.loads(tags_json)
+            except (ValueError, TypeError):
+                tags_list = []
+        else:
+            tags_list = []
+
+        tags_repr = str(tags_list)  # e.g. "['joins', 'foreign keys', ...]"
+        embed_text = f"{name or ''} — {description or ''}  — {tags_repr}".strip(" —")
+        result[file_path] = {
+            "content_hash": _md5(content or ""),
+            "embed_hash": _md5(embed_text),
+        }
+    return result
+
+
+def build_kb(verbose: bool = True) -> dict[str, int]:
+    """Execute the full KB build pipeline end-to-end.
 
     Connects to Postgres, ensures the schema exists, scans all .md files,
     computes embeddings for table files, and upserts everything into the DB.
 
-    This is the main entry point called by `main.py build`.
+    Change detection:
+        - Files whose body content changed but frontmatter description is
+          unchanged are upserted with their existing embedding (no API call).
+        - Files whose frontmatter description changed get a fresh embedding.
+        - Completely unchanged files are skipped entirely.
+
+    This is the main entry point called by ``main.py build``.
 
     Parameters
     ----------
-    verbose : bool
+    verbose:
         If True, print progress messages for each file processed.
 
     Returns
     -------
-    dict with keys:
-        - "total_files": total .md files found
-        - "entry_points": number of KB.md section index files stored
-        - "table_files": number of individual table files embedded + stored
-        - "skipped": number of files that failed parsing
+    dict
+        Keys: total_files, entry_points, table_files, skipped, unchanged.
     """
     print("\n" + "=" * 60)
-    print("  NBA Knowledge Base Builder")
+    print("  Knowledge Base Builder")
     print("=" * 60)
 
-    # ── Step 1: Connect to Postgres and ensure schema exists ──
     print("\n[kb_builder] Connecting to Postgres...")
     conn = get_connection()
-    print("[kb_builder] ✓ Connected")
+    print("[kb_builder] Connected")
 
     print("[kb_builder] Initializing schema...")
     init_schema(conn)
 
-    # ── Step 2: Scan and parse all .md files from disk ──
     print(f"\n[kb_builder] Scanning KB directory: {KB_ROOT}")
     all_parsed = scan_kb_directory(KB_ROOT)
 
     if not all_parsed:
         print("[kb_builder] No .md files found. Run 'python main.py generate' first.")
         conn.close()
-        return {"total_files": 0, "entry_points": 0, "table_files": 0, "skipped": 0}
+        return {"total_files": 0, "entry_points": 0, "table_files": 0, "skipped": 0, "unchanged": 0}
 
-    # ── Step 3: Separate entry points from table files ──
+    # Fetch hashes of what is currently stored so we can detect changes.
+    stored_hashes = _fetch_stored_hashes(conn)
+
     entry_points = [f for f in all_parsed if f.is_entry_point]
     table_files = [f for f in all_parsed if not f.is_entry_point]
 
     print(f"\n[kb_builder] Found {len(entry_points)} entry point(s) (KB.md files)")
-    print(f"[kb_builder] Found {len(table_files)} table file(s) to embed")
+    print(f"[kb_builder] Found {len(table_files)} table file(s)")
 
-    # ── Step 4: Store entry points WITHOUT embeddings ──
-    # Entry points (KB.md) are fetched by section name at query time,
-    # not by vector similarity — so they don't need embeddings.
+    # ── Store entry points (never embedded) ──
     print("\n[kb_builder] Storing entry points (no embeddings)...")
     for ep in entry_points:
+        stored = stored_hashes.get(ep.file_path, {})
+        new_hash = _md5(ep.content)
+        if stored.get("content_hash") == new_hash:
+            if verbose:
+                print(f"[kb_builder] Unchanged (skipped): {ep.file_path}")
+            continue
         row_id = upsert_kb_file(conn, ep, embedding=None)
         if verbose:
-            print(f"[kb_builder] ✓ Stored entry point: {ep.file_path} (id={row_id})")
+            print(f"[kb_builder] Updated entry point: {ep.file_path} (id={row_id})")
 
-    # ── Step 5: Compute embeddings for table files ──
-    # We embed the "name — description" text (embedding_text field).
-    # This is what gets compared against the user query at retrieval time.
-    print("\n[kb_builder] Computing embeddings for table files...")
+    # ── Classify table files by what changed ──
+    files_to_embed: list = []          # frontmatter description changed → need new embedding
+    files_content_only: list = []      # only body changed → reuse existing embedding
+    files_unchanged: list = []         # nothing changed → skip entirely
+    files_new: list = []               # not in DB yet → need embedding
 
-    # Filter out any table files that somehow have empty embedding_text
-    files_to_embed = [f for f in table_files if f.embedding_text.strip()]
-    skipped_count = len(table_files) - len(files_to_embed)
+    for f in table_files:
+        if not f.embedding_text.strip():
+            continue  # no description — cannot embed, skip
 
-    if skipped_count > 0:
-        print(f"[kb_builder] ⚠ Skipping {skipped_count} table file(s) with empty descriptions")
+        stored = stored_hashes.get(f.file_path)
 
-    if files_to_embed:
-        # Batch all embedding texts into one API call for efficiency
-        embedding_texts = [f.embedding_text for f in files_to_embed]
+        if stored is None:
+            # Brand-new file not yet in the DB.
+            files_new.append(f)
+            continue
 
-        print(f"[kb_builder] Calling OpenAI embeddings API for {len(embedding_texts)} texts...")
-        print("[kb_builder] Example embedding text:")
-        print(f"  → '{embedding_texts[0][:120]}...'")
+        new_content_hash = _md5(f.content)
+        new_embed_hash = _md5(f.embedding_text)
 
-        # Single batched API call — much more efficient than one call per file
-        embeddings = get_embeddings_batch(embedding_texts)
+        content_changed = stored["content_hash"] != new_content_hash
+        embed_changed = stored["embed_hash"] != new_embed_hash
 
-        # Validate that dimension matches config
-        if embeddings and len(embeddings[0]) != EMBEDDING_DIMENSION:
+        if not content_changed and not embed_changed:
+            files_unchanged.append(f)
+        elif embed_changed:
+            # Description changed → must recompute embedding.
+            files_to_embed.append(f)
+        else:
+            # Only body changed → upsert content but reuse existing embedding.
+            files_content_only.append(f)
+
+    # Merge new files with embed-changed files (both need API calls).
+    all_needs_embedding = files_new + files_to_embed
+
+    print(f"\n[kb_builder] Change summary:")
+    print(f"  Need new embedding  : {len(all_needs_embedding)}")
+    print(f"  Content-only update : {len(files_content_only)}")
+    print(f"  Unchanged (skipped) : {len(files_unchanged)}")
+
+    # ── Compute embeddings for files that need them ──
+    new_embeddings: list[list[float]] = []
+    if all_needs_embedding:
+        embedding_texts = [f.embedding_text for f in all_needs_embedding]
+        print(f"\n[kb_builder] Calling OpenAI embeddings API for {len(embedding_texts)} file(s)...")
+        new_embeddings = get_embeddings_batch(embedding_texts)
+
+        if new_embeddings and len(new_embeddings[0]) != EMBEDDING_DIMENSION:
             raise ValueError(
-                f"Embedding dimension mismatch: got {len(embeddings[0])}, "
+                f"Embedding dimension mismatch: got {len(new_embeddings[0])}, "
                 f"expected {EMBEDDING_DIMENSION}. Update EMBEDDING_DIMENSION in config.py."
             )
 
-        print(f"[kb_builder] ✓ Received {len(embeddings)} embeddings "
-              f"(dimension={len(embeddings[0])})")
-
-    else:
-        embeddings = []
-
-    # ── Step 6: Upsert table files WITH their embeddings ──
-    print("\n[kb_builder] Storing table files with embeddings...")
-    for parsed_file, embedding in zip(files_to_embed, embeddings):
+    # ── Upsert files that need a fresh embedding ──
+    for parsed_file, embedding in zip(all_needs_embedding, new_embeddings):
         row_id = upsert_kb_file(conn, parsed_file, embedding=embedding)
+        tag = "(new)" if parsed_file in files_new else "(desc changed)"
         if verbose:
-            print(f"[kb_builder] ✓ Stored: {parsed_file.file_path} "
-                  f"(embed_text='{parsed_file.embedding_text[:60]}...', id={row_id})")
+            print(f"[kb_builder] Upserted {tag}: {parsed_file.file_path} (id={row_id})")
 
-    # ── Step 7: Print final summary ──
+    # ── Upsert content-only changes — fetch existing embedding from DB ──
+    if files_content_only:
+        print(f"\n[kb_builder] Upserting {len(files_content_only)} content-only change(s) "
+              "(reusing existing embeddings)...")
+        for parsed_file in files_content_only:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT embedding FROM kb_files WHERE file_path = %s;",
+                    (parsed_file.file_path,),
+                )
+                row = cur.fetchone()
+
+            existing_embedding: list[float] | None = None
+            if row and row[0] is not None:
+                # pgvector returns the embedding as a list already in psycopg2
+                raw = row[0]
+                if isinstance(raw, str):
+                    import json as _json
+                    existing_embedding = _json.loads(raw)
+                else:
+                    existing_embedding = list(raw)
+
+            row_id = upsert_kb_file(conn, parsed_file, embedding=existing_embedding)
+            if verbose:
+                print(
+                    f"[kb_builder] Updated content: {parsed_file.file_path} "
+                    f"(embedding reused, id={row_id})"
+                )
+
     conn.close()
 
+    skipped_count = len([f for f in table_files if not f.embedding_text.strip()])
     summary = {
         "total_files": len(all_parsed),
         "entry_points": len(entry_points),
-        "table_files": len(files_to_embed),
+        "table_files": len(all_needs_embedding) + len(files_content_only),
         "skipped": skipped_count,
+        "unchanged": len(files_unchanged),
     }
 
     print("\n" + "=" * 60)
     print("  Build Complete")
     print("=" * 60)
-    print(f"  Total files processed : {summary['total_files']}")
-    print(f"  Entry points stored   : {summary['entry_points']}")
-    print(f"  Table files embedded  : {summary['table_files']}")
-    print(f"  Skipped (no desc)     : {summary['skipped']}")
+    print(f"  Total files processed      : {summary['total_files']}")
+    print(f"  Entry points stored        : {summary['entry_points']}")
+    print(f"  Table files re-embedded    : {len(all_needs_embedding)}")
+    print(f"  Table files content-synced : {len(files_content_only)}")
+    print(f"  Unchanged (skipped)        : {summary['unchanged']}")
+    print(f"  Skipped (no description)   : {skipped_count}")
     print("=" * 60)
 
     return summary
