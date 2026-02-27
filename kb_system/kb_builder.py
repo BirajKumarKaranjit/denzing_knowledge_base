@@ -1,22 +1,12 @@
-"""
-kb_system/kb_builder.py
-------------------------
+"""kb_system/kb_builder.py
+
 Orchestrates the full KB build pipeline:
+    scan .md files → parse → compute embeddings → upsert to Postgres.
 
-    1. Scan knowledge_base_files/ for all .md files
-    2. Parse each file (split frontmatter / body) via kb_parser
-    3. Compute OpenAI embeddings for non-entry-point table files only
-       — KB.md entry points are NOT embedded (they're fetched by name)
-       — Individual table files (players.md, games.md) ARE embedded
-         using their "name — description" text as the embedding input
-    4. Upsert every file into the kb_files Postgres table
-
-Run this script whenever you:
-    - Add a new table .md file
-    - Edit a description (which changes the embedding)
-    - Add a new KB section
-
-The upsert is idempotent — safe to re-run without duplicating data.
+Change detection avoids redundant embedding API calls:
+    - Unchanged files are skipped entirely.
+    - Files where only body content changed reuse the existing embedding.
+    - Files where the frontmatter description changed get a fresh embedding.
 """
 
 from __future__ import annotations
@@ -34,25 +24,12 @@ from kb_system.kb_store import get_connection, init_schema, upsert_kb_file, list
 
 
 def _md5(text: str) -> str:
-    """Return an MD5 hex digest for a string — used for change detection."""
+    """Return an MD5 hex digest for a string."""
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
 def _fetch_stored_hashes(conn) -> dict[str, dict[str, str]]:
-    """Return a mapping of file_path → {content_hash, embed_hash} for all rows in the DB.
-
-    Used to skip unchanged files and avoid unnecessary embedding API calls.
-
-    The embed_hash must be computed from exactly the same string that
-    kb_parser.py writes into ``ParsedKBFile.embedding_text``::
-
-        f"{name} — {description}  — {tags_as_python_repr}".strip(" —")
-
-    YAML parses tags into a Python list, so ``str(tags)`` uses single-quoted
-    Python list repr (e.g. ``"['a', 'b']"``).  The DB stores tags as a JSON
-    array string (``'["a", "b"]'``), so we must parse it back to a Python list
-    and call ``str()`` to get an identical representation before hashing.
-    """
+    """Return {file_path: {content_hash, embed_hash}} for all rows in the DB."""
     import json as _json
 
     with conn.cursor() as cur:
@@ -71,9 +48,6 @@ def _fetch_stored_hashes(conn) -> dict[str, dict[str, str]]:
 
     result: dict[str, dict[str, str]] = {}
     for file_path, content, name, description, tags_json in rows:
-        # psycopg2 auto-deserializes JSONB columns to native Python types,
-        # so metadata->'tags' arrives as a list, not a JSON string.
-        # Guard against either form so this works regardless of psycopg2 version.
         if isinstance(tags_json, list):
             tags_list = tags_json
         elif isinstance(tags_json, str):
@@ -84,7 +58,7 @@ def _fetch_stored_hashes(conn) -> dict[str, dict[str, str]]:
         else:
             tags_list = []
 
-        tags_repr = str(tags_list)  # e.g. "['joins', 'foreign keys', ...]"
+        tags_repr = str(tags_list)
         embed_text = f"{name or ''} — {description or ''}  — {tags_repr}".strip(" —")
         result[file_path] = {
             "content_hash": _md5(content or ""),
@@ -97,20 +71,12 @@ def build_kb(verbose: bool = True) -> dict[str, int]:
     """Execute the full KB build pipeline end-to-end.
 
     Connects to Postgres, ensures the schema exists, scans all .md files,
-    computes embeddings for table files, and upserts everything into the DB.
-
-    Change detection:
-        - Files whose body content changed but frontmatter description is
-          unchanged are upserted with their existing embedding (no API call).
-        - Files whose frontmatter description changed get a fresh embedding.
-        - Completely unchanged files are skipped entirely.
-
-    This is the main entry point called by ``main.py build``.
+    computes embeddings for changed table files, and upserts to the DB.
 
     Parameters
     ----------
-    verbose:
-        If True, print progress messages for each file processed.
+    verbose : bool
+        Print per-file progress messages.
 
     Returns
     -------
@@ -136,7 +102,6 @@ def build_kb(verbose: bool = True) -> dict[str, int]:
         conn.close()
         return {"total_files": 0, "entry_points": 0, "table_files": 0, "skipped": 0, "unchanged": 0}
 
-    # Fetch hashes of what is currently stored so we can detect changes.
     stored_hashes = _fetch_stored_hashes(conn)
 
     entry_points = [f for f in all_parsed if f.is_entry_point]
@@ -145,7 +110,6 @@ def build_kb(verbose: bool = True) -> dict[str, int]:
     print(f"\n[kb_builder] Found {len(entry_points)} entry point(s) (KB.md files)")
     print(f"[kb_builder] Found {len(table_files)} table file(s)")
 
-    # ── Store entry points (never embedded) ──
     print("\n[kb_builder] Storing entry points (no embeddings)...")
     for ep in entry_points:
         stored = stored_hashes.get(ep.file_path, {})
@@ -158,20 +122,18 @@ def build_kb(verbose: bool = True) -> dict[str, int]:
         if verbose:
             print(f"[kb_builder] Updated entry point: {ep.file_path} (id={row_id})")
 
-    # ── Classify table files by what changed ──
-    files_to_embed: list = []          # frontmatter description changed → need new embedding
-    files_content_only: list = []      # only body changed → reuse existing embedding
-    files_unchanged: list = []         # nothing changed → skip entirely
-    files_new: list = []               # not in DB yet → need embedding
+    files_to_embed: list = []
+    files_content_only: list = []
+    files_unchanged: list = []
+    files_new: list = []
 
     for f in table_files:
         if not f.embedding_text.strip():
-            continue  # no description — cannot embed, skip
+            continue
 
         stored = stored_hashes.get(f.file_path)
 
         if stored is None:
-            # Brand-new file not yet in the DB.
             files_new.append(f)
             continue
 
@@ -184,13 +146,10 @@ def build_kb(verbose: bool = True) -> dict[str, int]:
         if not content_changed and not embed_changed:
             files_unchanged.append(f)
         elif embed_changed:
-            # Description changed → must recompute embedding.
             files_to_embed.append(f)
         else:
-            # Only body changed → upsert content but reuse existing embedding.
             files_content_only.append(f)
 
-    # Merge new files with embed-changed files (both need API calls).
     all_needs_embedding = files_new + files_to_embed
 
     print(f"\n[kb_builder] Change summary:")
@@ -198,7 +157,6 @@ def build_kb(verbose: bool = True) -> dict[str, int]:
     print(f"  Content-only update : {len(files_content_only)}")
     print(f"  Unchanged (skipped) : {len(files_unchanged)}")
 
-    # ── Compute embeddings for files that need them ──
     new_embeddings: list[list[float]] = []
     if all_needs_embedding:
         embedding_texts = [f.embedding_text for f in all_needs_embedding]
@@ -211,14 +169,12 @@ def build_kb(verbose: bool = True) -> dict[str, int]:
                 f"expected {EMBEDDING_DIMENSION}. Update EMBEDDING_DIMENSION in config.py."
             )
 
-    # ── Upsert files that need a fresh embedding ──
     for parsed_file, embedding in zip(all_needs_embedding, new_embeddings):
         row_id = upsert_kb_file(conn, parsed_file, embedding=embedding)
         tag = "(new)" if parsed_file in files_new else "(desc changed)"
         if verbose:
             print(f"[kb_builder] Upserted {tag}: {parsed_file.file_path} (id={row_id})")
 
-    # ── Upsert content-only changes — fetch existing embedding from DB ──
     if files_content_only:
         print(f"\n[kb_builder] Upserting {len(files_content_only)} content-only change(s) "
               "(reusing existing embeddings)...")
@@ -232,7 +188,6 @@ def build_kb(verbose: bool = True) -> dict[str, int]:
 
             existing_embedding: list[float] | None = None
             if row and row[0] is not None:
-                # pgvector returns the embedding as a list already in psycopg2
                 raw = row[0]
                 if isinstance(raw, str):
                     import json as _json
@@ -273,15 +228,7 @@ def build_kb(verbose: bool = True) -> dict[str, int]:
 
 
 def status_kb() -> None:
-    """
-    Print a human-readable status report of what is currently stored in the DB.
-
-    Shows all files grouped by section, whether each has an embedding,
-    and the total count. Useful for verifying a successful build before
-    running queries.
-
-    Called by `main.py status`.
-    """
+    """Print a human-readable status report of what is currently stored in the DB."""
     print("\n[kb_builder] Fetching KB status from database...")
     conn = get_connection()
     files = list_all_files(conn)

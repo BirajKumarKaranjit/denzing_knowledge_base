@@ -1,20 +1,7 @@
-"""
-kb_system/kb_parser.py
------------------------
-Parses markdown KB files into structured Python objects.
+"""kb_system/kb_parser.py
 
-Each KB file has two parts:
-    1. YAML frontmatter (between --- delimiters) — contains name, description,
-       tags, priority. This is the metadata used for routing/embeddings.
-    2. Markdown body — contains the actual DDL, business rules, SQL patterns.
-       This is the "data field" injected into the SQL prompt.
-
-The ParsedKBFile dataclass holds both parts plus derived fields needed by
-kb_store.py (file_path, section, is_entry_point, embedding_text).
-
-Embedding text is computed as:  "{name} — {description}"
-This gives the embedding model both the topic name AND a semantic description
-of when to use this file — which is exactly what we want for routing.
+Parses KB markdown files into structured Python objects.
+Each file has YAML frontmatter (metadata/routing) and a markdown body (data/context).
 """
 
 from __future__ import annotations
@@ -29,30 +16,22 @@ import yaml
 
 @dataclass
 class ParsedKBFile:
-    """
-    Structured representation of a parsed KB markdown file.
+    """Structured representation of a parsed KB markdown file.
 
     Attributes
     ----------
     file_path : str
-        Relative path from KB_ROOT, used as the unique key in the database.
-        e.g., "ddl/players.md" or "ddl/KB.md"
+        Relative path from KB_ROOT (e.g. ``"ddl/players.md"``).
     section : str
-        Top-level folder name — "ddl", "business_rules", etc.
-        Derived from the first component of file_path.
+        Top-level folder name (e.g. ``"ddl"``, ``"business_rules"``).
     metadata : dict
-        All parsed YAML frontmatter fields as a dict.
-        e.g., {"name": "players", "description": "...", "tags": [...]}
+        Parsed YAML frontmatter fields.
     content : str
-        Raw markdown body below the frontmatter (the DDL, rules, etc.)
-        This is what gets injected into the SQL generation prompt.
+        Raw markdown body below the frontmatter.
     is_entry_point : bool
-        True if this is a KB.md section index file.
-        Entry points are injected as section context, never similarity-searched.
+        True for KB.md section index files; these are not similarity-searched.
     embedding_text : str
-        The text to embed for similarity search.
-        Computed as "{name} — {description}" from frontmatter.
-        Empty string for entry points (they don't get embeddings).
+        Text to embed for similarity search. Empty for entry points.
     """
 
     file_path: str
@@ -64,38 +43,28 @@ class ParsedKBFile:
 
 
 def parse_markdown_file(md_path: Path, kb_root: Path) -> ParsedKBFile:
-    """
-    Parse a single KB markdown file into a ParsedKBFile object.
-
-    Splits the file at the YAML frontmatter delimiters (---), parses
-    the YAML block, extracts the markdown body, and derives all fields
-    needed for database storage and embedding computation.
+    """Parse a single KB markdown file into a ParsedKBFile.
 
     Parameters
     ----------
     md_path : Path
-        Absolute path to the .md file to parse.
+        Absolute path to the .md file.
     kb_root : Path
-        Absolute path to the KB root directory (knowledge_base_files/).
-        Used to compute the relative file_path stored in the DB.
+        KB root directory used to compute the relative file_path.
 
     Returns
     -------
     ParsedKBFile
-        Fully populated dataclass ready for kb_store.upsert_kb_file().
 
     Raises
     ------
     ValueError
-        If the file has no YAML frontmatter or the frontmatter is missing
-        required fields (name, description).
+        If the file has no YAML frontmatter.
     yaml.YAMLError
         If the frontmatter YAML is malformed.
     """
     raw_text = md_path.read_text(encoding="utf-8")
 
-    # Split frontmatter from body using --- delimiters
-    # Pattern: optional whitespace, ---, content, ---, rest
     frontmatter_pattern = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)", re.DOTALL)
     match = frontmatter_pattern.match(raw_text)
 
@@ -108,34 +77,20 @@ def parse_markdown_file(md_path: Path, kb_root: Path) -> ParsedKBFile:
     frontmatter_str = match.group(1)
     body_content = match.group(2).strip()
 
-    # Parse YAML frontmatter
     try:
         metadata: dict[str, Any] = yaml.safe_load(frontmatter_str) or {}
     except yaml.YAMLError as exc:
         raise yaml.YAMLError(f"Invalid YAML frontmatter in '{md_path}': {exc}") from exc
 
-    # Derive relative file_path (e.g., "ddl/players.md")
-    relative_path = str(md_path.relative_to(kb_root))
-    relative_path = relative_path.replace("\\", "/")
-
-    # Derive section from the first path component
+    relative_path = str(md_path.relative_to(kb_root)).replace("\\", "/")
     section = relative_path.split("/")[0]
-
-    # Determine if this is a KB.md entry point
     is_entry_point = md_path.name == "KB.md"
 
-    # Build embedding text from name + description + tags
-    # Entry points don't need embedding_text (they're not similarity-searched)
     name = metadata.get("name", "")
     description = metadata.get("description", "")
     tags = metadata.get("tags", [])
 
-    if is_entry_point:
-        embedding_text = ""  # Entry points are never embedded
-    else:
-        # This is the text the OpenAI embedding model will encode.
-        # Format: "players — Use this when user asks about player profiles..."
-        embedding_text = f"{name} — {description}  — {tags}".strip(" —")
+    embedding_text = "" if is_entry_point else f"{name} — {description}  — {tags}".strip(" —")
 
     return ParsedKBFile(
         file_path=relative_path,
@@ -148,28 +103,18 @@ def parse_markdown_file(md_path: Path, kb_root: Path) -> ParsedKBFile:
 
 
 def scan_kb_directory(kb_root: Path) -> list[ParsedKBFile]:
-    """
-    Recursively scan the KB root directory and parse all .md files.
+    """Recursively scan the KB root and parse all .md files.
 
-    Walks kb_root looking for .md files in any subdirectory. Parses each
-    one using parse_markdown_file(). Files that fail parsing are logged
-    and skipped (so a single bad file doesn't abort the whole build).
+    Files that fail parsing are logged and skipped.
 
     Parameters
     ----------
     kb_root : Path
-        Absolute path to the KB root (knowledge_base_files/).
+        Absolute path to the KB root directory.
 
     Returns
     -------
     list[ParsedKBFile]
-        All successfully parsed KB files. Entry points (KB.md) are
-        included alongside table files.
-
-    Notes
-    -----
-    Ordering: entry points come before table files within each section,
-    which is the order they'll be upserted into the database.
     """
     if not kb_root.exists():
         raise FileNotFoundError(
@@ -186,8 +131,7 @@ def scan_kb_directory(kb_root: Path) -> list[ParsedKBFile]:
         try:
             parsed = parse_markdown_file(md_path, kb_root)
             parsed_files.append(parsed)
-            print(f"[kb_parser] Parsed: {parsed.file_path} "
-                  f"(entry_point={parsed.is_entry_point})")
+            print(f"[kb_parser] Parsed: {parsed.file_path} (entry_point={parsed.is_entry_point})")
         except (ValueError, yaml.YAMLError) as exc:
             print(f"[kb_parser] Skipped '{md_path.name}': {exc}")
 

@@ -299,3 +299,149 @@ def cross_encoder_user_prompt(user_query: str, candidates: list[dict]) -> str:
         "Return a JSON array with one score object per table, in the same order. "
         'Format: [{"table": "<name>", "score": <float>}, ...]'
     )
+
+
+# ---------------------------------------------------------------------------
+# SQL DIALECT INSTRUCTION BLOCKS
+# ---------------------------------------------------------------------------
+# Each block is injected verbatim into the SQL generation prompt so the LLM
+# produces engine-correct SQL without being told the dialect inline.
+
+_DIALECT_INSTRUCTIONS: dict[str, str] = {
+    "postgresql": (
+        "TARGET DATABASE: PostgreSQL\n"
+        "- Use standard ANSI SQL with PostgreSQL extensions where helpful.\n"
+        "- String matching: use ILIKE for case-insensitive patterns.\n"
+        "- Date truncation: DATE_TRUNC('month'|'year'|'week', col).\n"
+        "- Safe division: NULLIF(denominator, 0).\n"
+        "- Window functions: fully supported (RANK, DENSE_RANK, ROW_NUMBER, LAG, LEAD).\n"
+        "- CTEs: fully supported; columns in the WITH clause are accessible in SELECT.\n"
+        "- String concatenation: use || operator.\n"
+        "- Identifier quoting: use double quotes for reserved words (e.g. \"order\").\n"
+        "- Do NOT use TOP — use LIMIT instead.\n"
+        "- Do NOT use GETDATE() — use NOW() or CURRENT_TIMESTAMP."
+    ),
+    "snowflake": (
+        "TARGET DATABASE: Snowflake\n"
+        "- String matching: use ILIKE for case-insensitive patterns.\n"
+        "- Date truncation: DATE_TRUNC('MONTH'|'YEAR'|'WEEK', col).\n"
+        "- Safe division: NULLIF(denominator, 0) or DIV0(numerator, denominator).\n"
+        "- Window functions: fully supported.\n"
+        "- CTEs: fully supported.\n"
+        "- String concatenation: use || or CONCAT().\n"
+        "- Identifier quoting: use double quotes; identifiers are case-insensitive by default.\n"
+        "- QUALIFY clause can replace a subquery when filtering window function results.\n"
+        "- Do NOT use ILIKE with ESCAPE on the same column twice in one predicate.\n"
+        "- Use CURRENT_TIMESTAMP() (with parentheses) for the current time."
+    ),
+    "bigquery": (
+        "TARGET DATABASE: Google BigQuery\n"
+        "- String matching: use LIKE (case-sensitive) or LOWER(col) LIKE LOWER(pattern).\n"
+        "- Date truncation: DATE_TRUNC(col, MONTH|YEAR|WEEK).\n"
+        "- Safe division: SAFE_DIVIDE(numerator, denominator).\n"
+        "- Window functions: fully supported.\n"
+        "- CTEs: fully supported.\n"
+        "- String concatenation: use || or CONCAT().\n"
+        "- Identifier quoting: use backticks for reserved words or project.dataset.table paths.\n"
+        "- Use CURRENT_TIMESTAMP() for the current timestamp.\n"
+        "- Arrays: UNNEST() to flatten array columns.\n"
+        "- Do NOT use ILIKE — it is not supported in BigQuery."
+    ),
+    "mysql": (
+        "TARGET DATABASE: MySQL\n"
+        "- String matching: LIKE is case-insensitive for utf8 collations by default.\n"
+        "- Date truncation: DATE_FORMAT(col, '%Y-%m-01') or DATE_TRUNC is unavailable — "
+        "use DATE_FORMAT instead.\n"
+        "- Safe division: NULLIF(denominator, 0).\n"
+        "- Window functions: supported in MySQL 8.0+.\n"
+        "- CTEs: supported in MySQL 8.0+.\n"
+        "- String concatenation: use CONCAT(a, b) — do NOT use || (treated as OR).\n"
+        "- Identifier quoting: use backticks.\n"
+        "- Do NOT use ILIKE — it is not supported.\n"
+        "- Use NOW() for the current timestamp."
+    ),
+    "mssql": (
+        "TARGET DATABASE: Microsoft SQL Server (T-SQL)\n"
+        "- String matching: LIKE is case-insensitive for default collations.\n"
+        "- Date truncation: DATETRUNC(month|year|week, col) (SQL Server 2022+) or "
+        "DATEADD(month, DATEDIFF(month, 0, col), 0) for earlier versions.\n"
+        "- Safe division: NULLIF(denominator, 0).\n"
+        "- Window functions: fully supported.\n"
+        "- CTEs: fully supported.\n"
+        "- String concatenation: use + operator or CONCAT().\n"
+        "- Identifier quoting: use square brackets [column_name].\n"
+        "- Use TOP N instead of LIMIT.\n"
+        "- Do NOT use ILIKE — use LIKE with appropriate collation.\n"
+        "- Use GETDATE() or CURRENT_TIMESTAMP for the current timestamp."
+    ),
+}
+
+_DIALECT_FALLBACK = (
+    "TARGET DATABASE: Standard SQL\n"
+    "- Write ANSI-compatible SQL that avoids engine-specific extensions.\n"
+    "- Use LIMIT for row restriction, LIKE for string matching, and standard window functions."
+)
+
+
+def get_dialect_instruction(dialect: str) -> str:
+    """Return the dialect-specific SQL instruction block for the given engine name."""
+    return _DIALECT_INSTRUCTIONS.get(dialect.lower(), _DIALECT_FALLBACK)
+
+
+# ---------------------------------------------------------------------------
+# PEER — ENTITY EXTRACTION PROMPTS
+# ---------------------------------------------------------------------------
+
+PEER_ENTITY_EXTRACTION_SYSTEM_PROMPT = (
+    "You are a SQL analysis assistant for a Text2SQL system.\n"
+    "Inspect a SQL query and extract every filter value in a WHERE clause\n"
+    "that represents a real-world named entity — a person name, organisation name,\n"
+    "category label, status value, or any similar domain concept.\n\n"
+    "Rules:\n"
+    "- DO extract: string literals used in equality (=), ILIKE, LIKE, or IN filters.\n"
+    "- DO NOT extract: numeric thresholds, date literals, computed expressions, or column-to-column comparisons.\n"
+    "- If the SQL has no entity filters, return an empty JSON array [].\n"
+    "- Resolve table aliases to full table names where possible.\n\n"
+    "Return ONLY a valid JSON array. Each element must have exactly these keys:\n"
+    '  "column"   — the column being filtered (string)\n'
+    '  "table"    — the full table name (string, or empty string if unresolvable)\n'
+    '  "value"    — the raw string value as it appears in the SQL (string)\n'
+    '  "operator" — the SQL operator: =, ILIKE, LIKE, or IN (string)\n\n'
+    "Example output:\n"
+    '[\n'
+    '  {"column": "full_name", "table": "users", "value": "jon smth", "operator": "ILIKE"},\n'
+    '  {"column": "status", "table": "orders", "value": "active", "operator": "="}\n'
+    ']'
+)
+
+
+def peer_entity_extraction_user_prompt(sql: str) -> str:
+    """User prompt to extract entity filter values from the generated SQL."""
+    return (
+        f"SQL query to analyse:\n\n```sql\n{sql}\n```\n\n"
+        "Extract all named-entity filter values from WHERE clauses. "
+        "Return a JSON array only — no extra text."
+    )
+
+
+PEER_LLM_PATCH_SYSTEM_PROMPT = (
+    "You are a SQL rewriting assistant.\n"
+    "Apply ONLY the specified substitutions to the SQL query — change nothing else.\n"
+    "Preserve all formatting, whitespace, comments, and SQL structure.\n"
+    "Return ONLY the corrected SQL — no markdown fences, no explanations."
+)
+
+
+def peer_llm_patch_user_prompt(original_sql: str, substitutions: list[dict]) -> str:
+    """User prompt to apply entity substitutions to SQL via LLM rewrite."""
+    sub_lines = "\n".join(
+        f'  - Replace "{s["original"]}" with "{s["corrected"]}" '
+        f'(column: {s["column"]}, table: {s["table"]})'
+        for s in substitutions
+    )
+    return (
+        f"Original SQL:\n\n```sql\n{original_sql}\n```\n\n"
+        f"Apply these substitutions exactly:\n{sub_lines}\n\n"
+        "Return the corrected SQL only — no markdown fencing."
+    )
+

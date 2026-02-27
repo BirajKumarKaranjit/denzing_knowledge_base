@@ -106,7 +106,7 @@ def cmd_status() -> None:
 
 
 def cmd_query(user_query: str) -> None:
-    """Run a full pipeline query: relevance gate → retrieve → assemble → generate SQL.
+    """Run a full pipeline query: relevance gate → retrieve → assemble → generate SQL → PEER.
 
     Parameters
     ----------
@@ -115,6 +115,7 @@ def cmd_query(user_query: str) -> None:
     """
     from kb_system.kb_store import get_connection
     from kb_system.kb_retriever import retrieve_context_for_query
+    from kb_system.peer import run_peer
     from utils.prompt_builder import build_sql_prompt
     from sql_generator import generate_sql, extract_sql_from_response, is_query_relevant, answer_meta_query
 
@@ -157,12 +158,34 @@ def cmd_query(user_query: str) -> None:
     print(f"{'=' * 60}")
     print(f"\n[main] Calling LLM for SQL generation...")
     llm_response = generate_sql(prompt)
-    sql = extract_sql_from_response(llm_response)
+    raw_sql = extract_sql_from_response(llm_response)
+
+    # --- PEER: Pre-Execution Entity Resolution ---
+    peer_result = run_peer(raw_sql, conn)
+
+    # Surface PEER messages to the user before presenting the SQL
+    if peer_result.messages:
+        print(f"\n{'=' * 60}")
+        print("  Entity Resolution Notes:")
+        print(f"{'=' * 60}")
+        for msg in peer_result.messages:
+            print(f"  {msg}")
+
+    if peer_result.unvalidatable:
+        print(f"\n[peer] Could not validate: {', '.join(peer_result.unvalidatable)}")
+
+    if peer_result.error:
+        print(f"\n[peer] Warning: PEER encountered an error: {peer_result.error}")
+
+    final_sql = peer_result.sql
 
     print(f"\n{'=' * 60}")
-    print("  Generated SQL:")
+    if peer_result.patched:
+        print("  Generated SQL (PEER-patched):")
+    else:
+        print("  Generated SQL:")
     print(f"{'=' * 60}")
-    print(sql)
+    print(final_sql)
     print(f"{'=' * 60}\n")
     print(citation_md)
 

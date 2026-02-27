@@ -8,12 +8,16 @@ from kb_system.kb_generator import (
     generate_section_sub_file,
 )
 from kb_system.kb_retriever import classify_sections_with_llm, retrieve_context_for_query
+from kb_system.peer import PEERResult, run_peer
+
 __all__ = [
     "build_kb",
     "classify_sections_with_llm",
     "generate_all_kb_files",
     "generate_all_sub_files_for_section",
     "generate_section_sub_file",
+    "PEERResult",
     "retrieve_context_for_query",
+    "run_peer",
     "status_kb",
 ]

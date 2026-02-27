@@ -7,7 +7,7 @@ priority: high
 
 # SQL Filtering Guidelines
 
-## Player Name Matching — Always Use ILIKE with Wildcards or UPPER of LIKE if ILIKE not supported.
+## Entity Name Matching — Always Use ILIKE with Wildcards or UPPER of LIKE if ILIKE not supported.
 Player names in the database may include suffixes (Jr., II, III) or slight variations. **Never use `=` for player name lookups.**
 ```sql
 -- CORRECT: catches "Gary Payton II", "Jimmy Butler III", etc.
@@ -19,6 +19,23 @@ WHERE p.full_name = 'Jimmy Butler'
 ```
 **Gotcha:** If a name query returns no results, the first suspect is an exact-match filter. Switch to `ILIKE '%name%'`.
 ---
+## Textual / Categorical Matching — Prefer ILIKE
+
+For string-based categorical fields (e.g., type, status, code, category, label), avoid strict equality unless the exact stored value is guaranteed. Stored values often vary in casing, pluralization, or abbreviations.
+Use case-insensitive matching (ILIKE) or join to a dimension table instead of =.
+-- Preferred: tolerant text match
+WHERE g.game_type ILIKE '%playoff%'
+
+-- Preferred: via dimension attribute
+JOIN dwh_d_teams t ON g.team_id = t.team_id
+WHERE t.abbreviation ILIKE '%MIL%'
+
+-- Avoid: brittle exact match
+WHERE g.game_type = 'Playoff'
+
+Use exact equality (=) only when:
+- the column is a controlled enum/code, or
+- an exact code match is explicitly required.
 
 ## "Last Game" Date Queries — Use MAX, Not CURRENT_DATE
 When the user asks about a player's or team's "most recent game" or "last night," resolve the date dynamically from the data. **Never hardcode CURRENT_DATE - 1.**
@@ -98,6 +115,20 @@ WHERE pts.season_year = (
 )
 ```
 ---
+
+## Default Scoping (When User Does Not Specify)
+
+Game Type: Default to regular season.
+WHERE g.game_type ILIKE '%regular%'
+
+No Date Mentioned: Use latest available game in data (not CURRENT_DATE).
+ORDER BY game_date DESC
+LIMIT 1
+
+No Season Mentioned (Season-Level Query): Use latest season.
+WHERE g.season_year = (SELECT MAX(season_year) FROM dwh_d_games)
+
+Never rely on CURRENT_DATE for historical sports data.
 
 ## Avoid LIMIT That Truncates Analytical Results
 
