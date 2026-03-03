@@ -144,8 +144,14 @@ def _strip_sql_wildcards(value: str) -> str:
 def _build_word_prefixes(value: str) -> list[str]:
     """Extract PEER_PROBE_PREFIX_LEN-char prefixes from every word in value.
 
-    Duplicates and empty strings are removed.
-    Example: "Joel Embiid" with prefix_len=2 → ["jo", "em"]
+    Duplicates and empty strings are removed. Output is lowercased.
+    The first prefix is used as a start-anchored pattern (``prefix%``).
+    Subsequent prefixes are used as contains patterns (``%prefix%``) because
+    non-first words never start the full column value.
+
+    Example: "Joel Embiid" with prefix_len=2
+        → ["jo", "em"]
+        → query: col ILIKE 'jo%' AND col ILIKE '%em%'
     """
     seen: set[str] = set()
     result: list[str] = []
@@ -167,14 +173,12 @@ def _probe_candidates(
     """Return DISTINCT column values that match all word-prefixes of value.
 
     Strategy:
-    1. Split ``value`` into words, take ``PEER_PROBE_PREFIX_LEN`` chars of each.
-    2. Issue one query with ``col ILIKE 'jo%' AND col ILIKE 'em%' ...`` so only
-       rows that contain ALL prefixes are returned.  For a two-word name like
-       "Joel Embiid" this intersection is tiny and always includes the real row.
-    3. If the AND-query returns zero rows (e.g. the value really doesn't exist),
-       fall back to a single first-word prefix query so fuzzy matching can still
-       produce a scored no_match rather than an unvalidatable skip.
-    4. Apply ``LIMIT`` at the DB level to keep each query cheap.
+    - First word  → ``col ILIKE 'jo%'``   (anchored to start — uses any prefix index)
+    - Later words → ``col ILIKE '%em%'``   (contains — needed because the word never
+                                            starts the full column value)
+    - All conditions combined with AND so the intersection is tiny.
+    - Falls back to first-word prefix only when the AND query returns nothing,
+      ensuring fuzzy matching can still produce a scored no_match.
     """
     clean_value = _strip_sql_wildcards(value)
     if not clean_value:
@@ -201,23 +205,27 @@ def _probe_candidates(
             return []
 
     if not prefixes:
-        # No prefix at all — broad scan with limit only
         return _run("TRUE", ())
 
-    # Build AND clause: col ILIKE 'jo%' AND col ILIKE 'em%' ...
-    conditions = " AND ".join(f"{column} ILIKE %s" for _ in prefixes)
-    params_and = tuple(f"{p}%" for p in prefixes)
+    # First word: anchored prefix (e.g. 'jo%')  — hits leading-char index
+    # Subsequent words: contains pattern (e.g. '%em%') — matches anywhere in value
+    conditions_parts = [f"{column} ILIKE %s"]
+    params_list: list[str] = [f"{prefixes[0]}%"]
+    for p in prefixes[1:]:
+        conditions_parts.append(f"{column} ILIKE %s")
+        params_list.append(f"%{p}%")
 
-    candidates = _run(conditions, params_and)
+    conditions = " AND ".join(conditions_parts)
+    candidates = _run(conditions, tuple(params_list))
+
     _log.debug(
-        "PEER multi-prefix probe %s.%s prefixes=%s → %d candidate(s)",
-        qualified_table, column, prefixes, len(candidates),
+        "PEER multi-prefix probe %s.%s prefixes=%s patterns=%s → %d candidate(s)",
+        qualified_table, column, prefixes, params_list, len(candidates),
     )
 
-    # Fallback: AND intersection was empty — try first-word prefix only
+    # Fallback: AND intersection empty — try first-word prefix only
     if not candidates and len(prefixes) > 1:
-        fallback_cond = f"{column} ILIKE %s"
-        candidates = _run(fallback_cond, (f"{prefixes[0]}%",))
+        candidates = _run(f"{column} ILIKE %s", (f"{prefixes[0]}%",))
         _log.debug(
             "PEER fallback single-prefix probe %s.%s prefix=%s → %d candidate(s)",
             qualified_table, column, prefixes[0], len(candidates),
