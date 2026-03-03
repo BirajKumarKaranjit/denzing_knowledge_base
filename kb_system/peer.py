@@ -306,36 +306,47 @@ def _run_peer_internal(
     for entity in entities:
         candidates = _probe_candidates(conn, entity.table, entity.column, entity.value, db_schema)
         if not candidates:
+            _log.debug(
+                "PEER: probe returned no candidates for '%s' in %s.%s",
+                entity.value, entity.table, entity.column,
+            )
             unvalidatable.append(f"{entity.table}.{entity.column}='{entity.value}' (no candidates)")
             continue
 
         if len(candidates) == 1:
-            # Only one candidate, no fuzzy matching needed
             entity.corrected = candidates[0]
             entity.score = 100
             entity.action = "exact"
-            print(f"[peer]   '{entity.value}' → '{candidates[0]}' (only candidate, auto-exact)")
+            if entity.corrected != entity.value:
+                to_substitute.append(entity)
+                messages.append(
+                    f"Single candidate '{entity.value}' replaced with '{entity.corrected}'."
+                )
+            print(f"[peer]   '{entity.value}' → '{entity.corrected}' (single candidate, action={entity.action})")
         else:
             best, score = _fuzzy_match(entity.value, candidates)
             action = _determine_action(score)
             entity.corrected = best
             entity.score = score
             entity.action = action
+
             print(f"[peer]   '{entity.value}' → '{best}' (score={score}, action={action})")
 
-            if action in ("auto_sub", "flag_sub"):
+            if action == "auto_sub":
                 to_substitute.append(entity)
                 messages.append(
-                    f"'{entity.value}' interpreted as '{best}' (similarity {score}%)."
-                    if action == "auto_sub" else
-                    f"Assumed '{entity.value}' refers to '{best}' (similarity {score}%). Please verify."
+                    f"Note: '{entity.value}' was interpreted as '{best}' (auto-corrected, similarity {score}%)."
                 )
-
-        if entity.action == "no_match":
-            messages.append(
-                f"Could not find '{entity.value}' in {entity.table}.{entity.column} "
-                f"(best match: '{entity.corrected}', similarity {entity.score}%)."
-            )
+            elif action == "flag_sub":
+                to_substitute.append(entity)
+                messages.append(
+                    f"Assumed '{entity.value}' refers to '{best}' (similarity {score}%). Please verify the result."
+                )
+            elif action == "no_match":
+                messages.append(
+                    f"Could not find '{entity.value}' in {entity.table}.{entity.column} "
+                    f"(best match: '{best}', similarity {score}%). The query may return no results."
+                )
 
     if not to_substitute:
         print("[peer] No substitutions required — SQL is unchanged.")

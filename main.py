@@ -159,6 +159,10 @@ def cmd_query(user_query: str) -> None:
     print(f"\n[main] Calling LLM for SQL generation...")
     llm_response = generate_sql(prompt)
     raw_sql = extract_sql_from_response(llm_response)
+    print(f"The LLM returned the following raw SQL (before PEER patching):")
+    print(f"\n{'=' * 60}")
+    print(raw_sql)
+    print(f"{'=' * 60}")
 
     # --- PEER: Pre-Execution Entity Resolution ---
     remote_conn = get_connection(NBA_POSTGRES_DSN)
