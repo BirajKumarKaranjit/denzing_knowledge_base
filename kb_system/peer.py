@@ -25,7 +25,7 @@ from openai.types.chat import (
     ChatCompletionSystemMessageParam,
     ChatCompletionUserMessageParam,
 )
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, utils as fuzz_utils
 
 import sys
 import os
@@ -141,6 +141,22 @@ def _strip_sql_wildcards(value: str) -> str:
     return cleaned.strip()
 
 
+def _build_word_prefixes(value: str) -> list[str]:
+    """Extract PEER_PROBE_PREFIX_LEN-char prefixes from every word in value.
+
+    Duplicates and empty strings are removed.
+    Example: "Joel Embiid" with prefix_len=2 → ["jo", "em"]
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for word in value.split():
+        prefix = word[:PEER_PROBE_PREFIX_LEN].lower()
+        if prefix and prefix not in seen:
+            seen.add(prefix)
+            result.append(prefix)
+    return result
+
+
 def _probe_candidates(
     conn: psycopg2.extensions.connection,
     table: str,
@@ -148,44 +164,90 @@ def _probe_candidates(
     value: str,
     db_schema: str = "",
 ) -> list[str]:
-    """Run a prefix-filtered DISTINCT probe query and return candidate values.
+    """Return DISTINCT column values that match all word-prefixes of value.
+
+    Strategy:
+    1. Split ``value`` into words, take ``PEER_PROBE_PREFIX_LEN`` chars of each.
+    2. Issue one query with ``col ILIKE 'jo%' AND col ILIKE 'em%' ...`` so only
+       rows that contain ALL prefixes are returned.  For a two-word name like
+       "Joel Embiid" this intersection is tiny and always includes the real row.
+    3. If the AND-query returns zero rows (e.g. the value really doesn't exist),
+       fall back to a single first-word prefix query so fuzzy matching can still
+       produce a scored no_match rather than an unvalidatable skip.
+    4. Apply ``LIMIT`` at the DB level to keep each query cheap.
     """
     clean_value = _strip_sql_wildcards(value)
-    prefix = clean_value.split()[0][:PEER_PROBE_PREFIX_LEN] if clean_value else ""
+    if not clean_value:
+        return []
 
+    prefixes = _build_word_prefixes(clean_value)
     qualified_table = f"{db_schema}.{table}" if db_schema else table
 
-    try:
-        with conn.cursor() as cur:
-            if prefix:
+    def _run(where_clause: str, params: tuple) -> list[str]:
+        try:
+            with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT DISTINCT {column} FROM {qualified_table} "
-                    f"WHERE {column} ILIKE %s LIMIT %s;",
-                    (f"{prefix}%", PEER_PROBE_ROW_LIMIT),
+                    f"WHERE {where_clause} LIMIT %s;",
+                    (*params, PEER_PROBE_ROW_LIMIT),
                 )
-            else:
-                cur.execute(
-                    f"SELECT DISTINCT {column} FROM {qualified_table} LIMIT %s;",
-                    (PEER_PROBE_ROW_LIMIT,),
-                )
-            rows = cur.fetchall()
-        return [str(r[0]) for r in rows if r[0] is not None]
-    except psycopg2.Error as exc:
-        _log.warning("PEER probe query failed (%s.%s): %s", qualified_table, column, exc)
-        conn.rollback()
-        return []
+                rows = cur.fetchall()
+            return [str(r[0]) for r in rows if r[0] is not None]
+        except psycopg2.Error as exc:
+            _log.warning(
+                "PEER probe query failed (%s.%s): %s", qualified_table, column, exc
+            )
+            conn.rollback()
+            return []
+
+    if not prefixes:
+        # No prefix at all — broad scan with limit only
+        return _run("TRUE", ())
+
+    # Build AND clause: col ILIKE 'jo%' AND col ILIKE 'em%' ...
+    conditions = " AND ".join(f"{column} ILIKE %s" for _ in prefixes)
+    params_and = tuple(f"{p}%" for p in prefixes)
+
+    candidates = _run(conditions, params_and)
+    _log.debug(
+        "PEER multi-prefix probe %s.%s prefixes=%s → %d candidate(s)",
+        qualified_table, column, prefixes, len(candidates),
+    )
+
+    # Fallback: AND intersection was empty — try first-word prefix only
+    if not candidates and len(prefixes) > 1:
+        fallback_cond = f"{column} ILIKE %s"
+        candidates = _run(fallback_cond, (f"{prefixes[0]}%",))
+        _log.debug(
+            "PEER fallback single-prefix probe %s.%s prefix=%s → %d candidate(s)",
+            qualified_table, column, prefixes[0], len(candidates),
+        )
+
+    return candidates
 
 
 def _fuzzy_match(value: str, candidates: list[str]) -> tuple[str, int]:
-    """Return the best-matching candidate and its token_sort_ratio score."""
+    """Return the best candidate and its score using both token scorers.
+
+    Uses ``max(token_sort_ratio, token_set_ratio)`` so that:
+    - token_sort_ratio handles word-order differences ("James LeBron" vs "LeBron James")
+    - token_set_ratio handles subset matches ("Joel Embiid" vs "Joel Embiid III")
+    Both are computed on pre-processed (lower-cased, stripped) strings.
+    """
     best_candidate = ""
     best_score = 0
+    val_proc = fuzz_utils.default_process(value)
     for candidate in candidates:
-        score = fuzz.token_sort_ratio(value.lower(), candidate.lower())
+        cand_proc = fuzz_utils.default_process(candidate)
+        score = max(
+            fuzz.token_sort_ratio(val_proc, cand_proc, processor=None),
+            fuzz.token_set_ratio(val_proc, cand_proc, processor=None),
+        )
         if score > best_score:
             best_score = score
             best_candidate = candidate
     return best_candidate, best_score
+
 
 
 def _determine_action(score: int) -> str:
@@ -363,7 +425,16 @@ def _patch_comparison(comparison: Comparison, sub: _EntityMatch) -> bool:
 
     original_raw = rhs_token.value
 
+    # Value-match guard: only patch this specific comparison if its current
+    # RHS value matches the original extracted value for this substitution.
+    # Without this guard, an OR clause with two same-column comparisons
+    # (e.g. full_name ILIKE '%Luka%' OR full_name ILIKE '%Joel%') would
+    # have both nodes rewritten to sub.corrected when only the first matched.
     inner_unescaped = _sql_unescape(original_raw).strip("%")
+    if inner_unescaped.lower() != sub.value.lower():
+        return False
+
+    # Idempotence: already the corrected value — nothing to do.
     if inner_unescaped == sub.corrected:
         return False
 

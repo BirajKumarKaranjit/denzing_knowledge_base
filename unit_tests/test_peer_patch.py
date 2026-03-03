@@ -3,6 +3,8 @@
 Unit tests for the PEER SQL token-level patching logic in kb_system/peer.py.
 
 Tests cover:
+  - Multi-word prefix probing (_build_word_prefixes)
+  - Fuzzy matching with dual scorer (token_sort + token_set ratio)
   - Basic equality and LIKE/ILIKE patching
   - Escaped single-quotes (O''Neal round-trip)
   - Function-wrapped LHS (LOWER, TRIM)
@@ -14,6 +16,7 @@ Tests cover:
   - RHS inside a CAST() token-list
   - Dollar-quoted and E-prefix strings (unsupported — must be left unchanged)
   - Table-qualifier disambiguation (same column name in two tables)
+  - OR-clause same-column multiple values (reported regression)
   - Wildcard variants (leading-only, trailing-only, both)
 
 Run with:
@@ -27,7 +30,6 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import pytest
 from kb_system.peer import (
     _EntityMatch,
     _patch_python,
@@ -36,10 +38,11 @@ from kb_system.peer import (
     _build_new_literal,
     _get_column_name,
     _get_qualifier,
+    _collect_comparisons,
+    _build_word_prefixes,
+    _fuzzy_match,
 )
 import sqlparse
-from sqlparse.sql import Identifier, Function, Parenthesis
-from sqlparse import tokens as T
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +55,81 @@ def _sub(column: str, table: str, value: str, corrected: str) -> _EntityMatch:
     e.corrected = corrected
     e.action = "auto_sub"
     return e
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _build_word_prefixes
+# ---------------------------------------------------------------------------
+
+class TestBuildWordPrefixes:
+    def test_single_word(self):
+        assert _build_word_prefixes("Joel") == ["jo"]
+
+    def test_two_words(self):
+        assert _build_word_prefixes("Joel Embiid") == ["jo", "em"]
+
+    def test_three_words(self):
+        assert _build_word_prefixes("LeBron James Jr") == ["le", "ja", "jr"]
+
+    def test_deduplication(self):
+        # "Joe" and "John" both start with "jo" — only one prefix kept
+        assert _build_word_prefixes("Joe John") == ["jo"]
+
+    def test_accented_name(self):
+        # Prefix extraction works on unicode names
+        prefixes = _build_word_prefixes("Luka Dončić")
+        assert prefixes[0] == "lu"
+        assert len(prefixes) == 2
+
+    def test_empty_string(self):
+        assert _build_word_prefixes("") == []
+
+    def test_single_char_word(self):
+        # Word shorter than PEER_PROBE_PREFIX_LEN — still yields what it can
+        prefixes = _build_word_prefixes("A Jordan")
+        assert "a" in prefixes
+        assert "jo" in prefixes
+
+    def test_output_is_lowercase(self):
+        assert _build_word_prefixes("JOEL EMBIID") == ["jo", "em"]
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _fuzzy_match (dual scorer)
+# ---------------------------------------------------------------------------
+
+class TestFuzzyMatch:
+    def test_exact_match_scores_100(self):
+        best, score = _fuzzy_match("LeBron James", ["LeBron James", "Kobe Bryant"])
+        assert best == "LeBron James"
+        assert score == 100
+
+    def test_suffix_variant_scores_high(self):
+        # token_set_ratio handles "Joel Embiid" vs "Joel Embiid III"
+        best, score = _fuzzy_match("Joel Embiid", ["Joel Embiid III", "Joe Fabel"])
+        assert best == "Joel Embiid III"
+        assert score > 80
+
+    def test_word_order_variant_scores_high(self):
+        # token_sort_ratio handles reversed word order
+        best, score = _fuzzy_match("James LeBron", ["LeBron James", "Kobe Bryant"])
+        assert best == "LeBron James"
+        assert score > 80
+
+    def test_typo_scores_lower_than_correct(self):
+        best, score = _fuzzy_match(
+            "Luka Doncic", ["Luka Dončić", "Luke Walton", "Joe Fabel"]
+        )
+        assert best == "Luka Dončić"
+
+    def test_completely_unrelated_scores_low(self):
+        _, score = _fuzzy_match("Mount Everest", ["LeBron James", "Stephen Curry"])
+        assert score < 50
+
+    def test_empty_candidates(self):
+        best, score = _fuzzy_match("Joel Embiid", [])
+        assert best == ""
+        assert score == 0
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +390,6 @@ class TestPatchPython:
         )
         sub_a = _sub("full_name", "a", "curry", "Stephen Curry")
         result = _patch_python(sql, [sub_a])
-        # a.full_name patched, b.full_name untouched
         assert "Stephen Curry" in result
         assert "%james%" in result  # b.full_name unchanged
 
@@ -321,7 +398,73 @@ class TestPatchPython:
         result = _patch_python(sql, [_sub("full_name", "dwh_d_players", "curry", "Stephen Curry")])
         assert "Stephen Curry" in result
 
-    # --- RHS inside CAST token-list ---
+    # --- OR clause: same column, two different player names ---
+
+    def test_or_clause_both_players_patched_independently(self):
+        """Each OR branch must be patched to its own corrected value, not both to the first."""
+        sql = (
+            "SELECT * FROM t WHERE "
+            "(p.full_name ILIKE '%Luka Doncic%' OR p.full_name ILIKE '%Joel Embiid%')"
+        )
+        subs = [
+            _sub("full_name", "dwh_d_players", "Luka Doncic", "Luka Dončić"),
+            _sub("full_name", "dwh_d_players", "Joel Embiid", "Joel Embiid"),
+        ]
+        result = _patch_python(sql, subs)
+        assert "Luka Dončić" in result
+        assert "Joel Embiid" in result
+        # The critical regression: second slot must NOT be overwritten by first corrected value
+        assert result.count("Luka Dončić") == 1
+
+    def test_or_clause_no_match_player_preserved_as_original(self):
+        """When one player is no_match (not in to_substitute), their original value stays in SQL."""
+        sql = (
+            "SELECT * FROM t WHERE "
+            "(p.full_name ILIKE '%Luka Doncic%' OR p.full_name ILIKE '%Joel Embiid%')"
+        )
+        # Only Luka is in to_substitute; Joel had no_match so is NOT substituted
+        subs = [
+            _sub("full_name", "dwh_d_players", "Luka Doncic", "Luka Dončić"),
+        ]
+        result = _patch_python(sql, subs)
+        assert "Luka Dončić" in result
+        # Joel's original text must be preserved exactly as the LLM wrote it
+        assert "Joel Embiid" in result
+        assert result.count("Luka Dončić") == 1
+
+    def test_or_clause_regression_luka_joel(self):
+        """Direct reproduction of the reported bug: OR clause with two full_name ILIKE filters."""
+        sql = (
+            "WITH player_rebounds AS (\n"
+            "    SELECT pb.player_id, p.full_name,\n"
+            "           SUM(pb.rebounds_offensive + pb.rebounds_defensive) AS total_rebounds\n"
+            "    FROM dwh_f_player_boxscore pb\n"
+            "    JOIN dwh_d_players p ON pb.player_id = p.player_id\n"
+            "    JOIN dwh_d_games g ON pb.game_id = g.game_id\n"
+            "    WHERE g.season_year = (SELECT MAX(season_year) FROM dwh_d_games)\n"
+            "      AND g.game_type ILIKE '%regular%'\n"
+            "      AND (p.full_name ILIKE '%Luka Doncic%' OR p.full_name ILIKE '%Joel Embiid%')\n"
+            "    GROUP BY pb.player_id, p.full_name\n"
+            ")\n"
+            "SELECT full_name, total_rebounds FROM player_rebounds"
+        )
+        # game_type corrected; Luka corrected; Joel is no_match so NOT in to_substitute
+        subs = [
+            _sub("game_type", "dwh_d_games", "regular", "Regular Season"),
+            _sub("full_name", "dwh_d_players", "Luka Doncic", "Luka Dončić"),
+        ]
+        result = _patch_python(sql, subs)
+        # game_type patched
+        assert "Regular Season" in result
+        assert "'%regular%'" not in result
+        # Luka slot patched
+        assert "Luka Dončić" in result
+        # Joel slot must remain as original — not replaced by Luka's corrected value
+        assert "Joel Embiid" in result
+        # Luka's name must appear exactly once
+        assert result.count("Luka Dončić") == 1
+
+
 
     def test_rhs_cast_expression(self):
         sql = "SELECT * FROM t WHERE name = CAST('x' AS TEXT)"

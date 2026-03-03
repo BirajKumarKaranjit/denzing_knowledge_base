@@ -249,6 +249,12 @@ SELECT player_id, game_id, points,
 FROM dwh_f_player_boxscore;
 ```
 
+## Aggregates & Grouping Rules
+Rule: When selecting columns alongside aggregate functions:
+- All non-aggregated columns must appear in GROUP BY.
+- If the column is guaranteed to be a single value (like from a one-row CTE), wrap it in an aggregate (MAX, MIN) to satisfy PostgreSQL.
+- Avoid assuming implicit behavior—Postgres enforces this strictly.
+
 ### Important Rule for Consistency Calculation
 - For queries involving consistency, stability, reliability, or variance — never rank purely on raw variance or standard deviation.
 - Always incorporate sample size as a confidence weight. Compute a weighted score that discounts entities with fewer observations relative to the dataset.
