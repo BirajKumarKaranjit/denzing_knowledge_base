@@ -134,9 +134,6 @@ def _extract_entities(sql: str) -> list[_EntityMatch]:
 
 def _strip_sql_wildcards(value: str) -> str:
     """Remove ILIKE/LIKE wildcards and surrounding quotes from a raw SQL filter value.
-
-    Handles values like ``'%LeBron James%'``, ``"%regular%"``, ``LeBron James```.
-    Returns the clean literal string for fuzzy matching and prefix probing.
     """
     cleaned = value.strip()
     cleaned = cleaned.strip("'\"")
@@ -152,10 +149,6 @@ def _probe_candidates(
     db_schema: str = "",
 ) -> list[str]:
     """Run a prefix-filtered DISTINCT probe query and return candidate values.
-
-    Strips ILIKE wildcards from ``value`` before building the prefix.
-    Qualifies the table name with ``db_schema`` when provided.
-    Returns an empty list on any database error.
     """
     clean_value = _strip_sql_wildcards(value)
     prefix = clean_value.split()[0][:PEER_PROBE_PREFIX_LEN] if clean_value else ""
@@ -208,9 +201,6 @@ def _determine_action(score: int) -> str:
 
 def _sql_unescape(raw: str) -> str:
     """Strip outer quotes and unescape doubled single-quotes from a SQL string literal.
-
-    ``'O''Neal'``  →  ``O'Neal``
-    ``'regular'``  →  ``regular``
     """
     inner = raw.strip("'\"")
     return inner.replace("''", "'")
@@ -218,23 +208,12 @@ def _sql_unescape(raw: str) -> str:
 
 def _sql_escape(value: str) -> str:
     """Escape a plain Python string for safe embedding inside a SQL single-quoted literal.
-
-    ``O'Neal``  →  ``O''Neal``
     """
     return value.replace("'", "''")
 
 
 def _get_column_name(left_token: sqlparse.sql.Token) -> str:
     """Extract the bare column name from a Comparison left-hand side token.
-
-    Handles:
-    - Plain ``Identifier``:          ``game_type``        → ``game_type``
-    - Qualified ``Identifier``:      ``p.full_name``      → ``full_name``
-    - Function-wrapped plain:        ``LOWER(game_type)`` → ``game_type``
-    - Function-wrapped qualified:    ``TRIM(p.full_name)``→ ``full_name``
-    - Bare ``Token.Name``:           ``name``             → ``name``
-
-    Returns lowercase column name, or empty string when unrecognisable.
     """
     if isinstance(left_token, Identifier):
         name = left_token.get_name()
@@ -269,12 +248,6 @@ def _get_column_name(left_token: sqlparse.sql.Token) -> str:
 
 def _get_qualifier(left_token: sqlparse.sql.Token) -> str:
     """Return the table alias or prefix from a qualified column reference.
-
-    ``p.full_name``  → ``p``
-    ``game_type``    → ``""``
-    ``LOWER(p.full_name)`` → ``p``
-
-    Used for table disambiguation when ``sub.table`` is populated.
     """
     target: sqlparse.sql.Token | None = None
 
@@ -303,14 +276,6 @@ def _find_rhs_string_token(
     comparison: Comparison,
 ) -> sqlparse.sql.Token | None:
     """Locate the first string-literal token on the right-hand side of a Comparison.
-
-    Handles both a bare ``Token.Literal.String.Single`` and a ``Function``/
-    ``Parenthesis`` that wraps a string (e.g. ``CAST('x' AS TEXT)``).
-    Returns ``None`` when no string literal is found — the caller skips the patch.
-
-    Dollar-quoted strings (``$$...$$``) and ``E'...'`` escape-prefix forms are
-    not detected as string literals by sqlparse; they surface here as non-string
-    tokens and are therefore safely skipped with a debug-level log entry.
     """
     found_op = False
     for tok in comparison.tokens:
@@ -340,17 +305,6 @@ def _find_rhs_string_token(
 
 def _build_new_literal(original_raw: str, corrected_escaped: str) -> str:
     """Reconstruct a SQL string literal preserving quote style and ``%`` wildcards.
-
-    ``corrected_escaped`` must already have single-quotes doubled
-    (use ``_sql_escape`` before calling this).
-
-    Examples::
-
-        _build_new_literal("'%Jimmy Butler%'", "Jimmy Butler III")
-            → "'%Jimmy Butler III%'"
-
-        _build_new_literal("'O''Neal'", "O''Brien")
-            → "'O''Brien'"
     """
     if not original_raw:
         return original_raw
@@ -366,10 +320,6 @@ def _build_new_literal(original_raw: str, corrected_escaped: str) -> str:
 
 def _collect_comparisons(token: sqlparse.sql.Token, out: list[Comparison]) -> None:
     """Recursively collect every Comparison node from the token tree.
-
-    Covers WHERE clauses, ON conditions, CTEs, and nested subqueries.
-    Comment tokens (``Token.Comment.*``) are leaf nodes and are never
-    ``Comparison`` instances — they are inherently skipped.
     """
     if isinstance(token, Comparison):
         out.append(token)
@@ -380,18 +330,6 @@ def _collect_comparisons(token: sqlparse.sql.Token, out: list[Comparison]) -> No
 
 def _patch_comparison(comparison: Comparison, sub: _EntityMatch) -> bool:
     """Attempt to patch a single Comparison token in-place.
-
-    Guards applied in order:
-    1. Column name must match ``sub.column`` (case-insensitive).
-    2. If ``sub.table`` is set, the qualifier (alias/table prefix) must match
-       or be absent — prevents patching the wrong table when the same column
-       name appears in multiple tables.
-    3. Operator must be ``=``, ``LIKE``, or ``ILIKE``.
-    4. RHS must contain a SQL string literal.
-    5. Unescaped inner value must differ from ``sub.corrected`` (idempotence).
-
-    On success, patches ``tok.value`` in-place and logs the change.
-    Returns ``True`` if patched, ``False`` otherwise.
     """
     left = comparison.left
 
@@ -399,15 +337,6 @@ def _patch_comparison(comparison: Comparison, sub: _EntityMatch) -> bool:
     if col_name != sub.column.lower():
         return False
 
-    # Table/alias qualifier guard.
-    # Only enforce when both qualifier and sub.table are non-empty AND
-    # the qualifier looks like a full table name (not a short alias).
-    # When the SQL uses an alias (e.g. "p") but sub.table is the full
-    # table name ("dwh_d_players"), we cannot resolve the alias without
-    # parsing the FROM clause, so we allow the patch through.
-    # We do enforce strictly when both look like aliases (length <= 4,
-    # no underscores) — this covers the common disambiguation case of
-    # "a.col" vs "b.col" where sub.table is literally "a" or "b".
     qualifier = _get_qualifier(left)
     if sub.table and qualifier:
         tbl_is_alias = len(sub.table) <= 4 and "_" not in sub.table
@@ -415,8 +344,6 @@ def _patch_comparison(comparison: Comparison, sub: _EntityMatch) -> bool:
         if tbl_is_alias and qual_is_alias and qualifier != sub.table.lower():
             return False
 
-    # Robust operator detection: check normalised value against allowed set,
-    # accepting both T.Operator.Comparison and T.Keyword (dialect variations).
     op_found = False
     for tok in comparison.tokens:
         if tok.ttype in (T.Text.Whitespace, T.Text.Whitespace.Newline, T.Newline):
@@ -436,7 +363,6 @@ def _patch_comparison(comparison: Comparison, sub: _EntityMatch) -> bool:
 
     original_raw = rhs_token.value
 
-    # Unescape the inner literal for an accurate idempotence comparison.
     inner_unescaped = _sql_unescape(original_raw).strip("%")
     if inner_unescaped == sub.corrected:
         return False
@@ -454,20 +380,6 @@ def _patch_comparison(comparison: Comparison, sub: _EntityMatch) -> bool:
 
 def _patch_python(sql: str, substitutions: List[_EntityMatch]) -> str:
     """Patch SQL using sqlparse token-level replacement (no regex).
-
-    Properties:
-    - **Comment-safe**: comment tokens are never Comparison nodes.
-    - **Idempotent**: unescaped inner value is compared to ``sub.corrected``
-      so a second run on already-patched SQL is a no-op.
-    - **Escaped-quote-safe**: doubled single-quotes (``O''Neal``) are
-      correctly unescaped for comparison and re-escaped on write.
-    - **Wildcard-preserving**: leading/trailing ``%`` and quote style kept.
-    - **Function-wrapped LHS**: ``LOWER(col)``, ``TRIM(p.col)`` supported.
-    - **Robust operator detection**: value-based check, not ttype-only.
-    - **Robust RHS detection**: searches inside TokenList/Function via flatten.
-    - **Table-qualifier guard**: avoids patching the wrong table when the
-      same column name appears in multiple tables.
-    - **Nested-query-aware**: recursive walk covers CTEs and subqueries.
     """
     if not substitutions:
         return sql
