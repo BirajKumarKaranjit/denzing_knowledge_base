@@ -36,7 +36,7 @@ from utils.config import POSTGRES_DSN, EMBEDDING_DIMENSION, RRF_K, MANDATORY_FIL
 from kb_system.kb_parser import ParsedKBFile
 
 
-def get_connection() -> PgConnection:
+def get_connection(database_creds) -> PgConnection:
     """
     Open and return a new Postgres connection using the DSN from config.
 
@@ -55,7 +55,7 @@ def get_connection() -> PgConnection:
     psycopg2.OperationalError
         If the database is unreachable or credentials are wrong.
     """
-    return psycopg2.connect(POSTGRES_DSN)
+    return psycopg2.connect(database_creds)
 
 
 def init_schema(conn: PgConnection) -> None:

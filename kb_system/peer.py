@@ -37,6 +37,7 @@ from utils.config import (
     PEER_PATCH_METHOD,
     PEER_PROBE_PREFIX_LEN,
     PEER_PROBE_ROW_LIMIT,
+    nba_db_config,
 )
 from utils.prompts.kb_generation_prompts import (
     PEER_ENTITY_EXTRACTION_SYSTEM_PROMPT,
@@ -124,36 +125,53 @@ def _extract_entities(sql: str) -> list[_EntityMatch]:
         return []
 
 
+def _strip_sql_wildcards(value: str) -> str:
+    """Remove ILIKE/LIKE wildcards and surrounding quotes from a raw SQL filter value.
+
+    Handles values like ``'%LeBron James%'``, ``"%regular%"``, ``LeBron James``.
+    Returns the clean literal string for fuzzy matching and prefix probing.
+    """
+    cleaned = value.strip()
+    cleaned = cleaned.strip("'\"")
+    cleaned = cleaned.strip("%")
+    return cleaned.strip()
+
+
 def _probe_candidates(
     conn: psycopg2.extensions.connection,
     table: str,
     column: str,
     value: str,
+    db_schema: str = "",
 ) -> list[str]:
     """Run a prefix-filtered DISTINCT probe query and return candidate values.
 
-    Uses ILIKE 'prefix%' on the first PEER_PROBE_PREFIX_LEN characters of
-    the first word in value. Falls back to an unfiltered query if prefix is empty.
+    Strips ILIKE wildcards from ``value`` before building the prefix.
+    Qualifies the table name with ``db_schema`` when provided.
     Returns an empty list on any database error.
     """
-    prefix = value.split()[0][:PEER_PROBE_PREFIX_LEN] if value else ""
+    clean_value = _strip_sql_wildcards(value)
+    prefix = clean_value.split()[0][:PEER_PROBE_PREFIX_LEN] if clean_value else ""
+
+    qualified_table = f"{db_schema}.{table}" if db_schema else table
+
     try:
         with conn.cursor() as cur:
             if prefix:
                 cur.execute(
-                    f"SELECT DISTINCT {column} FROM {table} "
+                    f"SELECT DISTINCT {column} FROM {qualified_table} "
                     f"WHERE {column} ILIKE %s LIMIT %s;",
                     (f"{prefix}%", PEER_PROBE_ROW_LIMIT),
                 )
             else:
                 cur.execute(
-                    f"SELECT DISTINCT {column} FROM {table} LIMIT %s;",
+                    f"SELECT DISTINCT {column} FROM {qualified_table} LIMIT %s;",
                     (PEER_PROBE_ROW_LIMIT,),
                 )
             rows = cur.fetchall()
         return [str(r[0]) for r in rows if r[0] is not None]
     except psycopg2.Error as exc:
-        _log.warning("PEER probe query failed (%s.%s): %s", table, column, exc)
+        _log.warning("PEER probe query failed (%s.%s): %s", qualified_table, column, exc)
         conn.rollback()
         return []
 
@@ -182,11 +200,18 @@ def _determine_action(score: int) -> str:
 
 
 def _patch_python(sql: str, substitutions: list[_EntityMatch]) -> str:
-    """Patch SQL using regex substitution (Python method)."""
+    """Patch SQL using regex substitution (Python method).
+
+    Handles both bare values (``= 'LeBron James'``) and ILIKE wildcard
+    patterns (``ILIKE '%LeBron James%'``) by treating surrounding quotes
+    and percent signs as optional captured groups that are preserved.
+    """
     patched = sql
     for sub in substitutions:
         original_escaped = re.escape(sub.value)
-        pattern = rf"(%?['\"]?){original_escaped}(['\"]?%?)"
+        # Quote may precede or follow the percent wildcard, so capture both
+        # orderings: plain quote, quote+percent, or percent alone.
+        pattern = rf"(['\"]?%?){original_escaped}(%?['\"]?)"
         replacement = rf"\g<1>{sub.corrected}\g<2>"
         patched = re.sub(pattern, replacement, patched, flags=re.IGNORECASE)
     return patched
@@ -263,51 +288,53 @@ def _run_peer_internal(
         print("[peer] No named-entity filters found — passing SQL through unchanged.")
         return PEERResult(sql=sql)
 
+    # Clean the raw extracted values (strip ILIKE wildcards / quotes) so that
+    # probe prefix and fuzzy matching work on the actual literal text.
+    for e in entities:
+        e.value = _strip_sql_wildcards(e.value)
+
     print(f"[peer] Extracted {len(entities)} entity filter(s):")
     for e in entities:
         print(f"       • {e.table}.{e.column} = '{e.value}'")
+
+    db_schema: str = nba_db_config.get("schema", "")
 
     messages: list[str] = []
     unvalidatable: list[str] = []
     to_substitute: list[_EntityMatch] = []
 
     for entity in entities:
-        candidates = _probe_candidates(conn, entity.table, entity.column, entity.value)
+        candidates = _probe_candidates(conn, entity.table, entity.column, entity.value, db_schema)
         if not candidates:
-            _log.debug(
-                "PEER: probe returned no candidates for '%s' in %s.%s",
-                entity.value, entity.table, entity.column,
-            )
             unvalidatable.append(f"{entity.table}.{entity.column}='{entity.value}' (no candidates)")
             continue
 
-        best, score = _fuzzy_match(entity.value, candidates)
-        action = _determine_action(score)
-        entity.corrected = best
-        entity.score = score
-        entity.action = action
+        if len(candidates) == 1:
+            # Only one candidate, no fuzzy matching needed
+            entity.corrected = candidates[0]
+            entity.score = 100
+            entity.action = "exact"
+            print(f"[peer]   '{entity.value}' → '{candidates[0]}' (only candidate, auto-exact)")
+        else:
+            best, score = _fuzzy_match(entity.value, candidates)
+            action = _determine_action(score)
+            entity.corrected = best
+            entity.score = score
+            entity.action = action
+            print(f"[peer]   '{entity.value}' → '{best}' (score={score}, action={action})")
 
-        print(f"[peer]   '{entity.value}' → '{best}' (score={score}, action={action})")
+            if action in ("auto_sub", "flag_sub"):
+                to_substitute.append(entity)
+                messages.append(
+                    f"'{entity.value}' interpreted as '{best}' (similarity {score}%)."
+                    if action == "auto_sub" else
+                    f"Assumed '{entity.value}' refers to '{best}' (similarity {score}%). Please verify."
+                )
 
-        if action == "exact":
-            pass
-        elif action == "auto_sub":
-            to_substitute.append(entity)
-            messages.append(
-                f"Note: '{entity.value}' was interpreted as '{best}' "
-                f"(auto-corrected, similarity {score}%)."
-            )
-        elif action == "flag_sub":
-            to_substitute.append(entity)
-            messages.append(
-                f"Assumed '{entity.value}' refers to '{best}' "
-                f"(similarity {score}%). Please verify the result."
-            )
-        elif action == "no_match":
+        if entity.action == "no_match":
             messages.append(
                 f"Could not find '{entity.value}' in {entity.table}.{entity.column} "
-                f"(best match: '{best}', similarity {score}%). "
-                "The query may return no results."
+                f"(best match: '{entity.corrected}', similarity {entity.score}%)."
             )
 
     if not to_substitute:

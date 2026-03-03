@@ -557,8 +557,13 @@ def retrieve_context_for_query(
     print(f"\n[kb_retriever] Step 5: Cross-encoder re-ranking {len(unique_candidates)} candidate(s)...")
     reranked_tables = _apply_cross_encoder_reranking(user_query, unique_candidates, conn)
 
-    # After re-ranking, respect top_k
-    final_tables = reranked_tables[:top_k + _FK_EXPANSION_TOP_N]
+    # After re-ranking, respect top_k for semantic results only.
+    # FK-expanded tables are always preserved regardless of the top_k cap
+    # because they are required for JOIN-correct SQL and may not have ranked
+    # highly on semantic similarity alone.
+    semantic_tables = [t for t in reranked_tables if not t.get("_fk_expanded")]
+    fk_tables = [t for t in reranked_tables if t.get("_fk_expanded")]
+    final_tables = semantic_tables[:top_k] + fk_tables
 
     print("\n[kb_retriever] Step 6: SQL guideline sub-file retrieval...")
     matched_sql_guidelines = retrieve_with_rrf(

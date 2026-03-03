@@ -20,7 +20,7 @@ Pipeline order:
 
 from __future__ import annotations
 
-from utils.config import overwrite
+from utils.config import overwrite, NBA_POSTGRES_DSN, POSTGRES_DSN
 from utils.sample_values_for_testing import Sample_NBA_DDL_DICT
 import sys
 
@@ -144,7 +144,7 @@ def cmd_query(user_query: str) -> None:
                 print(f"    {i}. {q}")
         return
 
-    conn = get_connection()
+    conn = get_connection(POSTGRES_DSN)
     retrieval_result = retrieve_context_for_query(conn, user_query)
 
     prompt, citation_md = build_sql_prompt(
@@ -161,7 +161,8 @@ def cmd_query(user_query: str) -> None:
     raw_sql = extract_sql_from_response(llm_response)
 
     # --- PEER: Pre-Execution Entity Resolution ---
-    peer_result = run_peer(raw_sql, conn)
+    remote_conn = get_connection(NBA_POSTGRES_DSN)
+    peer_result = run_peer(raw_sql, remote_conn)
 
     # Surface PEER messages to the user before presenting the SQL
     if peer_result.messages:
