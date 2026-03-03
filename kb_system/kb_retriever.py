@@ -48,7 +48,7 @@ _CROSS_ENCODER_CANDIDATE_K: int = 10
 _ELBOW_DROP_THRESHOLD: float = 0.50
 
 # Top-N tables for FK expansion after re-ranking.
-_FK_EXPANSION_TOP_N: int = 3
+_FK_EXPANSION_TOP_N: int = 2
 
 _SECTION_DESCRIPTIONS: dict[str, str] = {
     "ddl": (
