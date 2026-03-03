@@ -117,6 +117,30 @@ Apply this join whenever the dimension table is available in the allowed tables,
 the query explicitly requests identifiers only, or
 the dimension table is not available in the allowed schema.
 
+## Player vs Specific Opponent — Correct Opponent Join Logic
+When calculating a player's performance against a specific team, NEVER join games to teams using:
+g.home_team_id = t.team_id OR g.visitor_team_id = t.team_id
+This duplicates rows and does not distinguish between:
+Player's team, Opponent team
+
+- Correct Pattern
+
+Always determine the opponent using pb.team_id:
+JOIN dwh_d_teams opp
+  ON (
+      (pb.team_id = g.home_team_id AND opp.team_id = g.visitor_team_id)
+      OR
+      (pb.team_id = g.visitor_team_id AND opp.team_id = g.home_team_id)
+  )
+
+- Then filter:
+
+AND opp.full_name ILIKE 'Miami Heat'
+# Why:
+- Prevents double-counting
+- Correctly isolates opponent
+- Avoids inflated averages and shooting %
+
 ## Gotchas and Anti-Patterns
 
 - **Incorrect join conditions** lead to Cartesian products or missing rows — verify FK relationships.

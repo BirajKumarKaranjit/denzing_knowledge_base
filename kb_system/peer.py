@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass, field
+from typing import List
+import re
 
 import openai
 import psycopg2
 import psycopg2.extras
+import sqlparse
+from sqlparse.sql import Comparison, Identifier, Function, Parenthesis
+from sqlparse import tokens as T
 from openai.types.chat import (
     ChatCompletionSystemMessageParam,
     ChatCompletionUserMessageParam,
@@ -48,6 +52,9 @@ from utils.prompts.kb_generation_prompts import (
 
 _log = logging.getLogger(__name__)
 _client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+# Valid SQL comparison operators that can precede a string literal entity filter.
+_COMPARISON_OPERATORS = {"=", "like", "ilike"}
 
 
 @dataclass
@@ -128,7 +135,7 @@ def _extract_entities(sql: str) -> list[_EntityMatch]:
 def _strip_sql_wildcards(value: str) -> str:
     """Remove ILIKE/LIKE wildcards and surrounding quotes from a raw SQL filter value.
 
-    Handles values like ``'%LeBron James%'``, ``"%regular%"``, ``LeBron James``.
+    Handles values like ``'%LeBron James%'``, ``"%regular%"``, ``LeBron James```.
     Returns the clean literal string for fuzzy matching and prefix probing.
     """
     cleaned = value.strip()
@@ -199,22 +206,286 @@ def _determine_action(score: int) -> str:
     return "no_match"
 
 
-def _patch_python(sql: str, substitutions: list[_EntityMatch]) -> str:
-    """Patch SQL using regex substitution (Python method).
+def _sql_unescape(raw: str) -> str:
+    """Strip outer quotes and unescape doubled single-quotes from a SQL string literal.
 
-    Handles both bare values (``= 'LeBron James'``) and ILIKE wildcard
-    patterns (``ILIKE '%LeBron James%'``) by treating surrounding quotes
-    and percent signs as optional captured groups that are preserved.
+    ``'O''Neal'``  →  ``O'Neal``
+    ``'regular'``  →  ``regular``
     """
-    patched = sql
-    for sub in substitutions:
-        original_escaped = re.escape(sub.value)
-        # Quote may precede or follow the percent wildcard, so capture both
-        # orderings: plain quote, quote+percent, or percent alone.
-        pattern = rf"(['\"]?%?){original_escaped}(%?['\"]?)"
-        replacement = rf"\g<1>{sub.corrected}\g<2>"
-        patched = re.sub(pattern, replacement, patched, flags=re.IGNORECASE)
-    return patched
+    inner = raw.strip("'\"")
+    return inner.replace("''", "'")
+
+
+def _sql_escape(value: str) -> str:
+    """Escape a plain Python string for safe embedding inside a SQL single-quoted literal.
+
+    ``O'Neal``  →  ``O''Neal``
+    """
+    return value.replace("'", "''")
+
+
+def _get_column_name(left_token: sqlparse.sql.Token) -> str:
+    """Extract the bare column name from a Comparison left-hand side token.
+
+    Handles:
+    - Plain ``Identifier``:          ``game_type``        → ``game_type``
+    - Qualified ``Identifier``:      ``p.full_name``      → ``full_name``
+    - Function-wrapped plain:        ``LOWER(game_type)`` → ``game_type``
+    - Function-wrapped qualified:    ``TRIM(p.full_name)``→ ``full_name``
+    - Bare ``Token.Name``:           ``name``             → ``name``
+
+    Returns lowercase column name, or empty string when unrecognisable.
+    """
+    if isinstance(left_token, Identifier):
+        name = left_token.get_name()
+        return name.lower() if name else ""
+
+    if left_token.ttype == T.Name:
+        return left_token.normalized.lower()
+
+    if isinstance(left_token, Function):
+        # The argument list is a Parenthesis token; the real column lives inside it.
+        for tok in left_token.tokens:
+            if isinstance(tok, Parenthesis):
+                for inner in tok.tokens:
+                    if isinstance(inner, Identifier):
+                        name = inner.get_name()
+                        return name.lower() if name else ""
+                    if inner.ttype == T.Name:
+                        return inner.normalized.lower()
+
+    # Generic fallback: walk all sub-tokens and return the last Name found.
+    if getattr(left_token, "tokens", None):
+        for tok in reversed(left_token.tokens):
+            if isinstance(tok, Identifier):
+                name = tok.get_name()
+                if name:
+                    return name.lower()
+            if tok.ttype == T.Name:
+                return tok.normalized.lower()
+
+    return ""
+
+
+def _get_qualifier(left_token: sqlparse.sql.Token) -> str:
+    """Return the table alias or prefix from a qualified column reference.
+
+    ``p.full_name``  → ``p``
+    ``game_type``    → ``""``
+    ``LOWER(p.full_name)`` → ``p``
+
+    Used for table disambiguation when ``sub.table`` is populated.
+    """
+    target: sqlparse.sql.Token | None = None
+
+    if isinstance(left_token, Identifier):
+        target = left_token
+    elif isinstance(left_token, Function):
+        for tok in left_token.tokens:
+            if isinstance(tok, Parenthesis):
+                for inner in tok.tokens:
+                    if isinstance(inner, Identifier):
+                        target = inner
+                        break
+
+    if target is None:
+        return ""
+
+    try:
+        parent = target.get_parent_name()
+        return parent.lower() if parent else ""
+    except AttributeError:
+        parts = target.value.split(".")
+        return parts[0].strip().lower() if len(parts) > 1 else ""
+
+
+def _find_rhs_string_token(
+    comparison: Comparison,
+) -> sqlparse.sql.Token | None:
+    """Locate the first string-literal token on the right-hand side of a Comparison.
+
+    Handles both a bare ``Token.Literal.String.Single`` and a ``Function``/
+    ``Parenthesis`` that wraps a string (e.g. ``CAST('x' AS TEXT)``).
+    Returns ``None`` when no string literal is found — the caller skips the patch.
+
+    Dollar-quoted strings (``$$...$$``) and ``E'...'`` escape-prefix forms are
+    not detected as string literals by sqlparse; they surface here as non-string
+    tokens and are therefore safely skipped with a debug-level log entry.
+    """
+    found_op = False
+    for tok in comparison.tokens:
+        if tok.ttype in (T.Text.Whitespace, T.Text.Whitespace.Newline, T.Newline):
+            continue
+        if not found_op:
+            if tok.value.strip().lower() in _COMPARISON_OPERATORS:
+                found_op = True
+            continue
+        # Direct string literal (the common case).
+        if tok.ttype == T.Literal.String.Single:
+            return tok
+        # TokenList on RHS (e.g. CAST expression): search via flatten().
+        if getattr(tok, "tokens", None):
+            for flat in tok.flatten():
+                if flat.ttype == T.Literal.String.Single:
+                    return flat
+        # Non-string token after operator (function result, column, etc.) — skip.
+        if tok.ttype is not None:
+            _log.debug(
+                "PEER: RHS of comparison is not a string literal (ttype=%s, val=%r) — skipping.",
+                tok.ttype, tok.value[:40],
+            )
+            return None
+    return None
+
+
+def _build_new_literal(original_raw: str, corrected_escaped: str) -> str:
+    """Reconstruct a SQL string literal preserving quote style and ``%`` wildcards.
+
+    ``corrected_escaped`` must already have single-quotes doubled
+    (use ``_sql_escape`` before calling this).
+
+    Examples::
+
+        _build_new_literal("'%Jimmy Butler%'", "Jimmy Butler III")
+            → "'%Jimmy Butler III%'"
+
+        _build_new_literal("'O''Neal'", "O''Brien")
+            → "'O''Brien'"
+    """
+    if not original_raw:
+        return original_raw
+
+    quote = original_raw[0] if original_raw[0] in ("'", '"') else "'"
+    inner = original_raw.strip("'\"")
+
+    lead_pct = "%" if inner.startswith("%") else ""
+    trail_pct = "%" if inner.endswith("%") else ""
+
+    return f"{quote}{lead_pct}{corrected_escaped}{trail_pct}{quote}"
+
+
+def _collect_comparisons(token: sqlparse.sql.Token, out: list[Comparison]) -> None:
+    """Recursively collect every Comparison node from the token tree.
+
+    Covers WHERE clauses, ON conditions, CTEs, and nested subqueries.
+    Comment tokens (``Token.Comment.*``) are leaf nodes and are never
+    ``Comparison`` instances — they are inherently skipped.
+    """
+    if isinstance(token, Comparison):
+        out.append(token)
+    if token.is_group:
+        for sub in token.tokens:
+            _collect_comparisons(sub, out)
+
+
+def _patch_comparison(comparison: Comparison, sub: _EntityMatch) -> bool:
+    """Attempt to patch a single Comparison token in-place.
+
+    Guards applied in order:
+    1. Column name must match ``sub.column`` (case-insensitive).
+    2. If ``sub.table`` is set, the qualifier (alias/table prefix) must match
+       or be absent — prevents patching the wrong table when the same column
+       name appears in multiple tables.
+    3. Operator must be ``=``, ``LIKE``, or ``ILIKE``.
+    4. RHS must contain a SQL string literal.
+    5. Unescaped inner value must differ from ``sub.corrected`` (idempotence).
+
+    On success, patches ``tok.value`` in-place and logs the change.
+    Returns ``True`` if patched, ``False`` otherwise.
+    """
+    left = comparison.left
+
+    col_name = _get_column_name(left)
+    if col_name != sub.column.lower():
+        return False
+
+    # Table/alias qualifier guard.
+    # Only enforce when both qualifier and sub.table are non-empty AND
+    # the qualifier looks like a full table name (not a short alias).
+    # When the SQL uses an alias (e.g. "p") but sub.table is the full
+    # table name ("dwh_d_players"), we cannot resolve the alias without
+    # parsing the FROM clause, so we allow the patch through.
+    # We do enforce strictly when both look like aliases (length <= 4,
+    # no underscores) — this covers the common disambiguation case of
+    # "a.col" vs "b.col" where sub.table is literally "a" or "b".
+    qualifier = _get_qualifier(left)
+    if sub.table and qualifier:
+        tbl_is_alias = len(sub.table) <= 4 and "_" not in sub.table
+        qual_is_alias = len(qualifier) <= 4 and "_" not in qualifier
+        if tbl_is_alias and qual_is_alias and qualifier != sub.table.lower():
+            return False
+
+    # Robust operator detection: check normalised value against allowed set,
+    # accepting both T.Operator.Comparison and T.Keyword (dialect variations).
+    op_found = False
+    for tok in comparison.tokens:
+        if tok.ttype in (T.Text.Whitespace, T.Text.Whitespace.Newline, T.Newline):
+            continue
+        if tok is left:
+            continue
+        if tok.value.strip().lower() in _COMPARISON_OPERATORS:
+            op_found = True
+            break
+
+    if not op_found:
+        return False
+
+    rhs_token = _find_rhs_string_token(comparison)
+    if rhs_token is None:
+        return False
+
+    original_raw = rhs_token.value
+
+    # Unescape the inner literal for an accurate idempotence comparison.
+    inner_unescaped = _sql_unescape(original_raw).strip("%")
+    if inner_unescaped == sub.corrected:
+        return False
+
+    corrected_escaped = _sql_escape(sub.corrected)
+    new_literal = _build_new_literal(original_raw, corrected_escaped)
+    rhs_token.value = new_literal
+
+    _log.info(
+        "PEER patched %s.%s: %r -> %r",
+        sub.table, sub.column, original_raw, new_literal,
+    )
+    return True
+
+
+def _patch_python(sql: str, substitutions: List[_EntityMatch]) -> str:
+    """Patch SQL using sqlparse token-level replacement (no regex).
+
+    Properties:
+    - **Comment-safe**: comment tokens are never Comparison nodes.
+    - **Idempotent**: unescaped inner value is compared to ``sub.corrected``
+      so a second run on already-patched SQL is a no-op.
+    - **Escaped-quote-safe**: doubled single-quotes (``O''Neal``) are
+      correctly unescaped for comparison and re-escaped on write.
+    - **Wildcard-preserving**: leading/trailing ``%`` and quote style kept.
+    - **Function-wrapped LHS**: ``LOWER(col)``, ``TRIM(p.col)`` supported.
+    - **Robust operator detection**: value-based check, not ttype-only.
+    - **Robust RHS detection**: searches inside TokenList/Function via flatten.
+    - **Table-qualifier guard**: avoids patching the wrong table when the
+      same column name appears in multiple tables.
+    - **Nested-query-aware**: recursive walk covers CTEs and subqueries.
+    """
+    if not substitutions:
+        return sql
+
+    statements = sqlparse.parse(sql)
+    if not statements:
+        return sql
+
+    for statement in statements:
+        comparisons: list[Comparison] = []
+        _collect_comparisons(statement, comparisons)
+        for sub in substitutions:
+            for comp in comparisons:
+                _patch_comparison(comp, sub)
+
+    return "".join(str(s) for s in statements)
+
+
 
 
 def _patch_llm(sql: str, substitutions: list[_EntityMatch]) -> str:
@@ -288,8 +559,6 @@ def _run_peer_internal(
         print("[peer] No named-entity filters found — passing SQL through unchanged.")
         return PEERResult(sql=sql)
 
-    # Clean the raw extracted values (strip ILIKE wildcards / quotes) so that
-    # probe prefix and fuzzy matching work on the actual literal text.
     for e in entities:
         e.value = _strip_sql_wildcards(e.value)
 
@@ -310,19 +579,24 @@ def _run_peer_internal(
                 "PEER: probe returned no candidates for '%s' in %s.%s",
                 entity.value, entity.table, entity.column,
             )
-            unvalidatable.append(f"{entity.table}.{entity.column}='{entity.value}' (no candidates)")
+            unvalidatable.append(
+                f"{entity.table}.{entity.column}='{entity.value}' (no candidates)"
+            )
             continue
 
         if len(candidates) == 1:
             entity.corrected = candidates[0]
             entity.score = 100
             entity.action = "exact"
-            if entity.corrected != entity.value:
+            if entity.corrected.lower() != entity.value.lower():
                 to_substitute.append(entity)
                 messages.append(
-                    f"Single candidate '{entity.value}' replaced with '{entity.corrected}'."
+                    f"Single candidate: '{entity.value}' replaced with '{entity.corrected}'."
                 )
-            print(f"[peer]   '{entity.value}' → '{entity.corrected}' (single candidate, action={entity.action})")
+            print(
+                f"[peer]   '{entity.value}' → '{entity.corrected}' "
+                f"(single candidate, action={entity.action})"
+            )
         else:
             best, score = _fuzzy_match(entity.value, candidates)
             action = _determine_action(score)
@@ -335,17 +609,20 @@ def _run_peer_internal(
             if action == "auto_sub":
                 to_substitute.append(entity)
                 messages.append(
-                    f"Note: '{entity.value}' was interpreted as '{best}' (auto-corrected, similarity {score}%)."
+                    f"Note: '{entity.value}' was interpreted as '{best}' "
+                    f"(auto-corrected, similarity {score}%)."
                 )
             elif action == "flag_sub":
                 to_substitute.append(entity)
                 messages.append(
-                    f"Assumed '{entity.value}' refers to '{best}' (similarity {score}%). Please verify the result."
+                    f"Assumed '{entity.value}' refers to '{best}' "
+                    f"(similarity {score}%). Please verify the result."
                 )
             elif action == "no_match":
                 messages.append(
                     f"Could not find '{entity.value}' in {entity.table}.{entity.column} "
-                    f"(best match: '{best}', similarity {score}%). The query may return no results."
+                    f"(best match: '{best}', similarity {score}%). "
+                    "The query may return no results."
                 )
 
     if not to_substitute:
@@ -353,7 +630,11 @@ def _run_peer_internal(
         return PEERResult(sql=sql, messages=messages, unvalidatable=unvalidatable)
 
     print(f"[peer] Patching SQL using method='{PEER_PATCH_METHOD}'...")
-    patched_sql = _patch_llm(sql, to_substitute) if PEER_PATCH_METHOD == "llm" else _patch_python(sql, to_substitute)
+    patched_sql = (
+        _patch_llm(sql, to_substitute)
+        if PEER_PATCH_METHOD == "llm"
+        else _patch_python(sql, to_substitute)
+    )
     print("[peer] SQL patched successfully.")
 
     return PEERResult(

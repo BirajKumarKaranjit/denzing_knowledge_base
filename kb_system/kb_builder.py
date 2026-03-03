@@ -17,7 +17,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.config import KB_ROOT, EMBEDDING_DIMENSION
+from utils.config import KB_ROOT, EMBEDDING_DIMENSION, POSTGRES_DSN
 from kb_system.kb_parser import scan_kb_directory
 from kb_system.kb_embeddings import get_embeddings_batch
 from kb_system.kb_store import get_connection, init_schema, upsert_kb_file, list_all_files
@@ -88,7 +88,7 @@ def build_kb(verbose: bool = True) -> dict[str, int]:
     print("=" * 60)
 
     print("\n[kb_builder] Connecting to Postgres...")
-    conn = get_connection()
+    conn = get_connection(POSTGRES_DSN)
     print("[kb_builder] Connected")
 
     print("[kb_builder] Initializing schema...")
@@ -230,7 +230,7 @@ def build_kb(verbose: bool = True) -> dict[str, int]:
 def status_kb() -> None:
     """Print a human-readable status report of what is currently stored in the DB."""
     print("\n[kb_builder] Fetching KB status from database...")
-    conn = get_connection()
+    conn = get_connection(POSTGRES_DSN)
     files = list_all_files(conn)
     conn.close()
 
