@@ -41,6 +41,8 @@ from utils.config import (
     PEER_PATCH_METHOD,
     PEER_PROBE_PREFIX_LEN,
     PEER_PROBE_ROW_LIMIT,
+    PEER_TRGM_SIMILARITY_THRESHOLD,
+    PEER_USE_TRIGRAM,
     nba_db_config,
 )
 from utils.prompts.kb_generation_prompts import (
@@ -144,14 +146,7 @@ def _strip_sql_wildcards(value: str) -> str:
 def _build_word_prefixes(value: str) -> list[str]:
     """Extract PEER_PROBE_PREFIX_LEN-char prefixes from every word in value.
 
-    Duplicates and empty strings are removed. Output is lowercased.
-    The first prefix is used as a start-anchored pattern (``prefix%``).
-    Subsequent prefixes are used as contains patterns (``%prefix%``) because
-    non-first words never start the full column value.
-
-    Example: "Joel Embiid" with prefix_len=2
-        → ["jo", "em"]
-        → query: col ILIKE 'jo%' AND col ILIKE '%em%'
+    Used only by the ILIKE fallback path when pg_trgm is unavailable.
     """
     seen: set[str] = set()
     result: list[str] = []
@@ -163,29 +158,128 @@ def _build_word_prefixes(value: str) -> list[str]:
     return result
 
 
-def _probe_candidates(
+# ---------------------------------------------------------------------------
+# pg_trgm capability detection
+# ---------------------------------------------------------------------------
+
+# Per-connection cache: maps connection id → bool (True = pg_trgm usable).
+_trgm_cache: dict[int, bool] = {}
+
+
+def _trgm_available(conn: psycopg2.extensions.connection) -> bool:
+    """Return True if pg_trgm similarity() is callable on this connection.
+
+    Result is cached per connection object so the probe SELECT runs at most
+    once per PEER call chain, not once per entity.
+    """
+    if not PEER_USE_TRIGRAM:
+        return False
+    conn_id = id(conn)
+    if conn_id in _trgm_cache:
+        return _trgm_cache[conn_id]
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT similarity('a', 'a');")
+            cur.fetchone()
+        _trgm_cache[conn_id] = True
+        _log.debug("PEER: pg_trgm is available on this connection.")
+    except psycopg2.Error:
+        conn.rollback()
+        _trgm_cache[conn_id] = False
+        _log.debug("PEER: pg_trgm not available — will use ILIKE fallback.")
+    return _trgm_cache[conn_id]
+
+
+# ---------------------------------------------------------------------------
+# Probe strategies
+# ---------------------------------------------------------------------------
+
+def _probe_trigram(
     conn: psycopg2.extensions.connection,
-    table: str,
+    qualified_table: str,
     column: str,
     value: str,
-    db_schema: str = "",
 ) -> list[str]:
-    """Return DISTINCT column values that match all word-prefixes of value.
+    """Resolve candidates using the three-step trigram pipeline.
 
-    Strategy:
-    - First word  → ``col ILIKE 'jo%'``   (anchored to start — uses any prefix index)
-    - Later words → ``col ILIKE '%em%'``   (contains — needed because the word never
-                                            starts the full column value)
-    - All conditions combined with AND so the intersection is tiny.
-    - Falls back to first-word prefix only when the AND query returns nothing,
-      ensuring fuzzy matching can still produce a scored no_match.
+    Step A — exact match  (cheapest, returns immediately if found)
+    Step B — prefix match (ILIKE 'value%', catches clean prefix hits)
+    Step C — trigram similarity (pg_trgm % operator + similarity() scoring)
+
+    Each step returns immediately when it finds results, so the expensive
+    trigram scan is only reached when exact and prefix both miss.
     """
-    clean_value = _strip_sql_wildcards(value)
-    if not clean_value:
+    # Step A: exact match
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {column} FROM {qualified_table} WHERE {column} = %s LIMIT 1;",
+                (value,),
+            )
+            row = cur.fetchone()
+        if row:
+            _log.debug("PEER trigram Step A (exact) hit for %r in %s.%s", value, qualified_table, column)
+            return [str(row[0])]
+    except psycopg2.Error as exc:
+        _log.warning("PEER trigram Step A failed (%s.%s): %s", qualified_table, column, exc)
+        conn.rollback()
+
+    # Step B: prefix match — the user may have typed just the start of the value
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT DISTINCT {column} FROM {qualified_table} "
+                f"WHERE {column} ILIKE %s LIMIT 5;",
+                (f"{value}%",),
+            )
+            rows = cur.fetchall()
+        if rows:
+            _log.debug("PEER trigram Step B (prefix) hit for %r in %s.%s", value, qualified_table, column)
+            return [str(r[0]) for r in rows if r[0] is not None]
+    except psycopg2.Error as exc:
+        _log.warning("PEER trigram Step B failed (%s.%s): %s", qualified_table, column, exc)
+        conn.rollback()
+
+    # Step C: trigram similarity — handles partial words, abbreviations, typos
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET pg_trgm.similarity_threshold = {PEER_TRGM_SIMILARITY_THRESHOLD};")
+            cur.execute(
+                f"SELECT DISTINCT {column}, similarity({column}, %s) AS score "
+                f"FROM {qualified_table} "
+                f"WHERE {column} %% %s "
+                f"ORDER BY score DESC "
+                f"LIMIT %s;",
+                (value, value, PEER_PROBE_ROW_LIMIT),
+            )
+            rows = cur.fetchall()
+        if rows:
+            _log.debug(
+                "PEER trigram Step C hit for %r in %s.%s: %d candidate(s)",
+                value, qualified_table, column, len(rows),
+            )
+        return [str(r[0]) for r in rows if r[0] is not None]
+    except psycopg2.Error as exc:
+        _log.warning("PEER trigram Step C failed (%s.%s): %s", qualified_table, column, exc)
+        conn.rollback()
         return []
 
-    prefixes = _build_word_prefixes(clean_value)
-    qualified_table = f"{db_schema}.{table}" if db_schema else table
+
+def _probe_ilike_fallback(
+    conn: psycopg2.extensions.connection,
+    qualified_table: str,
+    column: str,
+    value: str,
+) -> list[str]:
+    """Resolve candidates using the multi-prefix ILIKE strategy.
+
+    Used when pg_trgm is not available. Applies three layers in order:
+    1. Multi-word AND intersection (most selective)
+    2. First-word anchored prefix only (when AND returns nothing)
+    3. All-word contains patterns (when the entity word is not the first word
+       in the stored value, e.g. "Timberwolves" vs "Minnesota Timberwolves")
+    """
+    prefixes = _build_word_prefixes(value)
 
     def _run(where_clause: str, params: tuple) -> list[str]:
         try:
@@ -198,40 +292,71 @@ def _probe_candidates(
                 rows = cur.fetchall()
             return [str(r[0]) for r in rows if r[0] is not None]
         except psycopg2.Error as exc:
-            _log.warning(
-                "PEER probe query failed (%s.%s): %s", qualified_table, column, exc
-            )
+            _log.warning("PEER ILIKE probe failed (%s.%s): %s", qualified_table, column, exc)
             conn.rollback()
             return []
 
     if not prefixes:
         return _run("TRUE", ())
 
-    # First word: anchored prefix (e.g. 'jo%')  — hits leading-char index
-    # Subsequent words: contains pattern (e.g. '%em%') — matches anywhere in value
-    conditions_parts = [f"{column} ILIKE %s"]
-    params_list: list[str] = [f"{prefixes[0]}%"]
-    for p in prefixes[1:]:
-        conditions_parts.append(f"{column} ILIKE %s")
-        params_list.append(f"%{p}%")
-
-    conditions = " AND ".join(conditions_parts)
+    # Layer 1: multi-word AND intersection
+    conditions = " AND ".join(
+        [f"{column} ILIKE %s"] + [f"{column} ILIKE %s" for _ in prefixes[1:]]
+    )
+    params_list = [f"{prefixes[0]}%"] + [f"%{p}%" for p in prefixes[1:]]
     candidates = _run(conditions, tuple(params_list))
 
     _log.debug(
-        "PEER multi-prefix probe %s.%s prefixes=%s patterns=%s → %d candidate(s)",
-        qualified_table, column, prefixes, params_list, len(candidates),
+        "PEER ILIKE layer-1 %s.%s prefixes=%s → %d candidate(s)",
+        qualified_table, column, prefixes, len(candidates),
     )
 
-    # Fallback: AND intersection empty — try first-word prefix only
+    # Layer 2: first-word anchored prefix only
     if not candidates and len(prefixes) > 1:
         candidates = _run(f"{column} ILIKE %s", (f"{prefixes[0]}%",))
         _log.debug(
-            "PEER fallback single-prefix probe %s.%s prefix=%s → %d candidate(s)",
-            qualified_table, column, prefixes[0], len(candidates),
+            "PEER ILIKE layer-2 fallback %s.%s → %d candidate(s)",
+            qualified_table, column, len(candidates),
+        )
+
+    # Layer 3: all-word contains patterns (catches non-first-word entity words)
+    if not candidates:
+        contains_conditions = " AND ".join(f"{column} ILIKE %s" for _ in prefixes)
+        contains_params = tuple(f"%{p}%" for p in prefixes)
+        candidates = _run(contains_conditions, contains_params)
+        _log.debug(
+            "PEER ILIKE layer-3 contains fallback %s.%s → %d candidate(s)",
+            qualified_table, column, len(candidates),
         )
 
     return candidates
+
+
+def _probe_candidates(
+    conn: psycopg2.extensions.connection,
+    table: str,
+    column: str,
+    value: str,
+    db_schema: str = "",
+) -> list[str]:
+    """Return candidate column values for *value* using the best available strategy.
+
+    Delegates to the trigram pipeline when pg_trgm is detected on the connection,
+    and falls back to the multi-prefix ILIKE strategy otherwise.  The decision is
+    cached per connection so the capability probe runs at most once.
+    """
+    clean_value = _strip_sql_wildcards(value)
+    if not clean_value:
+        return []
+
+    qualified_table = f"{db_schema}.{table}" if db_schema else table
+
+    if _trgm_available(conn):
+        _log.debug("PEER: using trigram resolver for %s.%s", qualified_table, column)
+        return _probe_trigram(conn, qualified_table, column, clean_value)
+
+    _log.debug("PEER: using ILIKE fallback for %s.%s", qualified_table, column)
+    return _probe_ilike_fallback(conn, qualified_table, column, clean_value)
 
 
 def _fuzzy_match(value: str, candidates: list[str]) -> tuple[str, int]:
