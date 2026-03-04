@@ -722,7 +722,13 @@ def _run_peer_internal(
 
             print(f"[peer]   '{entity.value}' → '{best}' (score={score}, action={action})")
 
-            if action == "auto_sub":
+            if action == "exact":
+                if best.lower() != entity.value.lower():
+                    to_substitute.append(entity)
+                    messages.append(
+                        f"Single candidate: '{entity.value}' replaced with '{best}'."
+                    )
+            elif action == "auto_sub":
                 to_substitute.append(entity)
                 messages.append(
                     f"Note: '{entity.value}' was interpreted as '{best}' "
