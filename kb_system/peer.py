@@ -543,7 +543,7 @@ def _run_peer_internal(
     sql: str,
     conn: psycopg2.extensions.connection,
 ) -> PEERResult:
-    print("[peer] Running Pre-Execution Entity Resolution...")
+    print("\n[peer] Running Pre-Execution Entity Resolution...")
 
     entities = _extract_entities(sql)
     if not entities:

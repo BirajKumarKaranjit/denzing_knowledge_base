@@ -160,7 +160,7 @@ def format_citations_for_user(citations: list[TableCitation]) -> str:
             "in your `.md` files, or lowering `SIMILARITY_THRESHOLD` in `config.py`."
         )
     lines: list[str] = [
-        "###Knowledge Base Citations",
+        "\n\n###Knowledge Base Citations",
         "",
         "The following tables were retrieved from the Knowledge Base to generate this SQL:",
         "",

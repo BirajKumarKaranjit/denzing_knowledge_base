@@ -105,6 +105,79 @@ def cmd_status() -> None:
     status_kb()
 
 
+def _execute_sql(sql: str) -> None:
+    """Execute *sql* against NBA_POSTGRES_DSN and pretty-print results.
+
+    Parameters
+    ----------
+    sql:
+        The SQL string to execute.
+    """
+    import psycopg2
+    from utils.config import NBA_POSTGRES_DSN, nba_db_config
+
+    try:
+        conn = psycopg2.connect(NBA_POSTGRES_DSN,
+                                options=f"-c search_path={nba_db_config['schema']}")
+    except psycopg2.Error as exc:
+        print(f"\n[executor] Could not connect to database: {exc}")
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            col_names = [desc[0] for desc in cur.description] if cur.description else []
+
+        if not col_names:
+            print("\n[executor] Query executed successfully (no columns returned).")
+            return
+
+        if not rows:
+            print("\n[executor] Query returned no results.")
+            _print_table(col_names, [])
+            return
+
+        _print_table(col_names, rows)
+
+    except psycopg2.Error as exc:
+        print(f"\n[executor] SQL Error: {exc}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def _print_table(headers: list[str], rows: list[tuple]) -> None:
+    """Render *headers* and *rows* as a fixed-width table to stdout.
+
+    Parameters
+    ----------
+    headers:
+        Column names.
+    rows:
+        Result rows — each element is a tuple matching *headers* in length.
+    """
+    str_rows = [[str(v) if v is not None else "NULL" for v in row] for row in rows]
+    col_widths = [
+        max(len(h), max((len(r[i]) for r in str_rows), default=0))
+        for i, h in enumerate(headers)
+    ]
+
+    sep = "+-" + "-+-".join("-" * w for w in col_widths) + "-+"
+    header_line = "| " + " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers)) + " |"
+
+    print(f"\n{'=' * 60}")
+    print(f"  QUERY EXECUTION RESULT  ({len(rows)} row{'s' if len(rows) != 1 else ''})")
+    print(f"{'=' * 60}\n")
+    print(sep)
+    print(header_line)
+    print(sep)
+    for row in str_rows:
+        print("| " + " | ".join(row[i].ljust(col_widths[i]) for i in range(len(headers))) + " |")
+    print(sep)
+    print()
+
+
 def cmd_query(user_query: str) -> None:
     """Run a full pipeline query: relevance gate → retrieve → assemble → generate SQL → PEER.
 
@@ -192,6 +265,10 @@ def cmd_query(user_query: str) -> None:
     print(f"{'=' * 60}")
     print(final_sql)
     print(f"{'=' * 60}\n")
+
+    print("[executor] Executing SQL against remote database...")
+    _execute_sql(final_sql)
+
     print(citation_md)
 
     conn.close()
