@@ -141,6 +141,29 @@ AND opp.full_name ILIKE 'Miami Heat'
 - Correctly isolates opponent
 - Avoids inflated averages and shooting %
 
+## Filtering Games by Team — Avoid OR Join on Teams
+
+Do not join dwh_d_teams using:
+-- WRONG
+JOIN dwh_d_teams t
+  ON g.home_team_id = t.team_id OR g.visitor_team_id = t.team_id
+-- This creates duplicate rows and inefficient execution.
+
+# Correct Pattern
+Resolve the team first, then filter games:
+WITH team AS (
+  SELECT team_id
+  FROM dwh_d_teams
+  WHERE full_name ILIKE 'Boston Celtics'
+)
+SELECT g.*
+FROM dwh_d_games g
+JOIN team t
+  ON g.home_team_id = t.team_id
+  OR g.visitor_team_id = t.team_id;
+
+- # Why: prevents duplicate rows and keeps join logic clear.
+
 ## Gotchas and Anti-Patterns
 
 - **Incorrect join conditions** lead to Cartesian products or missing rows — verify FK relationships.
