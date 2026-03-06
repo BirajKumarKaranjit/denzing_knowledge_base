@@ -149,6 +149,46 @@ SELECT player_id, school FROM dwh_d_players WHERE school IS NOT NULL;
 ```
 ---
 
+## Prioritze the Rules:
+Default game type = regular season.
+-- default when unspecified: WHERE g.game_type ILIKE '%regular%'
+
+Default season = latest season in data.
+-- default: WHERE g.season_year = (SELECT MAX(season_year) FROM dwh_d_games)
+
+Default "last game" = latest game_date, not CURRENT_DATE offsets.
+-- use: ORDER BY g.game_date DESC LIMIT 1
+
+Require joining games when using season/date filters.
+JOIN dwh_d_games g ON pb.game_id = g.game_id -- needed to apply g.season_year or g.game_date
+
+When asking "this year/this season", enforce a season filter.
+-- must include: AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games)
+
+Always filter player-by-team using the boxscore team column.
+-- use pb.team_id = t.team_id; do NOT infer player team from g.home_team_id / g.visitor_team_id
+
+Show human-readable names in final output (never raw IDs).
+-- if players joined: SELECT p.full_name AS player_name
+-- if teams joined: SELECT t.full_name AS team_name
+
+For single-game thresholds (e.g., 20+ rebounds) compute totals explicitly.
+-- example: (pb.rebounds_offensive + pb.rebounds_defensive) >= 20 OR use alias total_reb in HAVING/WHERE
+
+CTE / aggregation correctness: don’t forget to join games when aggregating season totals.
+-- SUM(pb.points) requires JOIN dwh_d_games g and WHERE g.season_year = ... to scope to a season
+
+Pre-exec validation rules (reject & regenerate if missing):
+
+queries about team leaders MUST contain pb.team_id filter.
+
+season-scoped queries MUST contain g.season_year or explicit latest-game logic.
+
+"last game" queries MUST use ORDER BY game_date DESC LIMIT 1.
+
+UX tip — prefer player_fullname in any intermediate/result table shown to users.
+-- CTEs that expose player_id should also select p.full_name for table previews
+
 ## Anti-Pattern Summary
 | Bad Pattern | Fix |
 |---|---|

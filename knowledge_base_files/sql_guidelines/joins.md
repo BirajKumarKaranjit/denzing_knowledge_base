@@ -164,6 +164,12 @@ JOIN team t
 
 - # Why: prevents duplicate rows and keeps join logic clear.
 
+## Player Stats for a Team — Use pb.team_id
+When calculating player statistics for a specific team, always filter using:
+pb.team_id = team_id
+
+Do NOT infer the player's team from the game table (home_team_id / visitor_team_id), as this will include opponent players.
+
 ## Gotchas and Anti-Patterns
 
 - **Incorrect join conditions** lead to Cartesian products or missing rows — verify FK relationships.
