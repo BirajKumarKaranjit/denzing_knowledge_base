@@ -9,19 +9,6 @@ priority: critical
 
 ---
 
-## ⚠️ TWO DEFAULTS THAT MUST NEVER BE MISSED
-
-1. **Game type** — always `AND g.game_type ILIKE '%Regular Season%'` unless the user says "playoffs", "career", or "all-time".
-2. **Season** — always scope to the current season for any present-tense query. Omitting this causes retired players to appear as active leaders.
-
-```sql
--- These two lines belong in almost every query
-AND g.game_type ILIKE '%Regular Season%'
-AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')
-```
-
----
-
 ## RULE 1 — Name Matching: Always ILIKE '%name%', Never =
 
 Player names include suffixes (Jr., II, III) and accents (Jokić). Any `=` match silently returns zero rows when the stored value differs.
@@ -232,6 +219,72 @@ WHERE school = NULL        -- WRONG
 
 ---
 
+## RULE 12 — STRICTLY Always Apply These Two Filters by Default
+***Users never explicitly ask for "regular season" or "this year" — they just ask about basketball. Always apply both filters unless the query contains a specific override signal.***
+sql-- These two lines go in every query by default
+    AND g.game_type ILIKE '%Regular Season%'
+    AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')
+Override signals — when present, replace the defaults:
+Signal Override:
+- "playoffs", "postseason"Replace game_type with ILIKE '%playoff%'"career", "all-time", "ever", "total", 
+- "career high"Remove both filters entirely"last season",
+- "last year"Replace season filter with previous season subquery 
+- specific year mentioned ("in 2022")Replace season filter with that year
+- "last game","most recent game", "last night"Remove season filter; use ORDER BY game_date DESC LIMIT 1
+- implied recency — "what did X score", "how did X play", "what is X's stat line", "how many points did X score" (no time context given)Use ORDER BY g.game_date DESC LIMIT 1 — user wants the latest game, not a season aggregate
+
+## Concrete examples
+
+Example A — implied recency (user asks a single-game stat or score):
+User: What is the score of LeBron James?
+Interpretation: implied recency → last game stat line (do not apply season aggregate).
+
+-- CORRECT: implied recency → last game: remove default filters, order by date
+SELECT p.full_name, g.game_date,
+    ht.full_name AS home_team, vt.full_name AS visitor_team,
+    g.home_score, g.visitor_score,
+    pb.points, pb.assists,
+    pb.rebounds_offensive + pb.rebounds_defensive AS total_rebounds
+FROM dwh_f_player_boxscore pb
+JOIN dwh_d_players p ON pb.player_id = p.player_id
+JOIN dwh_d_games g   ON pb.game_id   = g.game_id
+JOIN dwh_d_teams ht  ON g.home_team_id    = ht.team_id
+JOIN dwh_d_teams vt  ON g.visitor_team_id = vt.team_id
+WHERE p.full_name ILIKE '%LeBron James%'
+ORDER BY g.game_date DESC
+LIMIT 1;
+
+-- WRONG: no time context handling → DO NOT produce a season aggregate for this implicit-last-game question
+SELECT p.full_name, SUM(pb.points) AS total_points
+FROM dwh_f_player_boxscore pb
+JOIN dwh_d_players p ON pb.player_id = p.player_id
+JOIN dwh_d_games g   ON pb.game_id   = g.game_id
+WHERE p.full_name ILIKE '%LeBron James%'
+  AND g.game_type ILIKE '%Regular Season%'
+  AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')
+GROUP BY p.full_name;
+
+Example B — explicit season request:
+User: How many points did LeBron score this season?
+Interpretation: present-tense → apply defaults (latest regular season + regular-season game_type), aggregate over that season.
+
+-- CORRECT: present-tense → default filters apply
+SELECT p.full_name, SUM(pb.points) AS total_points
+FROM dwh_f_player_boxscore pb
+JOIN dwh_d_players p ON pb.player_id = p.player_id
+JOIN dwh_d_games g ON pb.game_id = g.game_id
+WHERE p.full_name ILIKE '%LeBron James%'
+  AND g.game_type ILIKE '%Regular Season%'
+  AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')
+GROUP BY p.full_name;
+
+Example C — playoffs + specific year:
+User: How many points did X score in the 2022 playoffs?
+Interpretation: season = 2022, game_type = playoffs (both applied).
+
+AND g.game_type ILIKE '%playoff%'
+AND g.season_year = '2022'
+---
 ## Quick-Reference
 
 | Situation | Filter |
