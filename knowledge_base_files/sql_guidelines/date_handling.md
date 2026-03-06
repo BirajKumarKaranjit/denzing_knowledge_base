@@ -1,220 +1,222 @@
 ---
 name: date_handling
-description: "Use when the query involves filtering by date range, grouping by season or time period, extracting date components, finding the latest available game or season, computing player age, back-to-back game detection, or any time-based analysis. Critical rules: never use CURRENT_DATE for sports data, always use g.season_year for season grouping (never DATE_TRUNC), use MAX(game_date) or MAX(season_year) to resolve 'latest', and always cast season_year to integer before arithmetic."
-tags: [date, season_year, game_date, DATE_TRUNC, MAX, current season, latest game, age, back-to-back, date range, EXTRACT, BETWEEN, season filter]
-priority: high
+description: "Use when the query involves any time-based filtering or grouping — season grouping, last game resolution, last N games, season year arithmetic, back-to-back date detection, player age calculation, month filtering, or current/previous/rookie season dynamic resolution. Key rules: always use g.season_year for NBA season grouping (never DATE_TRUNC year), always use ORDER BY game_date DESC for last game resolution (never CURRENT_DATE), and always cast season_year to integer before arithmetic."
+tags: [date_handling, season_year, DATE_TRUNC, game_date, last game, CURRENT_DATE, back-to-back, player age, EXTRACT, AGE, month filter, current season, previous season, rookie season, season arithmetic]
+priority: critical
 ---
 
-# Date and Time Handling Guidelines
+# SQL Date Handling Guidelines
 
 ---
 
-## RULE 1 — Never Use CURRENT_DATE for Sports Data
+## RULE 1 — Season Grouping: Always g.season_year, Never DATE_TRUNC('year')
 
-Sports databases have a data cutoff. Using `CURRENT_DATE` to filter "today's" or "yesterday's" games will return empty results whenever no game was played on that exact date. Always resolve latest dates dynamically from the data.
+NBA seasons span two calendar years (Oct 2024 – Jun 2025). `DATE_TRUNC('year', game_date)` splits a single season across two groups: games before Jan 1 land in one group, games after Jan 1 land in another. This corrupts all season-level aggregations.
+
+Always use `g.season_year` from `dwh_d_games` to group by NBA season.
 
 ```sql
--- CORRECT: dynamic resolution from data
-WHERE g.game_date = (SELECT MAX(game_date) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')
-
--- WRONG: empty results if no game was played yesterday
-WHERE g.game_date = CURRENT_DATE - 1
-```
-
----
-
-## RULE 2 — Season Grouping: Always Use g.season_year, Never DATE_TRUNC('year')
-
-The NBA season spans two calendar years (e.g., Oct 2024 – Jun 2025). Using `DATE_TRUNC('year', game_date)` splits a single season across two groups — games from October–December appear in year 2024, and games from January–June appear in year 2025. This corrupts any season-level aggregation.
-
-Always use `g.season_year` from `dwh_d_games` as the season identifier.
-
-```sql
--- CORRECT: season grouping by season_year
-SELECT g.season_year, AVG(pb.plus_minus_points) AS avg_plus_minus
+-- CORRECT: season grouping using season_year
+SELECT g.season_year,
+    AVG(pb.points)  AS ppg,
+    AVG(pb.assists) AS apg
 FROM dwh_f_player_boxscore pb
 JOIN dwh_d_games g ON pb.game_id = g.game_id
-WHERE g.game_type ILIKE '%Regular Season%'
+JOIN dwh_d_players p ON pb.player_id = p.player_id
+WHERE p.full_name ILIKE '%LeBron James%'
+  AND g.game_type ILIKE '%Regular Season%'
 GROUP BY g.season_year
-ORDER BY g.season_year DESC;
+ORDER BY g.season_year;
 
--- WRONG: calendar-year grouping splits NBA season into two groups
-SELECT DATE_TRUNC('year', g.game_date) AS year, AVG(pb.plus_minus_points)
-FROM ...
-GROUP BY DATE_TRUNC('year', g.game_date);
+-- WRONG: splits 2024-25 NBA season into two calendar year groups
+GROUP BY DATE_TRUNC('year', g.game_date)
+```
+
+**Confirmed successes:** Rows 184, 186, 187.
+
+---
+
+## RULE 2 — Current Season: Dynamic MAX, Never Hardcoded Year
+
+Never hardcode a season year. Always resolve the current season dynamically.
+
+```sql
+-- CORRECT: always resolves to the latest season with data
+AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')
+
+-- WRONG: breaks as soon as the next season starts
+AND g.season_year = '2024'
+AND g.season_year = '2024-25'
 ```
 
 ---
 
-## RULE 3 — Current Season Resolution: Use MAX(season_year)
-
-Always resolve "current season", "this season", "this year" dynamically using `MAX(season_year)`. Never hardcode a season string.
+## RULE 3 — Previous Season: Dynamic Subquery
 
 ```sql
--- CORRECT: dynamic current season
-WHERE g.season_year = (
-    SELECT MAX(season_year)
-    FROM dwh_d_games
-    WHERE game_type ILIKE '%Regular Season%'
-)
-
--- WRONG: hardcoded season breaks when a new season starts
-WHERE g.season_year = '2024-25'
-```
-
----
-
-## RULE 4 — Previous Season: Subquery with season < MAX
-
-```sql
--- Previous season
-WHERE g.season_year = (
-    SELECT MAX(season_year)
-    FROM dwh_d_games
+AND g.season_year = (
+    SELECT MAX(season_year) FROM dwh_d_games
     WHERE season_year < (SELECT MAX(season_year) FROM dwh_d_games)
       AND game_type ILIKE '%Regular Season%'
 )
 ```
 
+**Confirmed successes:** Rows 145, 157, 169, 186, 187.
+
 ---
 
-## RULE 5 — season_year Arithmetic: Cast to Integer First
+## RULE 4 — Rookie Season: Dynamic MIN, Never Hardcoded
 
-`season_year` is stored as text (e.g., `'2024'`). Arithmetic directly on a text field causes a type error. Always cast before arithmetic.
+Never hardcode a player's rookie year. Determine it dynamically from `dwh_f_player_team_seasons`. A player who was a rookie 2 seasons ago will not be found if you apply the current season filter to them.
 
 ```sql
--- CORRECT: cast to integer before arithmetic
-WHERE g.season_year::integer >= (SELECT MAX(season_year)::integer FROM dwh_d_games) - 10
-
--- WRONG: text - integer → type error
-WHERE g.season_year >= (SELECT MAX(season_year) FROM dwh_d_games) - 10
+-- Rookie season (for any player)
+AND g.season_year = (
+    SELECT MIN(pts.season_year) FROM dwh_f_player_team_seasons pts
+    WHERE pts.player_id = (
+        SELECT player_id FROM dwh_d_players WHERE full_name ILIKE '%Bronny James%'
+    )
+)
 ```
 
----
-
-## RULE 6 — "Last 10 Years" / Multi-Year Range Queries
-
-```sql
--- CORRECT: last 10 seasons using integer cast
-WHERE g.season_year::integer >= (SELECT MAX(season_year)::integer FROM dwh_d_games) - 9
-  AND g.game_type ILIKE '%Regular Season%'
-```
+**Confirmed failure fixed:** Rows 32, 33. **Confirmed successes:** Rows 58, 59.
 
 ---
 
-## RULE 7 — Latest Game per Player or Team
+## RULE 5 — Last Game: ORDER BY game_date DESC LIMIT 1, Never CURRENT_DATE
+
+The database may not have games from today or yesterday. Always resolve "last game" dynamically from the data.
 
 ```sql
--- Latest game for a player
+-- CORRECT: most recent game in the data
 WHERE pb.game_id = (
     SELECT pb2.game_id
     FROM dwh_f_player_boxscore pb2
     JOIN dwh_d_games g2 ON pb2.game_id = g2.game_id
-    WHERE pb2.player_id = pb.player_id
+    JOIN dwh_d_players p2 ON pb2.player_id = p2.player_id
+    WHERE p2.full_name ILIKE '%LeBron James%'
     ORDER BY g2.game_date DESC
     LIMIT 1
 )
 
--- Latest game for a team
-WHERE g.game_date = (
-    SELECT MAX(g2.game_date)
-    FROM dwh_d_games g2
-    WHERE (g2.home_team_id = :team_id OR g2.visitor_team_id = :team_id)
-      AND g2.game_type ILIKE '%Regular Season%'
-)
-ORDER BY g.game_date DESC
-LIMIT 1
+-- WRONG: fails if no game was played yesterday
+WHERE g.game_date = CURRENT_DATE - 1
+WHERE g.game_date = CURRENT_DATE
+```
+
+**Confirmed failure fixed:** Row 62. **Confirmed successes:** Rows 14, 43, 44, 65, 80, 106, 181, 195.
+
+---
+
+## RULE 6 — Last N Games: ORDER BY game_date DESC, Never game_id DESC
+
+Game IDs are not guaranteed to be assigned in chronological order. Always order by `game_date DESC` when selecting recent games.
+
+```sql
+-- CORRECT
+ORDER BY g.game_date DESC LIMIT 10
+
+-- WRONG: game_id may not be chronological
+ORDER BY pb.game_id DESC LIMIT 10
+```
+
+**Confirmed successes:** Rows 47, 118, 203.
+
+---
+
+## RULE 7 — season_year Arithmetic: Cast to Integer First
+
+`season_year` is stored as varchar/text. Any arithmetic (subtract, compare with integer) requires an explicit `::integer` cast.
+
+```sql
+-- CORRECT
+WHERE g.season_year::integer >= (SELECT MAX(season_year)::integer FROM dwh_d_games) - 9
+AND g.season_year::integer BETWEEN 2015 AND 2024
+
+-- WRONG: type error — cannot subtract integer from text
+WHERE g.season_year >= MAX(season_year) - 9
+WHERE g.season_year - 1 = '2023'
 ```
 
 ---
 
-## RULE 8 — Back-to-Back Game Detection
+## RULE 8 — Back-to-Back Date Detection: LAG on Full Schedule
 
-Use LAG on `game_date` to compute the gap between consecutive games. A game is "back-to-back" if it occurs within 2 days of the previous game (accounting for travel days).
+Use LAG on `game_date` across the full unfiltered game sequence for back-to-back detection. Date difference of 1 means back-to-back.
 
 ```sql
-WITH team_games AS (
-    SELECT
-        g.game_id,
-        g.game_date,
-        LAG(g.game_date) OVER (
-            PARTITION BY :team_id
-            ORDER BY g.game_date
-        ) AS prev_game_date
+WITH team_schedule AS (
+    SELECT g.game_id, g.game_date,
+           LAG(g.game_date) OVER (ORDER BY g.game_date) AS prev_game_date
     FROM dwh_d_games g
     WHERE (g.home_team_id = :team_id OR g.visitor_team_id = :team_id)
       AND g.game_type ILIKE '%Regular Season%'
 )
-SELECT game_id, game_date, prev_game_date,
-    (game_date - prev_game_date) AS days_rest
-FROM team_games
-WHERE game_date - prev_game_date <= 1;   -- back-to-back = 1 day gap
+SELECT * FROM team_schedule
+WHERE game_date - prev_game_date = 1;  -- back-to-back
 ```
+
+**Confirmed success:** Row 173.
 
 ---
 
-## RULE 9 — Player Age Computation
+## RULE 9 — Player Age at Game Date: EXTRACT(YEAR FROM AGE(...))
 
-Use `EXTRACT(YEAR FROM AGE(game_date, birthdate))` to compute a player's age at the time of each game. Never hardcode ages or use `EXTRACT(YEAR FROM game_date) - birth_year` alone — this ignores the month/day and is off by up to a year.
+When calculating a player's age at the time of a game (for minutes-by-age analysis, aging curves), use `AGE(game_date, birthdate)` then EXTRACT the year component.
 
 ```sql
-SELECT
-    EXTRACT(YEAR FROM AGE(g.game_date, p.birthdate))::int AS age_at_game,
-    AVG(pb.minutes_played) AS avg_minutes
+EXTRACT(YEAR FROM AGE(g.game_date, p.birthdate))::int AS player_age_at_game
+
+-- Season-over-season aging curve
+SELECT g.season_year,
+    EXTRACT(YEAR FROM AGE(MAX(g.game_date), p.birthdate))::int AS age_that_season,
+    AVG(pb.points) AS ppg,
+    AVG(pb.minutes_played) AS mpg
 FROM dwh_f_player_boxscore pb
 JOIN dwh_d_players p ON pb.player_id = p.player_id
 JOIN dwh_d_games g   ON pb.game_id   = g.game_id
-GROUP BY age_at_game
-ORDER BY age_at_game;
+WHERE p.full_name ILIKE '%LeBron James%'
+  AND g.game_type ILIKE '%Regular Season%'
+GROUP BY g.season_year
+ORDER BY g.season_year;
 ```
+
+**Confirmed successes:** Rows 127, 128, 184.
 
 ---
 
-## RULE 10 — Date Range Filtering with BETWEEN
+## RULE 10 — Month Filter: EXTRACT or DATE_TRUNC
 
 ```sql
--- Filter games within a calendar date range
-WHERE g.game_date BETWEEN '2024-01-01' AND '2024-12-31'
+-- This month
+WHERE EXTRACT(MONTH FROM g.game_date) = EXTRACT(MONTH FROM CURRENT_DATE)
+  AND EXTRACT(YEAR  FROM g.game_date) = EXTRACT(YEAR  FROM CURRENT_DATE)
+
+-- Named month in a specific year
+WHERE DATE_TRUNC('month', g.game_date) = DATE '2025-01-01'
+
+-- Range filter with explicit dates
+WHERE g.game_date BETWEEN '2025-01-01' AND '2025-01-31'
 ```
 
-`game_date` is a TIMESTAMP — use `DATE_TRUNC('day', g.game_date)` or `CAST(g.game_date AS DATE)` when comparing to date literals to avoid timestamp boundary issues.
-
-```sql
--- Safe date comparison for TIMESTAMP columns
-WHERE CAST(g.game_date AS DATE) BETWEEN '2024-01-01' AND '2024-12-31'
-```
+**Confirmed successes:** Rows 70, 83.
 
 ---
 
-## RULE 11 — Monthly Analysis: Use DATE_TRUNC for Sub-Season Grouping
+## RULE 11 — Dynamic Latest Date (General)
 
-For grouping within a season by month (not season-level), `DATE_TRUNC('month', game_date)` is correct and appropriate.
+When you need the most recent date in the data for any purpose, use MAX dynamically:
 
 ```sql
-SELECT
-    DATE_TRUNC('month', g.game_date) AS month,
-    AVG(pb.points) AS avg_points
-FROM dwh_f_player_boxscore pb
-JOIN dwh_d_games g ON pb.game_id = g.game_id
-WHERE g.game_type ILIKE '%Regular Season%'
-GROUP BY DATE_TRUNC('month', g.game_date)
-ORDER BY month;
+-- Most recent game overall
+WHERE g.game_date = (SELECT MAX(game_date) FROM dwh_d_games)
+
+-- Most recent game for a specific team
+WHERE g.game_date = (
+    SELECT MAX(g2.game_date) FROM dwh_d_games g2
+    WHERE g2.home_team_id = :team_id OR g2.visitor_team_id = :team_id
+)
 ```
-
----
-
-## Quick-Reference Date Patterns
-
-| Use case | Pattern |
-|---|---|
-| Current season | `g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')` |
-| Previous season | `g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE season_year < (SELECT MAX(season_year) FROM dwh_d_games) AND game_type ILIKE '%Regular Season%')` |
-| Last N seasons | `g.season_year::integer >= (SELECT MAX(season_year)::integer FROM dwh_d_games) - (N-1)` |
-| Latest game | `ORDER BY g.game_date DESC LIMIT 1` |
-| Season grouping | `GROUP BY g.season_year` |
-| Monthly grouping | `GROUP BY DATE_TRUNC('month', g.game_date)` |
-| Player age at game | `EXTRACT(YEAR FROM AGE(g.game_date, p.birthdate))::int` |
-| Date arithmetic | `game_date - prev_game_date` (returns interval in days for DATE columns) |
 
 ---
 
@@ -222,8 +224,10 @@ ORDER BY month;
 
 | Bad Pattern | Consequence | Fix |
 |---|---|---|
-| `CURRENT_DATE - 1` for last game | Empty result if no game yesterday | `ORDER BY game_date DESC LIMIT 1` |
-| `DATE_TRUNC('year', game_date)` for season | Splits NBA season across two calendar years | Use `g.season_year` |
-| Hardcoded season year string | Breaks when new season starts | `MAX(season_year)` dynamic resolution |
-| `season_year - 1` on text field | Type error | `season_year::integer - 1` |
-| `EXTRACT(YEAR FROM game_date) - birth_year` for age | Off by up to 1 year | `EXTRACT(YEAR FROM AGE(game_date, birthdate))` |
+| `DATE_TRUNC('year', game_date)` for seasons | Splits NBA season in two | Use `g.season_year` |
+| Hardcoded `'2024'` as season year | Breaks next season | `SELECT MAX(season_year) FROM dwh_d_games` |
+| `CURRENT_DATE - 1` for last game | No game = empty result | `ORDER BY game_date DESC LIMIT 1` |
+| `ORDER BY game_id DESC` for recency | game_id not chronological | `ORDER BY game_date DESC` |
+| `season_year - 1` without cast | Type error on text | `season_year::integer - 1` |
+| Current season filter for past rookies | Player not found | `MIN(season_year)` from player_team_seasons |
+| Previous season filter without `AND game_type` | Includes preseason | Add `game_type ILIKE '%Regular Season%'` |

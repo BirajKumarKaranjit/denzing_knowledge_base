@@ -1,7 +1,7 @@
 ---
 name: filters
-description: "Use when the query involves filtering data by player name, team name, game type, season, date range, numeric thresholds, categorical values, streak calculations, or NULL handling. Essential for WHERE clauses involving any entity name lookup, default scoping to current season and regular season, last-game resolution, and all consecutive-game streak logic. Must be consulted for any query mentioning a player or team name, a time period, or a performance threshold."
-tags: [filters, WHERE clause, player name, team name, ILIKE, streak, season scoping, last game, date filter, NULL, threshold, game type, regular season, current season, present tense]
+description: "Use when the query involves any WHERE clause condition — player name lookup, team name lookup, game type scoping, season scoping (current, previous, career, rookie, specific), last game resolution, last N games, streak calculation, threshold filters, foul outs, month filters, or NULL handling. Contains the primary decision rules that determine whether to apply a current season filter, career/all-time filter, previous season filter, or no filter. Must be consulted for every query involving a player or team name, any time period reference, or any performance threshold."
+tags: [filters, WHERE clause, ILIKE, player name, team name, season scoping, current season, career, all-time, last game, last N games, streak, gaps-and-islands, threshold, perfect shooting, foul outs, month filter, NULL, regular season, playoffs, back-to-back]
 priority: critical
 ---
 
@@ -9,147 +9,273 @@ priority: critical
 
 ---
 
-## RULE 1 — Entity Name Matching: Always Use ILIKE with Wildcards
+## RULE 1 — Entity Name Matching: Always ILIKE with Wildcards, Never =
 
-Player and team names in the database may include suffixes (Jr., II, III), accents (Jokić, Dončić), or variations. **Never use `=` for any name-based filter. Always use `ILIKE '%name%'`.**
-
-This is non-negotiable. A single `=` match on a name will silently return zero rows if the stored value differs in any way.
+Player names in the database include suffixes (Jr., II, III) and accents (Jokić, Dončić). **Never use `=` for any name lookup.** A single `=` silently returns zero rows when the stored value has any suffix or accent variation.
 
 ```sql
--- CORRECT: catches "Jimmy Butler III", "Gary Payton II", "Nikola Jokić", etc.
+-- CORRECT: catches "Jimmy Butler III", "Gary Payton II", "Nikola Jokić"
 WHERE p.full_name ILIKE '%Jimmy Butler%'
 WHERE p.full_name ILIKE '%Gary Payton%'
-WHERE p.full_name ILIKE '%Nikola Jokic%'    -- accent variation still matches
+WHERE p.full_name ILIKE '%Nikola Jokic%'   -- accent variation still matches
+WHERE t.full_name ILIKE '%Timberwolves%'
 
--- WRONG: misses suffixed or accented names entirely, returns zero rows
-WHERE p.full_name = 'Jimmy Butler'
-WHERE p.full_name = 'Gary Payton'
-WHERE p.full_name = 'Nikola Jokić'
+-- WRONG: silently returns 0 rows if stored name has any suffix or accent
+WHERE p.full_name = 'Jimmy Butler'          -- misses "Jimmy Butler III"
+WHERE p.full_name = 'Gary Payton'           -- misses "Gary Payton II"
 ```
 
-Apply this rule identically to team names, game types, positions, conferences, and any other string-valued column.
+Apply ILIKE to: player full_name, team full_name, position, conference, game_type, and any other string column.
+
+**Confirmed failures from benchmarking:** Rows 46, 51, 61, 99, 116 — all failed because `=` was used instead of `ILIKE` for player names with suffixes.
 
 ---
 
-## RULE 2 — Categorical / Enum Fields: Use ILIKE, Never Strict Equality
+## RULE 2 — Ambiguous Names: Return All Matches
 
-Stored categorical values (game_type, conference, status, position) vary in casing and phrasing across the database. Always use `ILIKE` with a partial wildcard for these fields.
+When ILIKE matches multiple players (e.g., Gary Payton and Gary Payton II), return all matches. Do not silently narrow down. The user benefits from seeing both.
 
 ```sql
--- CORRECT: tolerant categorical match
+-- CORRECT: returns both Gary Payton and Gary Payton II
+WHERE p.full_name ILIKE '%Gary Payton%'
+
+-- WRONG: silently excludes one player
+WHERE p.full_name = 'Gary Payton II'
+```
+
+**Confirmed success from benchmarking:** Row 75 — query correctly returned both Gary Paytons and explained them.
+
+---
+
+## RULE 3 — Categorical Fields: Always ILIKE, Never Strict Equality
+
+Stored values for game_type, conference, and status vary in casing and phrasing across the database.
+
+```sql
+-- CORRECT
 WHERE g.game_type ILIKE '%Regular Season%'
 WHERE g.game_type ILIKE '%playoff%'
 WHERE t.conference ILIKE '%East%'
 WHERE t.conference ILIKE '%West%'
 
--- WRONG: brittle — fails if stored value has different casing or phrasing
+-- WRONG: fails if stored value uses different casing or phrasing
 WHERE g.game_type = 'Playoffs'
-WHERE t.conference = 'Eastern Conference'   -- stored as 'East', not 'Eastern Conference'
-WHERE t.conference = 'Western Conference'   -- stored as 'West', not 'Western Conference'
+WHERE t.conference = 'Eastern Conference'   -- stored as 'East', not full name
+WHERE t.conference = 'Western Conference'   -- stored as 'West', not full name
 ```
 
-**Known conference values in the database:** `'East'` and `'West'` — not the full names.
+**Known stored values:** `t.conference` stores `'East'` and `'West'` — never the full conference names.
 
 ---
 
-## RULE 3 — Default Game Type: Regular Season Unless Specified
+## RULE 4 — Game Type Default: Regular Season Unless the User Specifies Otherwise
 
-When a user does not mention a game type, **always default to regular season**. Never include preseason. Never mix regular season with playoff data unless the user explicitly asks for career totals or all-time records.
+When the user does not mention game type, always default to regular season. Never include preseason. Never mix regular + playoffs unless the user says "career", "all-time", or "playoffs".
 
 ```sql
--- Always include unless user explicitly says "career", "all-time", or "playoffs"
+-- Include in every query unless user specifies otherwise
 AND g.game_type ILIKE '%Regular Season%'
 ```
 
 ---
 
-## RULE 4 — Default Season: Current Season for Present-Tense Queries
+## RULE 5 — Season Scope: Match Exactly What the User Is Asking
 
-When a user uses present tense ("this season", "this year", "currently", "now", "leads", "averages") or asks about a team's current performance, always scope to the latest season in the data. **Never return all-time data for a present-tense question.**
+This is the most critical filter decision. Use the table below to choose the correct season scope.
 
-Failing to apply a season filter causes retired players to appear as current leaders, which is a critical UX failure.
+### Season Scope Decision Table
 
-```sql
--- CORRECT: scope to current season
-AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')
-
--- WRONG: no season filter returns all-time data including retired players
--- This makes LeBron James appear as a current scorer when asking about active leaders
-```
-
-**Trigger words that REQUIRE a current season filter:**
-- "this season", "this year", "currently", "now", "leads", "right now", "2024-25", "averaging"
-- "who is the best", "who leads", "top scorer", "most points this season"
-
-**Trigger words that allow all-time / career data:**
-- "career", "all-time", "ever", "history", "historically", "in his career"
+| User phrasing | Season filter to apply |
+|---|---|
+| "this season", "this year", "currently", "leads", "averaging", "how is X doing", "who is the best" | **Current season** — `g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')` |
+| "last season", "last year", "previous season" | **Previous season** — see Rule 5b |
+| "in 2023-24", "in the 2022 season", specific year named | **Specific season** — `g.season_year = '2023'` |
+| "career", "all-time", "ever", "in his career", "total", "historically", "how many total" | **No season filter** — omit season_year condition entirely |
+| "rookie season", "as a rookie" | **Rookie season dynamic** — see Rule 5d |
+| "last game", "most recent", "last night" | **Last game** — `ORDER BY g.game_date DESC LIMIT 1` — see Rule 6 |
+| "last 5 games", "last 10 games" | **Last N games** — `ORDER BY g.game_date DESC LIMIT N` — see Rule 7 |
+| "this month", "in January" | **Month filter** — see Rule 9 |
+| "playoffs" (explicit) | `g.game_type ILIKE '%playoff%'` — no regular season default |
+| unspecified (default) | Current season + Regular season |
 
 ---
 
-## RULE 5 — "Last Game" Resolution: Use ORDER BY game_date DESC, Never CURRENT_DATE
+### Rule 5a — Current Season Filter (Present-Tense Queries)
 
-When the user asks about "last night", "most recent game", "last game", always resolve dynamically from the data. Never hardcode `CURRENT_DATE - 1` or any fixed date offset.
+**Failing to apply this causes retired players to appear as current leaders — a critical failure.**
 
 ```sql
--- CORRECT: finds the actual latest game in the data
-WHERE pb.game_id = (
-    SELECT pb2.game_id
-    FROM dwh_f_player_boxscore pb2
-    JOIN dwh_d_games g2 ON pb2.game_id = g2.game_id
-    WHERE pb2.player_id = pb.player_id
-    ORDER BY g2.game_date DESC
+-- CORRECT: always use MAX subquery, never hardcode a season year
+AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')
+AND g.game_type ILIKE '%Regular Season%'
+
+-- WRONG: hardcoded year breaks when season advances
+AND g.season_year = '2024'
+
+-- WRONG: no season filter returns all-time data including retired players
+-- (simply omitting season_year on a present-tense query)
+```
+
+**Confirmed successes:** Rows 13, 36, 37, 50, 53, 64, 78, 87, 98, 103, 107, 113, 123, 125, 132, 138, 150, 153, 165, 167, 172, 197.
+
+---
+
+### Rule 5b — Previous Season Filter
+
+```sql
+AND g.season_year = (
+    SELECT MAX(season_year) FROM dwh_d_games
+    WHERE season_year < (SELECT MAX(season_year) FROM dwh_d_games)
+      AND game_type ILIKE '%Regular Season%'
+)
+```
+
+**Confirmed successes:** Rows 145, 157, 169, 186, 187.
+
+---
+
+### Rule 5c — Career / All-Time: No Season Filter
+
+When the user asks "in his career", "all-time", "how many total", "career high", "ever" — omit the season_year filter entirely. Include all game types unless user says "regular season career".
+
+```sql
+-- Career total — NO season filter
+SELECT p.full_name, SUM(pb.points) AS career_points
+FROM dwh_f_player_boxscore pb
+JOIN dwh_d_players p ON pb.player_id = p.player_id
+WHERE p.full_name ILIKE '%LeBron James%'
+GROUP BY p.full_name;
+```
+
+**Confirmed successes:** Rows 2, 17, 19, 27, 44, 52, 54, 55, 56, 63, 75, 92, 93, 94, 97, 108, 110, 135, 139, 142, 146, 147, 180, 188, 191, 207.
+
+---
+
+### Rule 5d — Rookie Season: Dynamic MIN(season_year), Never Hardcoded
+
+When a user asks about a player as a rookie, or asks to compare rookies, determine the rookie season dynamically from `dwh_f_player_team_seasons`. **Never hardcode a season year.** If the player was a rookie in a prior season, do not apply the current season filter — this causes the query to find no data for them.
+
+```sql
+AND g.season_year = (
+    SELECT MIN(season_year) FROM dwh_f_player_team_seasons
+    WHERE player_id = (SELECT player_id FROM dwh_d_players WHERE full_name ILIKE '%Bronny James%')
+)
+```
+
+**Confirmed failure fixed:** Rows 32, 33 — were failing because the current season filter was applied instead of MIN(season_year). **Confirmed successes:** Rows 58, 59 — correctly used rookie season lookup.
+
+---
+
+## RULE 6 — Last Game Resolution: ORDER BY game_date DESC, Never CURRENT_DATE
+
+"Last night", "most recent game", "last game", "what did X score last game" — always resolve dynamically from the data. The database may not have games from today or yesterday.
+
+```sql
+-- CORRECT: player's most recent game
+WITH last_game AS (
+    SELECT pb.game_id
+    FROM dwh_f_player_boxscore pb
+    JOIN dwh_d_games g ON pb.game_id = g.game_id
+    JOIN dwh_d_players p ON pb.player_id = p.player_id
+    WHERE p.full_name ILIKE '%Kevin Durant%'
+    ORDER BY g.game_date DESC
     LIMIT 1
 )
+SELECT p.full_name, g.game_date, pb.points, pb.assists,
+       pb.rebounds_offensive + pb.rebounds_defensive AS total_rebounds
+FROM dwh_f_player_boxscore pb
+JOIN dwh_d_games g ON pb.game_id = g.game_id
+JOIN dwh_d_players p ON pb.player_id = p.player_id
+JOIN last_game lg ON pb.game_id = lg.game_id
+WHERE p.full_name ILIKE '%Kevin Durant%';
 
--- CORRECT: for team last game
-WHERE g.game_date = (
-    SELECT MAX(g2.game_date)
-    FROM dwh_d_games g2
-    JOIN dwh_d_teams t2 ON g2.home_team_id = t2.team_id OR g2.visitor_team_id = t2.team_id
-    WHERE t2.full_name ILIKE '%Heat%'
-)
+-- CORRECT: team's most recent game score
+SELECT g.game_date,
+    ht.full_name AS home_team, g.home_score,
+    vt.full_name AS visitor_team, g.visitor_score
+FROM dwh_d_games g
+JOIN dwh_d_teams ht ON g.home_team_id = ht.team_id
+JOIN dwh_d_teams vt ON g.visitor_team_id = vt.team_id
+JOIN dwh_d_teams t ON g.home_team_id = t.team_id OR g.visitor_team_id = t.team_id
+WHERE t.full_name ILIKE '%Miami Heat%'
+ORDER BY g.game_date DESC
+LIMIT 1;
 
 -- WRONG: fails if no game was played yesterday
 WHERE g.game_date = CURRENT_DATE - 1
 ```
 
+**Confirmed failure fixed:** Row 62. **Confirmed successes:** Rows 14, 20, 43, 44, 65, 67, 80, 95, 106, 181, 195.
+
 ---
 
-## RULE 6 — Threshold Filters: Use Strict Greater-Than for Denominators
+## RULE 7 — Last N Games: ORDER BY game_date DESC with LIMIT N
 
-When filtering for "perfect" ratios (100% shooting, 100% free throws) or any minimum-attempt condition, the denominator must be **strictly greater than zero**. Using `>= 0` allows zero-attempt games to appear as "perfect", producing false positives.
+"Last 5 games", "last 10 games", "past 10 games" — always order by `game_date DESC`. **Never use `game_id DESC`** — game_id ordering is not guaranteed to be chronological.
 
 ```sql
--- CORRECT: requires at least 1 attempt
-WHERE pb.field_goals_attempted > 0
-  AND pb.field_goals_made = pb.field_goals_attempted
+-- Player's last 5 games averages
+WITH recent AS (
+    SELECT pb.game_id
+    FROM dwh_f_player_boxscore pb
+    JOIN dwh_d_games g ON pb.game_id = g.game_id
+    JOIN dwh_d_players p ON pb.player_id = p.player_id
+    WHERE p.full_name ILIKE '%LeBron James%'
+      AND g.game_type ILIKE '%Regular Season%'
+    ORDER BY g.game_date DESC
+    LIMIT 5
+)
+SELECT p.full_name,
+    AVG(pb.points)  AS avg_points,
+    AVG(pb.assists) AS avg_assists,
+    AVG(pb.rebounds_offensive + pb.rebounds_defensive) AS avg_rebounds
+FROM dwh_f_player_boxscore pb
+JOIN dwh_d_players p ON pb.player_id = p.player_id
+JOIN recent r ON pb.game_id = r.game_id
+GROUP BY p.full_name;
 
--- WRONG: 0 made = 0 attempted qualifies as "perfect" — false positive
-WHERE pb.field_goals_attempted >= 0
-  AND pb.field_goals_made = pb.field_goals_attempted
+-- Team's last 10 games
+WITH team AS (SELECT team_id FROM dwh_d_teams WHERE full_name ILIKE '%Milwaukee Bucks%'),
+last10 AS (
+    SELECT g.game_id, g.home_team_id, g.visitor_team_id, g.home_score, g.visitor_score
+    FROM dwh_d_games g, team t
+    WHERE (g.home_team_id = t.team_id OR g.visitor_team_id = t.team_id)
+      AND g.game_type ILIKE '%Regular Season%'
+    ORDER BY g.game_date DESC LIMIT 10
+)
+SELECT
+    SUM(CASE WHEN (l.home_team_id = t.team_id AND l.home_score > l.visitor_score)
+              OR (l.visitor_team_id = t.team_id AND l.visitor_score > l.home_score)
+             THEN 1 ELSE 0 END) AS wins,
+    SUM(CASE WHEN (l.home_team_id = t.team_id AND l.home_score < l.visitor_score)
+              OR (l.visitor_team_id = t.team_id AND l.visitor_score < l.home_score)
+             THEN 1 ELSE 0 END) AS losses
+FROM last10 l, team t;
 ```
 
+**Confirmed successes:** Rows 47, 118, 203.
+
 ---
 
-## RULE 7 — Streak Calculation: Never Pre-Filter, Always Use Full Game Sequence
+## RULE 8 — Streak Calculation: Never Pre-Filter, Always Use Full Game Sequence
 
-**This is the most common streak bug.** Pre-filtering rows that meet a condition (e.g., games with 30+ points, or games with positive plus-minus) removes the gaps between qualifying games, making the row numbers contiguous and inflating streak lengths to incorrect values.
+**The most common and most damaging streak bug.** Pre-filtering rows (e.g., WHERE points >= 30) removes the gaps between qualifying games, making any two qualifying games appear consecutive. This inflates every streak result.
 
-The correct pattern: keep all games in the sequence for the player, flag each game as qualifying or not, then use the gaps-and-islands technique to find streaks.
+**The correct pattern:** keep ALL games in sequence, flag each game as qualifying or not, then use gaps-and-islands to find streaks.
 
 ```sql
--- CORRECT: keep ALL games, flag qualifying ones, compute streaks on full sequence
+-- CORRECT: full sequence + flag + gaps-and-islands
 WITH all_games AS (
     SELECT
         pb.player_id,
         g.game_date,
         pb.points,
         ROW_NUMBER() OVER (PARTITION BY pb.player_id ORDER BY g.game_date) AS rn,
-        CASE WHEN pb.points >= 10 THEN 1 ELSE 0 END AS qualifies
+        CASE WHEN pb.points >= 30 THEN 1 ELSE 0 END AS qualifies
     FROM dwh_f_player_boxscore pb
     JOIN dwh_d_players p ON pb.player_id = p.player_id
     JOIN dwh_d_games g ON pb.game_id = g.game_id
-    WHERE p.full_name ILIKE '%Player Name%'
+    WHERE p.full_name ILIKE '%Stephen Curry%'
       AND g.game_type ILIKE '%Regular Season%'
 ),
 streaks AS (
@@ -159,74 +285,129 @@ streaks AS (
         ) AS grp
     FROM all_games
 )
-SELECT
-    MIN(game_date) AS streak_start,
-    MAX(game_date) AS streak_end,
-    COUNT(*) AS streak_length
+SELECT MIN(game_date) AS streak_start,
+       MAX(game_date) AS streak_end,
+       COUNT(*) AS streak_length
 FROM streaks
 WHERE qualifies = 1
 GROUP BY player_id, grp
 ORDER BY streak_length DESC
 LIMIT 1;
 
--- WRONG: filter first, then number — removes gaps, inflates streaks
-WITH qualifying_games AS (
-    SELECT * FROM dwh_f_player_boxscore
-    WHERE player_id = :id AND points >= 10   -- removes non-qualifying gaps!
-)
-SELECT ROW_NUMBER() OVER (ORDER BY game_date) ...
+-- WRONG: filters first — removes gaps — inflates streaks
+SELECT * FROM dwh_f_player_boxscore
+WHERE player_id = :id AND points >= 30   -- removes non-qualifying games!
+ORDER BY game_date;
+-- then row-numbering these makes every game look consecutive
 ```
 
-**This rule applies to all streak types:** consecutive scoring games, positive plus-minus streaks, consecutive double-doubles, consecutive steal games, back-to-back threshold games, and any other consecutive-game pattern.
+**This rule applies to ALL streak types:** scoring streaks, plus-minus streaks, double-double streaks, steal streaks, assist streaks, zero-turnover streaks, three-pointer streaks, any consecutive-game threshold.
+
+**Confirmed failures fixed:** Rows 83, 104, 109, 133. **Confirmed successes:** Rows 66, 142, 149, 179.
 
 ---
 
-## RULE 8 — Season Scoping: Match the Question's Time Context
+## RULE 9 — Month / Date-Range Filters
 
-Do not default blindly to the current season for all queries. Match the season scope to what the user is asking.
+For "this month", "in January", "over the last 3 months" — filter using EXTRACT or DATE_TRUNC on game_date. Never use game_id ranges.
 
 ```sql
--- Current season
-AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')
+-- This month
+WHERE EXTRACT(MONTH FROM g.game_date) = EXTRACT(MONTH FROM CURRENT_DATE)
+  AND EXTRACT(YEAR  FROM g.game_date) = EXTRACT(YEAR  FROM CURRENT_DATE)
 
--- Previous / "last" season
-AND g.season_year = (
-    SELECT MAX(season_year) FROM dwh_d_games
-    WHERE season_year < (SELECT MAX(season_year) FROM dwh_d_games)
-      AND game_type ILIKE '%Regular Season%'
-)
+-- Specific named month + year
+WHERE DATE_TRUNC('month', g.game_date) = DATE '2025-01-01'
 
--- Rookie season (determine dynamically, never hardcode)
-AND g.season_year = (
-    SELECT MIN(season_year) FROM dwh_f_player_team_seasons WHERE player_id = :player_id
-)
-
--- Career / all-time: no season filter at all
+-- All games this year (calendar year, not NBA season)
+WHERE EXTRACT(YEAR FROM g.game_date) = EXTRACT(YEAR FROM CURRENT_DATE)
 ```
 
-**Bronny James pattern:** When a user asks about a rookie who played in a prior season, do not apply the current season filter. Determine the rookie season dynamically from `dwh_f_player_team_seasons` using `MIN(season_year)`.
+**Confirmed successes:** Rows 70, 83.
 
 ---
 
-## RULE 9 — Avoid LIMIT in Analytical CTEs
+## RULE 10 — Threshold Filters: Strict > Not >= for Denominators
 
-Never apply `LIMIT` inside CTEs used for intermediate analysis (trends, streaks, aggregations). Arbitrary limits silently truncate data and corrupt results. Apply `LIMIT` only on the final output row.
+When filtering for "perfect" shooting, "minimum N attempts", or any ratio threshold — the denominator must be **strictly greater than zero**. `>= 0` allows zero-attempt games to qualify as "perfect", producing false positives.
 
 ```sql
--- WRONG: LIMIT 1000 silently drops rows mid-analysis
-WITH data AS (
-    SELECT ... FROM dwh_f_player_boxscore LIMIT 1000
-)
+-- CORRECT: at least 1 attempt
+WHERE pb.field_goals_attempted > 0
+  AND pb.field_goals_made = pb.field_goals_attempted
+
+-- FT% with minimum attempts
+WHERE pb.free_throws_attempted >= 10   -- explicit minimum specified by user
+  AND pb.free_throws_made::numeric / pb.free_throws_attempted = 1.0
+
+-- WRONG: 0 made / 0 attempted = 1.0 — false positive
+WHERE pb.field_goals_attempted >= 0
+```
+
+**Confirmed failure fixed:** Row 3. **Confirmed success:** Row 48.
+
+---
+
+## RULE 11 — Foul Outs: fouls_personal >= 6
+
+```sql
+SELECT COUNT(DISTINCT pb.game_id) AS games_fouled_out
+FROM dwh_f_player_boxscore pb
+JOIN dwh_d_players p ON pb.player_id = p.player_id
+JOIN dwh_d_games g ON pb.game_id = g.game_id
+WHERE p.full_name ILIKE '%Kawhi Leonard%'
+  AND pb.fouls_personal >= 6
+  AND g.game_type ILIKE '%Regular Season%'
+  AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%');
+```
+
+**Confirmed success:** Row 125.
+
+---
+
+## RULE 12 — Player Team Identity: pb.team_id Only, Never Infer From Game Table
+
+When filtering player stats to a specific team, always use `pb.team_id`. Never join the game table to both home/visitor teams and then pull all player stats — this includes opponent players and produces completely wrong results.
+
+```sql
+-- CORRECT: pb.team_id identifies exactly which team the player was playing for
+WITH target_team AS (SELECT team_id FROM dwh_d_teams WHERE full_name ILIKE '%Timberwolves%')
+SELECT p.full_name, SUM(pb.points) AS total_points
+FROM dwh_f_player_boxscore pb
+JOIN dwh_d_players p ON pb.player_id = p.player_id
+JOIN dwh_d_games g ON pb.game_id = g.game_id
+JOIN target_team t ON pb.team_id = t.team_id    -- pb.team_id only
+WHERE g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')
+  AND g.game_type ILIKE '%Regular Season%'
+GROUP BY p.full_name ORDER BY total_points DESC LIMIT 1;
+
+-- WRONG: OR join collects ALL players in Timberwolves games — includes opponents
+JOIN dwh_d_teams t ON g.home_team_id = t.team_id OR g.visitor_team_id = t.team_id
+WHERE t.full_name ILIKE '%Timberwolves%'
+-- then stats from all player_ids in those game_ids includes the opposing team's players
+```
+
+**Confirmed failures fixed:** Rows 120 (partial), 156. **Confirmed successes:** Rows 117, 132, 204, 205.
+
+---
+
+## RULE 13 — Avoid LIMIT Inside Analytical CTEs
+
+Never apply LIMIT inside CTEs used for intermediate analysis, trends, or streaks. Apply LIMIT only on the final SELECT.
+
+```sql
+-- WRONG: silently drops rows mid-analysis
+WITH data AS (SELECT ... FROM dwh_f_player_boxscore LIMIT 1000)
 
 -- CORRECT: LIMIT only on final output
 SELECT ... FROM analysis_cte ORDER BY season_year LIMIT 10;
 ```
 
+**Confirmed failure fixed:** Row 129.
+
 ---
 
-## RULE 10 — NULL Handling
-
-Use `IS NULL` / `IS NOT NULL`. Never compare NULL with `=`.
+## RULE 14 — NULL Handling
 
 ```sql
 -- CORRECT
@@ -238,51 +419,20 @@ WHERE school = NULL
 
 ---
 
-## RULE 11 — Player Team Identity: Use pb.team_id, Never Game Table
-
-When identifying which team a player belongs to in a game, always use `pb.team_id` from the boxscore. **Never infer player team from `g.home_team_id` or `g.visitor_team_id`** — those identify both teams in the game, not the player's team. Using the game table to infer team membership includes opponent players and produces wildly incorrect results.
-
-```sql
--- CORRECT: player's team is pb.team_id
-WHERE pb.team_id = (SELECT team_id FROM dwh_d_teams WHERE full_name ILIKE '%Timberwolves%')
-
--- WRONG: joins game to both teams, includes opponent players in the result
-JOIN dwh_d_teams t ON g.home_team_id = t.team_id OR g.visitor_team_id = t.team_id
-WHERE t.full_name ILIKE '%Timberwolves%'
--- then scores ALL players in those games, not just Timberwolves players
-```
-
-See also Joins guidelines for the full canonical pattern.
-
----
-
-## Priority Quick-Reference
-
-| Default Rule | SQL Pattern |
-|---|---|
-| Game type when unspecified | `AND g.game_type ILIKE '%Regular Season%'` |
-| Season when present-tense | `AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')` |
-| Last game resolution | `ORDER BY g.game_date DESC LIMIT 1` — never `CURRENT_DATE - 1` |
-| Player name match | `ILIKE '%name%'` — never `=` |
-| Team name match | `ILIKE '%name%'` — never `=` |
-| Categorical enum match | `ILIKE '%value%'` — never `=` |
-| Conference values | `'East'` and `'West'` — not full names |
-| Denominator safety | `> 0` not `>= 0` |
-| Streak logic | Full unfiltered sequence + window function — never pre-filter |
-| Limit placement | Final output only — never inside analytical CTEs |
-
----
-
 ## Anti-Pattern Summary
 
-| Bad Pattern | Root Cause | Correct Fix |
+| Bad Pattern | Root Cause | Fix |
 |---|---|---|
-| `full_name = 'Jimmy Butler'` | Misses suffixed names | `full_name ILIKE '%Jimmy Butler%'` |
-| `game_type = 'Playoffs'` | Case/value mismatch | `game_type ILIKE '%playoff%'` |
-| `conference = 'Eastern Conference'` | Wrong stored value | `conference ILIKE '%East%'` |
+| `full_name = 'Jimmy Butler'` | Misses "Jimmy Butler III" | `ILIKE '%Jimmy Butler%'` |
+| `full_name = 'Gary Payton'` | Misses "Gary Payton II" | `ILIKE '%Gary Payton%'` |
+| `conference = 'Eastern Conference'` | Stored as `'East'` | `ILIKE '%East%'` |
+| `game_type = 'Playoffs'` | Case/value mismatch | `ILIKE '%playoff%'` |
 | `game_date = CURRENT_DATE - 1` | No game = no result | `ORDER BY game_date DESC LIMIT 1` |
-| `attempts >= 0` | Zero attempts = false positive | `attempts > 0` |
-| Pre-filter rows before streak calc | Removes gaps, inflates streaks | Keep all rows, use window functions |
-| `LIMIT 1000` inside CTE | Silently drops analytical data | Move LIMIT to final output |
-| No season filter on present-tense query | Returns retired players | Add `g.season_year = (SELECT MAX(...))` |
-| Inferring player team from game table | Includes opponent players | Use `pb.team_id` directly |
+| `ORDER BY game_id DESC` for recency | game_id ≠ date order | `ORDER BY game_date DESC` |
+| No season filter on present-tense query | Returns retired players | `g.season_year = (SELECT MAX...)` |
+| Season filter on career query | Excludes prior seasons | Remove season_year condition |
+| Current season filter for past rookie | Player not found | Use `MIN(season_year)` from player_team_seasons |
+| Pre-filter before streak calc | Removes gaps, inflates streaks | Full sequence + window functions |
+| `attempts >= 0` for threshold | Zero attempts qualify | `attempts > 0` |
+| `LIMIT 1000` inside CTE | Silently drops data | LIMIT on final output only |
+| OR join on game teams for player stats | Includes opponents | Use `pb.team_id` |
