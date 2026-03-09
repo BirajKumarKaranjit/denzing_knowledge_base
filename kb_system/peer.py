@@ -83,6 +83,16 @@ class PEERResult:
     error: str = ""
 
 
+def _extract_cte_names(sql: str) -> set[str]:
+    """Return the set of CTE names defined in the WITH clause of *sql* (lower-cased).
+
+    Matches patterns like:  WITH cte_name AS (  or  , cte_name AS (
+    This is used to guard the probe loop: entities whose table resolves to a CTE
+    name are virtual and cannot be queried against the database.
+    """
+    return {m.lower() for m in re.findall(r"\b(\w+)\s+AS\s*\(", sql, re.IGNORECASE)}
+
+
 def _extract_entities(sql: str) -> list[_EntityMatch]:
     """Call the LLM to extract named-entity filter values from the SQL.
 
@@ -683,12 +693,24 @@ def _run_peer_internal(
         print(f"       • {e.table}.{e.column} = '{e.value}'")
 
     db_schema: str = nba_db_config.get("schema", "")
+    cte_names: set[str] = _extract_cte_names(sql)
 
     messages: list[str] = []
     unvalidatable: list[str] = []
     to_substitute: list[_EntityMatch] = []
 
     for entity in entities:
+        if entity.table.lower() in cte_names:
+            _log.debug(
+                "PEER: '%s' is a CTE name — skipping probe for %s.%s",
+                entity.table, entity.table, entity.column,
+            )
+            print(
+                f"[peer]   '{entity.table}.{entity.column}' — CTE alias, "
+                "cannot probe DB directly; value passes through unchanged."
+            )
+            continue
+
         candidates = _probe_candidates(conn, entity.table, entity.column, entity.value, db_schema)
         if not candidates:
             _log.debug(

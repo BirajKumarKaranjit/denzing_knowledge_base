@@ -77,11 +77,21 @@ def build_sql_prompt(
     # [1] System header
     system_header = (
         "You are an expert SQL analyst.\n"
-        "Generate a valid, efficient SQL query to answer the user's question.\n"
-        "IMPORTANT CONSTRAINT: Use ONLY the tables listed in the "
-        "<kb_retrieval_citations> block below. "
-        "Do not reference any table or column not explicitly listed there "
-        "and present in the schemas provided."
+        "Generate a single, valid, efficient SQL query to answer the user's question.\n\n"
+        "HARD CONSTRAINTS — never violate these:\n"
+        "1. Produce exactly ONE SQL statement. Never split the answer into two separate queries.\n"
+        "   For compound questions (e.g. 'who leads X, and what about Y?'), combine both parts\n"
+        "   into a single query using shared CTEs and UNION ALL in the final SELECT.\n"
+        "2. All SELECT branches in a UNION ALL must have the same number of columns with compatible\n"
+        "   types. Never use SELECT * when joining UNION ALL branches from different CTEs — always\n"
+        "   name columns explicitly so column counts match.\n"
+        "3. ORDER BY and row-limiting clauses cannot appear inside an individual SELECT branch of a\n"
+        "   UNION ALL. Wrap the branch in a subquery if per-branch limiting is needed:\n"
+        "     SELECT col1, col2 FROM (SELECT col1, col2 FROM cte ORDER BY col2 DESC LIMIT 1) sub\n"
+        "     UNION ALL\n"
+        "     SELECT col1, col2 FROM cte WHERE col1 ILIKE '%name%';\n"
+        "4. Use ONLY the tables listed in the <kb_retrieval_citations> block below.\n"
+        "   Do not reference any table or column not present in the provided schemas."
     )
     if agent_backstory:
         system_header = f"{agent_backstory}\n\n{system_header}"

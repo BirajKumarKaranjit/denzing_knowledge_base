@@ -401,10 +401,14 @@ PEER_ENTITY_EXTRACTION_SYSTEM_PROMPT = (
     "- DO extract: string literals used in equality (=), ILIKE, LIKE, or IN filters.\n"
     "- DO NOT extract: numeric thresholds, date literals, computed expressions, or column-to-column comparisons.\n"
     "- If the SQL has no entity filters, return an empty JSON array [].\n"
-    "- Resolve table aliases to full table names where possible.\n\n"
+    "- Resolve table aliases to full physical table names where possible.\n"
+    "- IMPORTANT: if the filter appears inside a CTE body, resolve 'table' to the physical\n"
+    "  source table that the column originates from (e.g. if CTE 'td' selects from\n"
+    "  'dwh_d_players', use 'dwh_d_players' as the table). If you cannot determine the\n"
+    "  physical table, use the CTE name as-is — the system will skip probing for it.\n\n"
     "Return ONLY a valid JSON array. Each element must have exactly these keys:\n"
     '  "column"   — the column being filtered (string)\n'
-    '  "table"    — the full table name (string, or empty string if unresolvable)\n'
+    '  "table"    — the physical table name (string, or CTE name if unresolvable)\n'
     '  "value"    — the raw string value as it appears in the SQL (string)\n'
     '  "operator" — the SQL operator: =, ILIKE, LIKE, or IN (string)\n\n'
     "Example output:\n"

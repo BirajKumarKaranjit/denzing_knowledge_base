@@ -199,6 +199,41 @@ PER cannot be reliably computed from base columns — do not attempt it. Quarter
 
 ---
 
+---
+## Triple-Double Counting — Low Freedom
+
+**Use this exact template. Do not use HAVING for per-game conditions.**
+
+The triple-double condition MUST be in WHERE (per-game check), not HAVING
+(which would check totals across all games and produce nonsense counts).
+
+Run exactly this SQL:
+```sql
+SELECT
+    p.full_name,
+    COUNT(*) AS triple_double_count
+FROM dwh_f_player_boxscore pb
+JOIN dwh_d_players p ON pb.player_id = p.player_id
+JOIN dwh_d_games g ON pb.game_id = g.game_id
+WHERE g.game_type ILIKE '%Regular Season%'
+  AND (
+      CASE WHEN pb.points >= 10 THEN 1 ELSE 0 END
+    + CASE WHEN (pb.rebounds_offensive + pb.rebounds_defensive) >= 10 THEN 1 ELSE 0 END
+    + CASE WHEN pb.assists >= 10 THEN 1 ELSE 0 END
+    + CASE WHEN pb.steals >= 10 THEN 1 ELSE 0 END
+    + CASE WHEN pb.blocks >= 10 THEN 1 ELSE 0 END
+  ) >= 3
+GROUP BY p.player_id, p.full_name
+ORDER BY triple_double_count DESC;
+```
+
+**Critical:** The condition `>= 3` checks per row (per game) whether 3 or more
+stat categories hit 10+. This is the WHERE clause. Never move this into HAVING.
+HAVING operates after GROUP BY and would check aggregated totals across all games,
+producing meaningless results (Robert Parish having 1598 "triple doubles").
+
+---
+
 ## Anti-Pattern Summary
 
 | Bad Pattern | Fix |

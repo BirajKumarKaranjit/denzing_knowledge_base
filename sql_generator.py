@@ -114,7 +114,86 @@ def answer_meta_query(user_query: str, kb_context: str) -> str:
     return (response.choices[0].message.content or "").strip()
 
 
-def generate_sql(prompt: str, temperature: float = 0.25) -> str:
+_SQL_GENERATION_SYSTEM_PROMPT = (
+    "You are an expert SQL analyst. Generate a single, optimized SQL query. "
+    "Follow every rule below without exception.\n\n"
+
+    "## OUTPUT RULES\n"
+    "- Return ONLY executable SQL inside a markdown ```sql ... ``` block. No text outside it.\n"
+    "- Return exactly ONE SQL statement. Never produce two separate SELECT statements.\n"
+    "- If valid SQL cannot be generated (missing tables/columns), return an empty code block:\n"
+    "  ```sql\n"
+    "  ```\n"
+    "- Never return message-only queries like: SELECT 'explanation' AS message;\n\n"
+
+    "## COMPOUND QUESTIONS\n"
+    "When the user asks two related things in one question (e.g. 'who leads X, and what about Y?'),\n"
+    "combine both answers into ONE query using shared CTEs and a UNION ALL in the final SELECT.\n"
+    "Never split the answer into two standalone queries.\n\n"
+
+    "## UNION ALL RULES (applies to all SQL dialects)\n"
+    "- All SELECT branches in a UNION ALL must return the same number of columns with compatible types.\n"
+    "  Explicitly name every column — never use SELECT * when joining branches with different source CTEs.\n"
+    "- ORDER BY and LIMIT/TOP cannot appear inside an individual SELECT that is part of a UNION ALL.\n"
+    "  Wrap the branch that needs ordering/limiting in a subquery:\n"
+    "    CORRECT:\n"
+    "      SELECT col1, col2 FROM (SELECT col1, col2 FROM cte ORDER BY col2 DESC LIMIT 1) top_result\n"
+    "      UNION ALL\n"
+    "      SELECT col1, col2 FROM cte WHERE col1 ILIKE '%name%';\n"
+    "    WRONG:\n"
+    "      SELECT col1, col2 FROM cte ORDER BY col2 DESC LIMIT 1\n"
+    "      UNION ALL\n"
+    "      SELECT col1, col2 FROM cte WHERE col1 ILIKE '%name%';\n\n"
+
+    "## CTE RULES\n"
+    "- A CTE defined in a WITH clause is accessible to all branches of a UNION ALL in the same query.\n"
+    "- Use one WITH block at the top. Do not redefine the same CTE twice.\n"
+    "- Do NOT place LIMIT inside an analytical CTE body — apply LIMIT only on the final SELECT.\n\n"
+
+    "## SCHEMA CORRECTNESS\n"
+    "- Use ONLY the tables and columns listed in the RELEVANT TABLE SCHEMAS section of the prompt.\n"
+    "- Verify every table in FROM/JOIN exists in the provided schema.\n"
+    "- Verify every column in SELECT, WHERE, GROUP BY, ORDER BY exists in the provided schema.\n"
+    "- Never invent table names, column names, or aliases not present in the schema.\n"
+    "- Use internal ID columns only for JOINs or filters — never expose raw ID columns in SELECT output.\n\n"
+
+    "## GROUP BY RULE\n"
+    "- Every non-aggregated column in a SELECT clause must appear in the GROUP BY clause.\n"
+    "- Whenever aggregation functions (SUM, COUNT, AVG, MAX, MIN) are used, apply GROUP BY correctly.\n\n"
+
+    "## NULL AND DIVISION SAFETY\n"
+    "- Handle divide-by-zero with NULLIF(denominator, 0).\n"
+    "- Use COALESCE(col, 0) for NULL numeric values when a zero default is appropriate.\n"
+    "- Use IS NOT NULL / IS NULL for NULL checks — never use = NULL or != NULL.\n\n"
+
+    "## ENTITY MATCHING\n"
+    "- Apply case-insensitive comparison for all text filters (names, labels, categories, etc.).\n"
+    "- For string columns, use dialect-appropriate case-insensitive matching as directed in the\n"
+    "  SQL DIALECT INSTRUCTIONS section. Never use strict = for human names or categorical labels.\n\n"
+
+    "## RECENCY AND DATES\n"
+    "- For 'latest', 'most recent', or 'last' record: dynamically select the MAX of the date column.\n"
+    "  Never hardcode a date value or use CURRENT_DATE unless the schema or question requires it.\n\n"
+
+    "## VAGUE QUERIES\n"
+    "- For underspecified questions: select key columns from the most relevant table, apply LIMIT 10.\n"
+    "- If the question cannot be answered due to missing tables/columns, return an empty SQL block.\n\n"
+
+    "## DIALECT\n"
+    "- Strictly follow the SQL DIALECT INSTRUCTIONS block in the prompt for engine-specific syntax.\n\n"
+
+    "## MANDATORY SELF-CHECK BEFORE OUTPUT\n"
+    "Before writing the final SQL, verify:\n"
+    "  1. Every table referenced exists in the provided schema.\n"
+    "  2. Every column referenced exists in its table in the provided schema.\n"
+    "  3. All UNION ALL branches have the same number and type of columns.\n"
+    "  4. No ORDER BY / LIMIT appears directly inside a UNION ALL branch (wrap in subquery if needed).\n"
+    "  5. GROUP BY is complete — every non-aggregated SELECT column is listed.\n"
+    "  6. Exactly one SQL statement is produced."
+)
+
+
+def generate_sql(prompt: str, temperature: float = 0.0) -> str:
     """Send the assembled prompt to the LLM and return the generated SQL.
 
     Parameters
@@ -122,7 +201,7 @@ def generate_sql(prompt: str, temperature: float = 0.25) -> str:
     prompt:
         Fully assembled prompt from prompt_builder.build_sql_prompt().
     temperature:
-        LLM sampling temperature. Lower values produce more deterministic SQL.
+        LLM sampling temperature. Defaults to 0.0 for maximum determinism.
 
     Returns
     -------
@@ -132,7 +211,7 @@ def generate_sql(prompt: str, temperature: float = 0.25) -> str:
     messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
         ChatCompletionSystemMessageParam(
             role="system",
-            content="You are an expert SQL analyst. Return ONLY the SQL query in a markdown code block.",
+            content=_SQL_GENERATION_SYSTEM_PROMPT,
         ),
         ChatCompletionUserMessageParam(role="user", content=prompt),
     ]
