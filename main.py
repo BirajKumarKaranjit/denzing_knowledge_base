@@ -105,13 +105,19 @@ def cmd_status() -> None:
     status_kb()
 
 
-def _execute_sql(sql: str) -> None:
+def _execute_sql(sql: str) -> tuple[bool, str | None]:
     """Execute *sql* against NBA_POSTGRES_DSN and pretty-print results.
 
     Parameters
     ----------
     sql:
         The SQL string to execute.
+
+    Returns
+    -------
+    tuple[bool, str | None]
+        ``(True, None)`` on success, ``(False, error_message)`` on SQL error.
+        Connection errors are printed and returned as failures.
     """
     import psycopg2
     from utils.config import NBA_POSTGRES_DSN, nba_db_config
@@ -121,7 +127,7 @@ def _execute_sql(sql: str) -> None:
                                 options=f"-c search_path={nba_db_config['schema']}")
     except psycopg2.Error as exc:
         print(f"\n[executor] Could not connect to database: {exc}")
-        return
+        return False, str(exc)
 
     try:
         with conn.cursor() as cur:
@@ -131,18 +137,21 @@ def _execute_sql(sql: str) -> None:
 
         if not col_names:
             print("\n[executor] Query executed successfully (no columns returned).")
-            return
+            return True, None
 
         if not rows:
             print("\n[executor] Query returned no results.")
             _print_table(col_names, [])
-            return
+            return True, None
 
         _print_table(col_names, rows)
+        return True, None
 
     except psycopg2.Error as exc:
-        print(f"\n[executor] SQL Error: {exc}")
+        error_msg = str(exc).strip()
+        print(f"\n[executor] SQL Error: {error_msg}")
         conn.rollback()
+        return False, error_msg
     finally:
         conn.close()
 
@@ -190,7 +199,7 @@ def cmd_query(user_query: str) -> None:
     from kb_system.kb_retriever import retrieve_context_for_query
     from kb_system.peer import run_peer
     from utils.prompt_builder import build_sql_prompt
-    from sql_generator import generate_sql, extract_sql_from_response, is_query_relevant, answer_meta_query
+    from sql_generator import generate_sql, extract_sql_from_response, is_query_relevant, answer_meta_query, build_retry_prompt
 
     print(f"\n{'=' * 60}")
     print(f"  Query: {user_query}")
@@ -265,9 +274,55 @@ def cmd_query(user_query: str) -> None:
     print(f"{'=' * 60}")
     print(final_sql)
     print(f"{'=' * 60}\n")
+    final_sql="SELECT p.ffull_name, g.season_year, COUNT(DISTINCT pb.game_id) AS games_played, SUM(pb.points) AS total_points, ROUND(AVG(pb.points)::NUMERIC, 1) AS points_per_game, ROUND(AVG(pb.assists)::NUMERIC, 1) AS assists_per_game,  ROUND(AVG(pb.rebounds_offensive + pb.rebounds_defensive)::NUMERIC, 1) AS rebounds_per_game FROM dwh_f_player_boxscore pb JOIN dwh_d_players p ON pb.player_id = p.player_id JOIN dwh_d_games g ON pb.game_id = g.game_id WHERE p.full_name ILIKE '%LeBron James%' AND g.game_type ILIKE '%Regular Season%' AND g.season_year = '2022' GROUP BY p.full_name, g.season_year;"
 
     print("[executor] Executing SQL against remote database...")
-    _execute_sql(final_sql)
+    success, exec_error = _execute_sql(final_sql)
+
+    if not success and exec_error:
+        print(f"\n[sql_generator] Attempt 1 failed: {exec_error}. Retrying...")
+
+        retry_prompt = build_retry_prompt(prompt, final_sql, exec_error)
+        print(f"\n[sql_generator] Regenerating SQL with error context...")
+        retry_response = generate_sql(retry_prompt)
+        retry_raw_sql = extract_sql_from_response(retry_response)
+
+        print(f"\n{'=' * 60}")
+        print("  Retry SQL (before PEER patching):")
+        print(f"{'=' * 60}")
+        print(retry_raw_sql)
+        print(f"{'=' * 60}")
+
+        retry_peer = run_peer(retry_raw_sql, remote_conn)
+
+        if retry_peer.messages:
+            print(f"\n{'=' * 60}")
+            print("  Entity Resolution Notes (retry):")
+            print(f"{'=' * 60}")
+            for msg in retry_peer.messages:
+                print(f"  {msg}")
+
+        final_retry_sql = retry_peer.sql
+
+        print(f"\n{'=' * 60}")
+        if retry_peer.patched:
+            print("  Retry SQL (PEER-patched):")
+        else:
+            print("  Retry SQL:")
+        print(f"{'=' * 60}")
+        print(final_retry_sql)
+        print(f"{'=' * 60}\n")
+
+        print("[executor] Executing retry SQL against remote database...")
+        retry_success, retry_error = _execute_sql(final_retry_sql)
+
+        if not retry_success:
+            print(f"\n[sql_generator] Attempt 2 failed: {retry_error}")
+            print(
+                "\n[main] Could not generate a valid SQL query after 2 attempts.\n"
+                "  The question may reference columns or logic not present in the schema.\n"
+                f"  Last error: {retry_error}"
+            )
 
     print(citation_md)
 

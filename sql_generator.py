@@ -251,3 +251,34 @@ def extract_sql_from_response(llm_response: str) -> str:
     if match:
         return match.group(1).strip()
     return llm_response.strip()
+
+
+def build_retry_prompt(original_prompt: str, failed_sql: str, error_message: str) -> str:
+    """Append an error-feedback block to *original_prompt* for a single retry.
+
+    The original prompt is left entirely intact — only the error context is
+    appended so the LLM can see exactly what failed and why.
+
+    Parameters
+    ----------
+    original_prompt:
+        The prompt that produced the failing SQL.
+    failed_sql:
+        The SQL that was executed and raised an error.
+    error_message:
+        The database error message returned by the executor.
+
+    Returns
+    -------
+    str
+        Extended prompt ready for a second generate_sql() call.
+    """
+    error_block = (
+        "\n\n## PREVIOUS SQL ATTEMPT FAILED\n\n"
+        "The SQL below was generated but failed during execution.\n"
+        "Fix only what caused the error. Do not change the query logic or structure.\n\n"
+        f"Failed SQL:\n```sql\n{failed_sql}\n```\n\n"
+        f"Execution error:\n{error_message}"
+    )
+    return original_prompt + error_block
+
