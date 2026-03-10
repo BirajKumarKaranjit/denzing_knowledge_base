@@ -41,7 +41,34 @@ WHERE t.conference ILIKE '%West%'   -- stored as 'West', not 'Western Conference
 
 ---
 
-## RULE 3 — Season Scope
+## RULE 3 — Column Ownership: Never Put a Column on the Wrong Table
+
+Before writing any filter, verify the column exists in the target table. The most common hallucination is putting `season_year`, `game_date`, or `game_type` on a fact table that does not have them.
+
+| Column | Lives in | Does NOT exist in |
+|---|---|---|
+| `season_year` | `dwh_d_games` only | `dwh_f_player_boxscore`, `dwh_f_player_team_seasons`, `dwh_f_player_tracking`, `dwh_f_team_boxscore` |
+| `game_date` | `dwh_d_games` only | all fact tables |
+| `game_type` | `dwh_d_games` only | `dwh_f_player_boxscore`, `dwh_f_player_tracking`, `dwh_f_team_boxscore` |
+| `full_name` | `dwh_d_players`, `dwh_d_teams` | all fact tables |
+| `points`, `assists`, `rebounds_*` | `dwh_f_player_boxscore` only | `dwh_d_games`, `dwh_d_players` |
+
+**Rule:** fact tables (`dwh_f_*`) have no date or season columns of their own. To filter by season or date, always JOIN to `dwh_d_games` and use `g.season_year` or `g.game_date`.
+
+```sql
+-- CORRECT: season_year comes from dwh_d_games via JOIN
+FROM dwh_f_player_boxscore pb
+JOIN dwh_d_games g ON pb.game_id = g.game_id
+WHERE g.season_year = '2022'
+
+-- WRONG: season_year does not exist on dwh_f_player_boxscore
+FROM dwh_f_player_boxscore pb
+WHERE pb.season_year = '2022'   -- column does not exist → runtime error
+```
+
+---
+
+## RULE 4 — Season Scope
 
 ### Present-tense → Current Season (REQUIRED)
 
@@ -68,12 +95,17 @@ AND g.season_year = (
 
 Trigger phrases: "career", "all-time", "ever", "in his career", "total", "career high", "how many total". Omit `season_year` and `game_type` filters entirely unless user says "regular season career".
 
-### Rookie Season → Dynamic MIN, Never Hardcoded
+### Rookie Season → Dynamic MIN via dwh_d_games, Never Hardcoded
+
+`season_year` exists only on `dwh_d_games`. Neither `dwh_f_player_boxscore` nor `dwh_f_player_team_seasons` has a `season_year` column — always reach it by joining to `dwh_d_games`.
 
 ```sql
 AND g.season_year = (
-    SELECT MIN(season_year) FROM dwh_f_player_team_seasons
-    WHERE player_id = (SELECT player_id FROM dwh_d_players WHERE full_name ILIKE '%Bronny James%')
+    SELECT MIN(g2.season_year)
+    FROM dwh_f_player_boxscore pb2
+    JOIN dwh_d_games g2 ON pb2.game_id = g2.game_id
+    JOIN dwh_d_players p2 ON pb2.player_id = p2.player_id
+    WHERE p2.full_name ILIKE '%Bronny James%'
 )
 ```
 
@@ -83,7 +115,7 @@ Regular season + current season. Both filters always applied.
 
 ---
 
-## RULE 4 — Last Game: ORDER BY game_date DESC LIMIT 1, Never CURRENT_DATE
+## RULE 5 — Last Game: ORDER BY game_date DESC LIMIT 1, Never CURRENT_DATE
 
 ```sql
 -- Player's last game
@@ -108,7 +140,7 @@ WHERE g.game_date = CURRENT_DATE - 1
 
 ---
 
-## RULE 5 — Last N Games: ORDER BY game_date DESC LIMIT N
+## RULE 6 — Last N Games: ORDER BY game_date DESC LIMIT N
 
 Never use `ORDER BY game_id DESC` — game_id is not chronological.
 
@@ -129,7 +161,7 @@ GROUP BY p.full_name;
 
 ---
 
-## RULE 6 — Streaks: Full Game Sequence + Gaps-and-Islands, Never Pre-Filter
+## RULE 7 — Streaks: Full Game Sequence + Gaps-and-Islands, Never Pre-Filter
 
 Pre-filtering qualifying games (e.g., `WHERE points >= 30`) removes the gaps between them, making non-consecutive games appear consecutive and inflating every streak.
 
@@ -160,7 +192,7 @@ Applies to all streak types: scoring, plus-minus, double-doubles, steals, assist
 
 ---
 
-## RULE 7 — Threshold Filters: Strict > for Denominators
+## RULE 8 — Threshold Filters: Strict > for Denominators
 
 ```sql
 -- CORRECT: requires at least 1 attempt
@@ -172,7 +204,7 @@ WHERE pb.field_goals_attempted >= 0
 
 ---
 
-## RULE 8 — Month / Date-Range Filters
+## RULE 9 — Month / Date-Range Filters
 
 ```sql
 -- This month
@@ -185,7 +217,7 @@ WHERE DATE_TRUNC('month', g.game_date) = DATE '2025-01-01'
 
 ---
 
-## RULE 9 — Player Team Identity: pb.team_id Only
+## RULE 10 — Player Team Identity: pb.team_id Only
 
 When filtering player stats to a team, use `pb.team_id`. Joining the game table on both home/visitor teams then pulling all player stats includes the opponent's players.
 
@@ -201,7 +233,7 @@ WHERE t.full_name ILIKE '%Timberwolves%'
 
 ---
 
-## RULE 10 — No LIMIT Inside Analytical CTEs
+## RULE 11 — No LIMIT Inside Analytical CTEs
 
 ```sql
 WITH data AS (SELECT ... LIMIT 1000)  -- WRONG: silently drops data mid-analysis
@@ -210,7 +242,7 @@ SELECT ... FROM cte ORDER BY pts DESC LIMIT 10;  -- CORRECT: LIMIT on final outp
 
 ---
 
-## RULE 11 — NULL Handling
+## RULE 12 — NULL Handling
 
 ```sql
 WHERE school IS NOT NULL   -- CORRECT
@@ -219,7 +251,7 @@ WHERE school = NULL        -- WRONG
 
 ---
 
-## RULE 12 — STRICTLY Always Apply These Two Filters by Default
+## RULE 13 — STRICTLY Always Apply These Two Filters by Default
 ***Users never explicitly ask for "regular season" or "this year" — they just ask about basketball. Always apply both filters unless the query contains a specific override signal.***
 sql-- These two lines go in every query by default
     AND g.game_type ILIKE '%Regular Season%'
@@ -293,7 +325,7 @@ AND g.season_year = '2022'
 | Default season (present-tense) | `season_year = (SELECT MAX(season_year) ...)` |
 | Last season | `MAX(season_year) WHERE season_year < MAX(...)` |
 | Career / all-time | No `season_year` filter |
-| Rookie season | `MIN(season_year) FROM dwh_f_player_team_seasons` |
+| Rookie season | `MIN(g.season_year)` via JOIN to `dwh_d_games` — never `MIN(season_year) FROM dwh_f_*` |
 | Last game | `ORDER BY game_date DESC LIMIT 1` |
 | Last N games | `ORDER BY game_date DESC LIMIT N` |
 | Conference | `'East'` / `'West'` — not full names |

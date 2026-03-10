@@ -46,14 +46,15 @@ CREATE TABLE dwh_d_games (
 - **visitor_team_id**: Identifier for the visiting team, similar use as home_team_id for team-related JOINs.
 - **home_score**: The score achieved by the home team, used in SELECT for performance analysis.
 - **visitor_score**: The score achieved by the visiting team, also used in SELECT for comparative analysis.
-- **game_type**: Specifies the type of game (e.g., 'Regular', 'Playoff'), important for filtering and grouping.
+- **game_type**: Specifies the type of game. Stored as full phrases such as `'Regular Season'` or `'Playoffs'`. Always filter with ILIKE (e.g., `ILIKE '%Regular Season%'`), never strict equality.
 - **playoff_round**: Indicates the playoff round, relevant for playoff-specific queries and analysis.
 
 ## Common Query Patterns
 
 - Retrieve all games played in a specific season: `WHERE season_year = '2023'`
 - Analyze game outcomes by team: `SELECT home_team_id, visitor_team_id, home_score, visitor_score`
-- Filter games by type and date: `WHERE game_type = 'Playoff' AND game_date BETWEEN '2023-04-01' AND '2023-06-01'`
+- Filter games by type: `WHERE game_type ILIKE '%Regular Season%'` or `WHERE game_type ILIKE '%playoff%'` — always use ILIKE, never strict equality
+- Filter games by date range: `WHERE game_date BETWEEN '2023-04-01' AND '2023-06-01'`
 - Compare scores for home and visitor teams: `SELECT game_id, home_score, visitor_score WHERE home_score > visitor_score`
 
 ## Join Relationships

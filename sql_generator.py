@@ -157,6 +157,10 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
     "- Never invent table names, column names, or aliases not present in the schema.\n"
     "- Use internal ID columns only for JOINs or filters — never expose raw ID columns in SELECT output.\n\n"
 
+    "## COLUMN OWNERSHIP — CRITICAL\n"
+    "Columns belong to specific tables. Before writing any filter or subquery, confirm the column\n"
+    "exists on the table you are querying.\n\n"
+
     "## GROUP BY RULE\n"
     "- Every non-aggregated column in a SELECT clause must appear in the GROUP BY clause.\n"
     "- Whenever aggregation functions (SUM, COUNT, AVG, MAX, MIN) are used, apply GROUP BY correctly.\n\n"
