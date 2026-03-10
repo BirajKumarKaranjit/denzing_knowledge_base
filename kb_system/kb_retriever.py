@@ -48,7 +48,9 @@ _CROSS_ENCODER_CANDIDATE_K: int = 10
 _ELBOW_DROP_THRESHOLD: float = 0.50
 
 # Top-N tables for FK expansion after re-ranking.
-_FK_EXPANSION_TOP_N: int = 2
+# Only expand FKs from the single top-ranked table.  Expanding from rank 2+ pulls in dimension tables that are already present via rank-1 expansion,
+# wasting tokens without adding new information.
+_FK_EXPANSION_TOP_N: int = 1
 
 _SECTION_DESCRIPTIONS: dict[str, str] = {
     "ddl": (
@@ -570,7 +572,7 @@ def retrieve_context_for_query(
         conn=conn,
         query_embeddings=all_embeddings,
         section="sql_guidelines",
-        top_k=2,
+        top_k=1,
         per_query_k=8,
         rrf_k=RRF_K,
     )
