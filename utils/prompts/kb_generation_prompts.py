@@ -55,6 +55,60 @@ SECTION_SUB_FILE_SYSTEM_PROMPT = (
     "Return ONLY the markdown content. No explanations, no code fences around the whole output."
 )
 
+RESPONSE_FORMAT_SYSTEM_PROMPT = (
+    "You are a SQL output quality expert writing a knowledge base guideline file.\n"
+    "Your task is to generate a response_format.md file that instructs an AI SQL generator\n"
+    "on which columns to always include in its SELECT output for different query types.\n\n"
+    "RULES:\n"
+    "- Use ONLY the table and column names present in the DDL provided. Do not invent columns.\n"
+    "- The file must contain YAML frontmatter followed by a markdown body.\n"
+    "- The frontmatter 'description' must be rich (4-5 sentences) and cover all query types\n"
+    "  where output completeness matters: season aggregates, single-game stats, career totals,\n"
+    "  leaderboards, CTE-scoped queries, and comparisons.\n"
+    "- The body must have at most 6 numbered rules, each with a BAD/GOOD SQL pair.\n"
+    "  Every column name in every SQL example MUST exist in the provided DDL.\n"
+    "- Keep the total file under 120 lines.\n"
+    "- Do not include trivial or obvious rules (e.g. 'use SELECT *').\n"
+    "- Focus on rules that prevent silent data loss: hiding season scope, hiding game count,\n"
+    "  missing opponent context, unexposed CTE scalars.\n"
+    "- End with a compact Quick Reference table mapping query type → required columns.\n"
+    "- Return ONLY the markdown content. No explanations, no code fences around the whole output."
+)
+
+
+def response_format_user_prompt(ddl_summary: str) -> str:
+    """User prompt for generating the response_format.md guideline file."""
+    return (
+        "Generate a response_format.md knowledge base file that teaches an AI SQL generator\n"
+        "which context columns to always include in its SELECT output.\n\n"
+        "Use ONLY the table and column names from the DDL below — all SQL examples must be\n"
+        "grounded in real schema. Do not invent column names.\n\n"
+        "--- DDL START ---\n"
+        f"{ddl_summary}\n"
+        "--- DDL END ---\n\n"
+        "Required frontmatter:\n"
+        "---\n"
+        "name: response_format\n"
+        'description: >\n'
+        "  Use when deciding which columns to include in the final SELECT output. [WRITE RICH\n"
+        "  DESCRIPTION HERE covering: season aggregates, single-game queries, career totals,\n"
+        "  CTE-scoped queries, leaderboard queries, comparison queries — 4-5 sentences.]\n"
+        "example_queries:\n"
+        "  - [2-3 example query strings this file applies to]\n"
+        "tags: [output, SELECT, columns, completeness, context]\n"
+        "priority: high\n"
+        "---\n\n"
+        "Body rules:\n"
+        "- RULE 1 — CTE-Computed Scope Values Must Appear in Final SELECT\n"
+        "- RULE 2 — Season Aggregates: Always Include season_year and games_played\n"
+        "- RULE 3 — Single-Game Stats: Always Include Date and Opponent\n"
+        "- RULE 4 — Career Totals: Include seasons_played and games_played\n"
+        "- RULE 5 — Leaderboard Queries: Include RANK()\n"
+        "- RULE 6 — Comparison Queries: Same columns for all entities\n\n"
+        "Each rule must have a BAD SQL block and a GOOD SQL block using only real column names.\n"
+        "End with a Quick Reference table: query type | must include | bonus columns."
+    )
+
 
 def table_file_user_prompt(table_name: str, ddl_sql: str, domain: str) -> str:
     """User prompt for generating a single table KB file."""

@@ -33,7 +33,7 @@ from utils.config import (
     RRF_K,
 )
 from kb_system.kb_embeddings import get_embeddings_batch
-from kb_system.kb_store import retrieve_with_rrf, get_entry_point
+from kb_system.kb_store import retrieve_with_rrf, get_entry_point, get_section_sub_files
 from utils.prompts.kb_generation_prompts import (
     CROSS_ENCODER_SYSTEM_PROMPT,
     cross_encoder_user_prompt,
@@ -578,10 +578,12 @@ def retrieve_context_for_query(
 
     sql_guidelines_entry = get_entry_point(conn, "sql_guidelines")
 
-    always_inject: dict[str, dict | None] = {}
+    always_inject: dict[str, dict] = {}
     for section in _FORCED_SECTIONS:
         if section not in target_sections:
-            always_inject[section] = get_entry_point(conn, section)
+            entry = get_entry_point(conn, section)
+            sub_files = get_section_sub_files(conn, section)
+            always_inject[section] = {"entry": entry, "sub_files": sub_files}
 
     summary_lines = [
         f"Sections searched  : {', '.join(target_sections)}",

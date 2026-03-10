@@ -164,7 +164,13 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
     "## GROUP BY RULE\n"
     "- Every non-aggregated column in a SELECT clause must appear in the GROUP BY clause.\n"
     "- Whenever aggregation functions (SUM, COUNT, AVG, MAX, MIN) are used, apply GROUP BY correctly.\n\n"
-
+    
+    "## OUTPUT COMPLETENESS\n"
+    "- Every value computed in a CTE that scopes the query MUST appear in the final SELECT.\n"
+    "-If a CTE computes a boundary value (a minimum, maximum, threshold, or derived period) to filter the main query, expose that value in the output so the user understands what time period, scope, or condition the result covers.\n"
+    "- Always include the dimension columns that explain an aggregate: the time period it covers, the entity it belongs to, and the sample size it is based on.\n"
+    "- Never return a bare aggregate (SUM, AVG, COUNT, MAX, MIN) as the sole output column. Every aggregate must be accompanied by the columns that answer: aggregate of what, over what scope, for how many records?\n"
+    
     "## NULL AND DIVISION SAFETY\n"
     "- Handle divide-by-zero with NULLIF(denominator, 0).\n"
     "- Use COALESCE(col, 0) for NULL numeric values when a zero default is appropriate.\n"

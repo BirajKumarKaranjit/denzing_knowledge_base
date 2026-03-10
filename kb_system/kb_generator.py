@@ -37,10 +37,12 @@ from utils.prompts.kb_generation_prompts import (
     SECTION_KB_SYSTEM_PROMPT,
     ROOT_KB_SYSTEM_PROMPT,
     SECTION_SUB_FILE_SYSTEM_PROMPT,
+    RESPONSE_FORMAT_SYSTEM_PROMPT,
     table_file_user_prompt,
     section_kb_user_prompt,
     root_kb_user_prompt,
     section_sub_file_user_prompt,
+    response_format_user_prompt,
 )
 
 _client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -130,22 +132,23 @@ def generate_section_sub_file(
 ) -> str:
     """Generate a single sub-file for any KB section via LLM.
 
-    When ``ddl_dict`` is provided and the section requires DDL context
-    (per ``SECTION_DDL_REQUIRED``), the full schema is injected into the
-    prompt so all examples are grounded in real column names.
-    When ``ddl_dict`` is ``None`` or the section does not require DDL,
-    the prompt is content-only — suitable for sections like
-    ``business_rules/project_information``.
+    Uses a dedicated prompt for ``response_guidelines/response_format`` so the
+    output is grounded in real DDL column names. All other sub-sections use the
+    generic ``SECTION_SUB_FILE_SYSTEM_PROMPT``.
     """
     needs_ddl = SECTION_DDL_REQUIRED.get(section, False)
     ddl_summary = _build_ddl_summary(ddl_dict) if (needs_ddl and ddl_dict) else None
 
+    if section == "response_guidelines" and sub_section == "response_format" and ddl_summary:
+        system_content = RESPONSE_FORMAT_SYSTEM_PROMPT
+        user_content = response_format_user_prompt(ddl_summary)
+    else:
+        system_content = SECTION_SUB_FILE_SYSTEM_PROMPT
+        user_content = section_sub_file_user_prompt(section, sub_section, hint, ddl_summary)
+
     messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
-        ChatCompletionSystemMessageParam(role="system", content=SECTION_SUB_FILE_SYSTEM_PROMPT),
-        ChatCompletionUserMessageParam(
-            role="user",
-            content=section_sub_file_user_prompt(section, sub_section, hint, ddl_summary),
-        ),
+        ChatCompletionSystemMessageParam(role="system", content=system_content),
+        ChatCompletionUserMessageParam(role="user", content=user_content),
     ]
     response = _client.chat.completions.create(
         model=OPENAI_GENERATION_MODEL,

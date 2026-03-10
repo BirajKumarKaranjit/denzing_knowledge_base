@@ -103,11 +103,21 @@ def build_sql_prompt(
     # [3] Citation manifest
     sections.append(citation_xml)
 
-    # [4] Always-inject sections
-    for section_name, entry in always_inject.items():
+    # [4] Always-inject sections (entry KB.md + all sub-files, e.g. response_format.md)
+    for section_name, section_data in always_inject.items():
+        label = section_name.replace("_", " ").upper()
+        entry = section_data.get("entry") if isinstance(section_data, dict) else section_data
+        sub_files = section_data.get("sub_files", []) if isinstance(section_data, dict) else []
+
         if entry and entry.get("content"):
-            label = section_name.replace("_", " ").upper()
             sections.append(f"## {label}\n\n{entry['content']}")
+
+        for sub_file in sub_files:
+            content = sub_file.get("content", "").strip()
+            name = sub_file.get("metadata", {}).get("name", sub_file.get("file_path", ""))
+            if content:
+                sub_label = name.replace("_", " ").title()
+                sections.append(f"## {label} — {sub_label}\n\n{content}")
 
     # [5] SQL guidelines entry point overview
     if sql_guidelines_entry and sql_guidelines_entry.get("content"):

@@ -445,6 +445,43 @@ def retrieve_similar_tables(
     return results
 
 
+def get_section_sub_files(conn: PgConnection, section: str) -> list[dict[str, Any]]:
+    """Fetch all non-entry-point files for a given section.
+
+    Used to unconditionally inject every sub-file from sections listed in
+    ``ALWAYS_INJECT_SECTIONS`` (e.g., response_guidelines/response_format.md).
+
+    Parameters
+    ----------
+    conn : psycopg2.connection
+    section : str
+
+    Returns
+    -------
+    list[dict]
+        Records with file_path, section, metadata, content fields.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT file_path, section, metadata, content
+            FROM kb_files
+            WHERE section = %s AND is_entry_point = FALSE
+            ORDER BY file_path;
+            """,
+            (section,),
+        )
+        rows = cur.fetchall()
+
+    result = []
+    for row in rows:
+        record = dict(row)
+        if isinstance(record.get("metadata"), str):
+            record["metadata"] = json.loads(record["metadata"])
+        result.append(record)
+    return result
+
+
 def get_entry_point(conn: PgConnection, section: str) -> Optional[dict[str, Any]]:
     """
     Fetch the KB.md index file for a given section.
