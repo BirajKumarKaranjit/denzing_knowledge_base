@@ -191,7 +191,7 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
 
     "## DIALECT\n"
     "- Strictly follow the SQL DIALECT INSTRUCTIONS block in the prompt for engine-specific syntax.\n\n"
-
+    
     "## MANDATORY SELF-CHECK BEFORE OUTPUT\n"
     "Before writing the final SQL, verify:\n"
     "  1. Every table referenced exists in the provided schema.\n"
@@ -200,6 +200,7 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
     "  4. No ORDER BY / LIMIT appears directly inside a UNION ALL branch (wrap in subquery if needed).\n"
     "  5. GROUP BY is complete — every non-aggregated SELECT column is listed.\n"
     "  6. Exactly one SQL statement is produced."
+    "  7. Whenever AND and OR appear in the same WHERE clause, always add parentheses to make the intended logic explicit to avoid precedence errors."
 )
 
 

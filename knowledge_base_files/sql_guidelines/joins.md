@@ -205,6 +205,34 @@ JOIN dwh_f_player_boxscore pb2 ON pb1.game_id = pb2.game_id
 ```
 
 ---
+## Rule: Avoid OR Joins on Multi-FK Relationships
+
+Some tables contain multiple foreign keys referencing the same dimension
+(e.g., home_team_id / visitor_team_id, buyer_id / seller_id, sender_id / receiver_id).
+
+Using OR inside a JOIN multiplies rows because the event can match more than one FK, which makes ORDER BY, LIMIT, and window functions unreliable (they operate on rows, not events).
+
+-- Avoid
+JOIN dim_table d 
+ON fact.fk_a = d.id OR fact.fk_b = d.id
+This can produce multiple rows per event.
+
+-- Correct approach
+Resolve the entity ID first, then filter the fact table in WHERE:
+WITH entity AS (
+  SELECT id FROM dim_table WHERE name ILIKE '%entity%'
+)
+SELECT ...
+FROM fact_table f
+WHERE f.fk_a = (SELECT id FROM entity)
+   OR f.fk_b = (SELECT id FROM entity)
+ORDER BY f.event_date DESC
+LIMIT 1;
+
+--Principle
+
+Use JOIN for relationships, and WHERE for membership checks when multiple foreign keys reference the same entity.
+---
 
 ## Anti-Pattern Summary
 
