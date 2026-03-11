@@ -13,12 +13,9 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
-import openai
-from openai.types.chat import (
-    ChatCompletionSystemMessageParam,
-    ChatCompletionUserMessageParam,
-)
+from utils.llm_client import call_llm
 
 _log = logging.getLogger(__name__)
 
@@ -67,7 +64,7 @@ def review_sql(
     generated_sql: str,
     ddl_context: str,
     guidelines_context: str,
-    client: openai.OpenAI,
+    client: Any,
     model: str,
 ) -> ReviewResult:
     """Submit *generated_sql* to the LLM reviewer and return a ReviewResult.
@@ -83,7 +80,7 @@ def review_sql(
     guidelines_context:
         Relevant SQL guidelines injected into the prompt.
     client:
-        Initialised OpenAI client.
+        Provider client returned by ``get_llm_client()``.
     model:
         Model name to use for the review call.
 
@@ -97,18 +94,15 @@ def review_sql(
     user_prompt = _build_user_prompt(user_query, generated_sql, ddl_context, guidelines_context)
 
     try:
-        response = client.chat.completions.create(
+        raw = call_llm(
+            client=client,
             model=model,
-            messages=[
-                ChatCompletionSystemMessageParam(
-                    role="system", content=_REVIEWER_SYSTEM_PROMPT
-                ),
-                ChatCompletionUserMessageParam(role="user", content=user_prompt),
-            ],
+            system_prompt=_REVIEWER_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            max_tokens=2048,
             temperature=0.0,
         )
-        raw = (response.choices[0].message.content or "").strip()
-    except openai.OpenAIError as exc:
+    except Exception as exc:  # noqa: BLE001
         _log.warning("[sql_reviewer] LLM call failed: %s — treating as approved.", exc)
         return ReviewResult(approved=True)
 

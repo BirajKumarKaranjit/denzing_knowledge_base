@@ -1,308 +1,175 @@
 """unit_tests/test_sql_reviewer.py
-
-Unit tests for sql_validator.sql_reviewer.
-
-All tests are network-free: the OpenAI client is replaced by a stub that
-returns a controlled raw response string.
-
+Unit tests for sql_validator.sql_reviewer and utils.llm_client.
+All tests are network-free: call_llm is patched at the module level so no
+real LLM calls are made.
 Run with:
     pytest unit_tests/test_sql_reviewer.py -v
 """
-
 from __future__ import annotations
-
 import sys
 import os
 from unittest.mock import MagicMock, patch
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import pytest
-
-from sql_validator.sql_reviewer import (
-    ReviewResult,
-    review_sql,
-    _parse_response,
-    _build_user_prompt,
-)
+from sql_validator.sql_reviewer import ReviewResult, review_sql, _parse_response, _build_user_prompt
 from sql_validator.schema_linker import build_column_registry
 from sql_validator.sql_verifier import verify_sql
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 _SIMPLE_SQL = (
     "SELECT p.full_name, SUM(pb.points) AS total_points "
     "FROM dwh_f_player_boxscore pb "
     "JOIN dwh_d_players p ON pb.player_id = p.player_id "
     "GROUP BY p.full_name ORDER BY total_points DESC LIMIT 10"
 )
-
 _DDL = "CREATE TABLE dwh_d_players (player_id text, full_name text, position text);"
 _GUIDELINES = "Always use table aliases. Apply ILIKE for text filters."
-
-
-def _make_client(content: str) -> MagicMock:
-    """Build a minimal OpenAI client stub returning *content* as the LLM response."""
-    choice = MagicMock()
-    choice.message.content = content
-    response = MagicMock()
-    response.choices = [choice]
-    client = MagicMock()
-    client.chat.completions.create.return_value = response
-    return client
-
-
-# ---------------------------------------------------------------------------
-# _parse_response
-# ---------------------------------------------------------------------------
-
+_CALL_LLM_PATCH = "sql_validator.sql_reviewer.call_llm"
+def _make_client() -> MagicMock:
+    return MagicMock()
 class TestParseResponse:
     def test_approved_simple(self):
-        result = _parse_response("APPROVED")
-        assert result.approved is True
-        assert result.revised_sql is None
-        assert result.changes == []
-
-    def test_approved_with_trailing_whitespace(self):
-        result = _parse_response("  APPROVED  ")
-        assert result.approved is True
-
+        r = _parse_response("APPROVED")
+        assert r.approved is True and r.revised_sql is None and r.changes == []
+    def test_approved_with_whitespace(self):
+        assert _parse_response("  APPROVED  ").approved is True
     def test_revised_with_sql_and_changes(self):
-        raw = (
-            "REVISED\n"
-            "```sql\n"
-            "SELECT full_name FROM dwh_d_players;\n"
-            "```\n"
-            "CHANGES:\n"
-            "- Added missing column to SELECT\n"
-            "- Removed unnecessary JOIN\n"
-        )
-        result = _parse_response(raw)
-        assert result.approved is False
-        assert result.revised_sql == "SELECT full_name FROM dwh_d_players;"
-        assert len(result.changes) == 2
-        assert "Added missing column" in result.changes[0]
-        assert "Removed unnecessary JOIN" in result.changes[1]
-
-    def test_revised_no_sql_block_treated_as_approved(self):
-        raw = "REVISED\nCHANGES:\n- something changed\n"
-        result = _parse_response(raw)
-        assert result.approved is True
-
-    def test_unparseable_response_treated_as_approved(self):
-        result = _parse_response("I cannot determine this.")
-        assert result.approved is True
-
-    def test_empty_string_treated_as_approved(self):
-        result = _parse_response("")
-        assert result.approved is True
-
-    def test_revised_sql_block_with_language_tag(self):
-        raw = (
-            "REVISED\n"
-            "```sql\nSELECT id FROM t;\n```\n"
-            "CHANGES:\n- Fixed column reference\n"
-        )
-        result = _parse_response(raw)
-        assert result.approved is False
-        assert result.revised_sql == "SELECT id FROM t;"
-
+        raw = "REVISED\n```sql\nSELECT x;\n```\nCHANGES:\n- Fix A\n- Fix B\n"
+        r = _parse_response(raw)
+        assert not r.approved
+        assert r.revised_sql == "SELECT x;"
+        assert len(r.changes) == 2
+    def test_revised_no_sql_block_approved(self):
+        assert _parse_response("REVISED\nCHANGES:\n- x\n").approved is True
+    def test_unparseable_approved(self):
+        assert _parse_response("cannot determine").approved is True
+    def test_empty_approved(self):
+        assert _parse_response("").approved is True
     def test_revised_no_changes_section(self):
-        raw = "REVISED\n```sql\nSELECT 1;\n```\n"
-        result = _parse_response(raw)
-        assert result.approved is False
-        assert result.revised_sql == "SELECT 1;"
-        assert result.changes == []
-
-    def test_changes_list_stripped_correctly(self):
-        raw = (
-            "REVISED\n"
-            "```sql\nSELECT x FROM t;\n```\n"
-            "CHANGES:\n"
-            "-  Leading spaces trimmed  \n"
-            "-  Another change\n"
-        )
-        result = _parse_response(raw)
-        assert result.changes[0] == "Leading spaces trimmed"
-        assert result.changes[1] == "Another change"
-
-
-# ---------------------------------------------------------------------------
-# _build_user_prompt
-# ---------------------------------------------------------------------------
-
+        r = _parse_response("REVISED\n```sql\nSELECT 1;\n```\n")
+        assert not r.approved and r.revised_sql == "SELECT 1;" and r.changes == []
+    def test_changes_stripped(self):
+        raw = "REVISED\n```sql\nSELECT 1;\n```\nCHANGES:\n-  A trimmed  \n-  B\n"
+        r = _parse_response(raw)
+        assert r.changes == ["A trimmed", "B"]
 class TestBuildUserPrompt:
-    def test_contains_all_sections(self):
-        prompt = _build_user_prompt("Q?", "SELECT 1;", "DDL here", "Guidelines here")
-        assert "Q?" in prompt
-        assert "SELECT 1;" in prompt
-        assert "DDL here" in prompt
-        assert "Guidelines here" in prompt
-
-    def test_empty_ddl_section_omitted(self):
-        prompt = _build_user_prompt("Q?", "SELECT 1;", "", "Guidelines here")
-        assert "RELEVANT TABLE DDL" not in prompt
-        assert "Guidelines here" in prompt
-
-    def test_empty_guidelines_section_omitted(self):
-        prompt = _build_user_prompt("Q?", "SELECT 1;", "DDL here", "   ")
-        assert "SQL GUIDELINES" not in prompt
-        assert "DDL here" in prompt
-
-    def test_sql_wrapped_in_code_block(self):
-        prompt = _build_user_prompt("Q?", "SELECT 1;", "", "")
-        assert "```sql" in prompt
-        assert "SELECT 1;" in prompt
-
-
-# ---------------------------------------------------------------------------
-# review_sql — approved path
-# ---------------------------------------------------------------------------
-
+    def test_all_sections_present(self):
+        p = _build_user_prompt("Q?", "SELECT 1;", "DDL", "Guidelines")
+        assert all(s in p for s in ["Q?", "SELECT 1;", "DDL", "Guidelines"])
+    def test_empty_ddl_omitted(self):
+        p = _build_user_prompt("Q?", "SELECT 1;", "", "Guidelines")
+        assert "RELEVANT TABLE DDL" not in p
+    def test_empty_guidelines_omitted(self):
+        p = _build_user_prompt("Q?", "SELECT 1;", "DDL", "   ")
+        assert "SQL GUIDELINES" not in p
+    def test_sql_in_code_block(self):
+        p = _build_user_prompt("Q?", "SELECT 1;", "", "")
+        assert "```sql" in p and "SELECT 1;" in p
 class TestReviewSQLApproved:
     def test_approved_response(self):
-        client = _make_client("APPROVED")
-        result = review_sql("query", _SIMPLE_SQL, _DDL, _GUIDELINES, client, "gpt-4o")
-        assert result.approved is True
-        assert result.revised_sql is None
-        assert result.changes == []
-
-    def test_openai_error_treated_as_approved(self):
-        import openai as _openai
-        client = MagicMock()
-        client.chat.completions.create.side_effect = _openai.OpenAIError("timeout")
-        result = review_sql("query", _SIMPLE_SQL, _DDL, _GUIDELINES, client, "gpt-4o")
-        assert result.approved is True
-
-    def test_unparseable_llm_response_treated_as_approved(self):
-        client = _make_client("I'm not sure how to review this SQL.")
-        result = review_sql("query", _SIMPLE_SQL, _DDL, _GUIDELINES, client, "gpt-4o")
-        assert result.approved is True
-
-
-# ---------------------------------------------------------------------------
-# review_sql — revised path
-# ---------------------------------------------------------------------------
-
+        with patch(_CALL_LLM_PATCH, return_value="APPROVED"):
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+        assert r.approved is True and r.revised_sql is None and r.changes == []
+    def test_exception_treated_as_approved(self):
+        with patch(_CALL_LLM_PATCH, side_effect=RuntimeError("err")):
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+        assert r.approved is True
+    def test_unparseable_treated_as_approved(self):
+        with patch(_CALL_LLM_PATCH, return_value="dunno"):
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+        assert r.approved is True
 class TestReviewSQLRevised:
-    def test_revised_response_parsed(self):
-        raw = (
-            "REVISED\n"
-            "```sql\nSELECT full_name, total_points FROM stats;\n```\n"
-            "CHANGES:\n"
-            "- Added season_year to SELECT for context\n"
-        )
-        client = _make_client(raw)
-        result = review_sql("query", _SIMPLE_SQL, _DDL, _GUIDELINES, client, "gpt-4o")
-        assert result.approved is False
-        assert "SELECT full_name, total_points FROM stats;" in (result.revised_sql or "")
-        assert len(result.changes) == 1
-
-    def test_llm_called_with_correct_model(self):
-        client = _make_client("APPROVED")
-        review_sql("q", "SELECT 1;", "", "", client, "gpt-4o-mini")
-        call_kwargs = client.chat.completions.create.call_args
-        assert call_kwargs.kwargs.get("model") == "gpt-4o-mini"
-
+    def test_revised_parsed(self):
+        raw = "REVISED\n```sql\nSELECT x;\n```\nCHANGES:\n- Added x\n"
+        with patch(_CALL_LLM_PATCH, return_value=raw):
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+        assert not r.approved and "SELECT x;" in r.revised_sql
+    def test_model_forwarded(self):
+        with patch(_CALL_LLM_PATCH, return_value="APPROVED") as m:
+            review_sql("q", "SELECT 1;", "", "", _make_client(), "gpt-4o-mini")
+        assert m.call_args.kwargs["model"] == "gpt-4o-mini"
     def test_temperature_zero(self):
-        client = _make_client("APPROVED")
-        review_sql("q", "SELECT 1;", "", "", client, "gpt-4o")
-        call_kwargs = client.chat.completions.create.call_args
-        assert call_kwargs.kwargs.get("temperature") == 0.0
-
-    def test_system_prompt_included(self):
-        client = _make_client("APPROVED")
-        review_sql("q", "SELECT 1;", "", "", client, "gpt-4o")
-        messages = client.chat.completions.create.call_args.kwargs["messages"]
-        system_msgs = [m for m in messages if m["role"] == "system"]
-        assert len(system_msgs) == 1
-        assert "SQL quality reviewer" in system_msgs[0]["content"]
-
-    def test_user_query_in_user_message(self):
-        client = _make_client("APPROVED")
-        review_sql("What is the top scorer?", "SELECT 1;", "", "", client, "gpt-4o")
-        messages = client.chat.completions.create.call_args.kwargs["messages"]
-        user_msgs = [m for m in messages if m["role"] == "user"]
-        assert any("What is the top scorer?" in m["content"] for m in user_msgs)
-
-
-# ---------------------------------------------------------------------------
-# Integration: reviewer + schema verifier guard
-# ---------------------------------------------------------------------------
-
+        with patch(_CALL_LLM_PATCH, return_value="APPROVED") as m:
+            review_sql("q", "SELECT 1;", "", "", _make_client(), "gpt-4o")
+        assert m.call_args.kwargs["temperature"] == 0.0
+    def test_system_prompt_contains_reviewer_text(self):
+        with patch(_CALL_LLM_PATCH, return_value="APPROVED") as m:
+            review_sql("q", "SELECT 1;", "", "", _make_client(), "gpt-4o")
+        assert "SQL quality reviewer" in m.call_args.kwargs["system_prompt"]
+    def test_user_prompt_contains_query(self):
+        with patch(_CALL_LLM_PATCH, return_value="APPROVED") as m:
+            review_sql("top scorer?", "SELECT 1;", "", "", _make_client(), "gpt-4o")
+        assert "top scorer?" in m.call_args.kwargs["user_prompt"]
 class TestReviewerWithSchemaGuard:
-    """Simulates the main.py logic: if reviewer proposes a revised SQL,
-    run schema verification on it before accepting."""
-
     @pytest.fixture()
     def nba_registry(self):
         from utils.sample_values_for_testing import Sample_NBA_DDL_DICT
         return build_column_registry(Sample_NBA_DDL_DICT)
-
-    def test_valid_revised_sql_accepted(self, nba_registry):
+    def test_valid_revised_accepted(self, nba_registry):
         revised = (
-            "SELECT p.full_name, SUM(pb.points) AS total_points, COUNT(*) AS games_played "
+            "SELECT p.full_name, SUM(pb.points) AS pts, COUNT(*) AS gp "
             "FROM dwh_f_player_boxscore pb "
             "JOIN dwh_d_players p ON pb.player_id = p.player_id "
-            "GROUP BY p.full_name ORDER BY total_points DESC LIMIT 10"
+            "GROUP BY p.full_name ORDER BY pts DESC LIMIT 10"
         )
         raw = f"REVISED\n```sql\n{revised}\n```\nCHANGES:\n- Added games_played\n"
-        client = _make_client(raw)
-        result = review_sql("top scorers?", _SIMPLE_SQL, _DDL, _GUIDELINES, client, "gpt-4o")
-
-        assert result.approved is False
-        assert result.revised_sql is not None
-
-        schema_check = verify_sql(result.revised_sql, nba_registry)
-        assert schema_check.is_valid
-        # Schema passed → use revised SQL
-        final_sql = result.revised_sql
-
-        assert "games_played" in final_sql
-
-    def test_hallucinated_column_in_revised_rejected(self, nba_registry):
+        with patch(_CALL_LLM_PATCH, return_value=raw):
+            r = review_sql("top?", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+        assert not r.approved
+        assert verify_sql(r.revised_sql, nba_registry).is_valid
+    def test_hallucinated_column_rejected(self, nba_registry):
         revised = (
-            "SELECT p.full_name, pb.season_year "  # season_year does not live on pb
+            "SELECT p.full_name, pb.season_year "
             "FROM dwh_f_player_boxscore pb "
             "JOIN dwh_d_players p ON pb.player_id = p.player_id"
         )
         raw = f"REVISED\n```sql\n{revised}\n```\nCHANGES:\n- Added season_year\n"
-        client = _make_client(raw)
-        result = review_sql("query", _SIMPLE_SQL, _DDL, _GUIDELINES, client, "gpt-4o")
-
-        assert result.approved is False
-        assert result.revised_sql is not None
-
-        schema_check = verify_sql(result.revised_sql, nba_registry)
-        # Schema fails → fall back to original SQL
-        assert not schema_check.is_valid
-        final_sql = _SIMPLE_SQL  # original kept
-
-        assert "season_year" not in final_sql
-
-    def test_approved_sql_passes_through_unchanged(self, nba_registry):
-        client = _make_client("APPROVED")
-        result = review_sql("top scorers?", _SIMPLE_SQL, _DDL, _GUIDELINES, client, "gpt-4o")
-
-        assert result.approved is True
-        # No schema re-check needed — original SQL used directly
-        schema_check = verify_sql(_SIMPLE_SQL, nba_registry)
-        assert schema_check.is_valid
-
-    def test_reviewer_disabled_skips_entirely(self):
-        """Simulate SQL_REVIEWER_ENABLED=False — review_sql is never called."""
-        client = _make_client("APPROVED")
-        sql_reviewer_enabled = False
-
-        final_sql = _SIMPLE_SQL
-        if sql_reviewer_enabled:
-            result = review_sql("q", final_sql, "", "", client, "gpt-4o")
-            if not result.approved and result.revised_sql:
-                final_sql = result.revised_sql
-
-        client.chat.completions.create.assert_not_called()
-        assert final_sql == _SIMPLE_SQL
-
+        with patch(_CALL_LLM_PATCH, return_value=raw):
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+        assert not r.approved
+        assert not verify_sql(r.revised_sql, nba_registry).is_valid
+    def test_approved_passes_through(self, nba_registry):
+        with patch(_CALL_LLM_PATCH, return_value="APPROVED"):
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+        assert r.approved and verify_sql(_SIMPLE_SQL, nba_registry).is_valid
+    def test_reviewer_disabled_skips(self):
+        with patch(_CALL_LLM_PATCH) as m:
+            if False:  # SQL_REVIEWER_ENABLED=False
+                review_sql("q", _SIMPLE_SQL, "", "", _make_client(), "gpt-4o")
+            m.assert_not_called()
+class TestGetLlmClient:
+    def test_openai_client_returned(self):
+        from utils.llm_client import get_llm_client
+        import openai
+        client = get_llm_client("openai", "sk-fake-key")
+        assert isinstance(client, openai.OpenAI)
+    def test_unknown_provider_raises(self):
+        from utils.llm_client import get_llm_client
+        with pytest.raises(ValueError, match="Unsupported provider"):
+            get_llm_client("gemini", "key")  # type: ignore[arg-type]
+class TestCallLlmOpenAI:
+    def test_returns_response_text(self):
+        from utils.llm_client import call_llm
+        import openai
+        client = openai.OpenAI(api_key="sk-fake")
+        choice = MagicMock()
+        choice.message.content = "hello from llm"
+        mock_resp = MagicMock()
+        mock_resp.choices = [choice]
+        with patch.object(client.chat.completions, "create", return_value=mock_resp):
+            text = call_llm(client, "gpt-4o", "sys", "user")
+        assert text == "hello from llm"
+    def test_passes_model_and_temperature(self):
+        from utils.llm_client import call_llm
+        import openai
+        client = openai.OpenAI(api_key="sk-fake")
+        choice = MagicMock()
+        choice.message.content = ""
+        mock_resp = MagicMock()
+        mock_resp.choices = [choice]
+        with patch.object(client.chat.completions, "create", return_value=mock_resp) as mc:
+            call_llm(client, "gpt-4o-mini", "sys", "user", temperature=0.5)
+        kw = mc.call_args.kwargs
+        assert kw["model"] == "gpt-4o-mini" and kw["temperature"] == 0.5
+    def test_unknown_client_raises(self):
+        from utils.llm_client import call_llm
+        with pytest.raises(TypeError, match="Unrecognised client type"):
+            call_llm(MagicMock(), "model", "sys", "user")

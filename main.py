@@ -20,7 +20,15 @@ Pipeline order:
 
 from __future__ import annotations
 
-from utils.config import overwrite, NBA_POSTGRES_DSN, POSTGRES_DSN, SQL_REVIEWER_ENABLED, SQL_REVIEWER_MODEL
+from utils.config import (
+    overwrite,
+    NBA_POSTGRES_DSN,
+    POSTGRES_DSN,
+    SQL_REVIEWER_ENABLED,
+    SQL_REVIEWER_MODEL,
+    SQL_REVIEWER_PROVIDER,
+    SQL_REVIEWER_API_KEY,
+)
 from utils.sample_values_for_testing import Sample_NBA_DDL_DICT
 from sql_validator.schema_linker import build_column_registry
 import sys
@@ -234,8 +242,7 @@ def cmd_query(user_query: str) -> None:
     from sql_generator import generate_sql, extract_sql_from_response, is_query_relevant, answer_meta_query, build_retry_prompt
     from sql_validator.sql_verifier import verify_sql
     from sql_validator.sql_reviewer import review_sql
-    import openai as _openai
-    from utils.config import OPENAI_API_KEY
+    from utils.llm_client import get_llm_client
 
     print(f"\n{'=' * 60}")
     print(f"  Query: {user_query}")
@@ -357,7 +364,7 @@ def cmd_query(user_query: str) -> None:
 
     # --- SQL Reviewer: LLM quality gate (runs after schema verification) ---
     if SQL_REVIEWER_ENABLED:
-        _reviewer_client = _openai.OpenAI(api_key=OPENAI_API_KEY)
+        _reviewer_client = get_llm_client(SQL_REVIEWER_PROVIDER, SQL_REVIEWER_API_KEY)
         ddl_context = _build_ddl_context(retrieval_result)
         guidelines_context = _build_guidelines_context(retrieval_result)
 
