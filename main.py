@@ -20,7 +20,7 @@ Pipeline order:
 
 from __future__ import annotations
 
-from utils.config import overwrite, NBA_POSTGRES_DSN, POSTGRES_DSN
+from utils.config import overwrite, NBA_POSTGRES_DSN, POSTGRES_DSN, SQL_REVIEWER_ENABLED, SQL_REVIEWER_MODEL
 from utils.sample_values_for_testing import Sample_NBA_DDL_DICT
 from sql_validator.schema_linker import build_column_registry
 import sys
@@ -192,6 +192,33 @@ def _print_table(headers: list[str], rows: list[tuple]) -> None:
     print()
 
 
+def _build_ddl_context(retrieval_result: dict) -> str:
+    """Concatenate DDL content from matched tables in *retrieval_result*."""
+    chunks: list[str] = []
+    for table in retrieval_result.get("matched_tables", []):
+        content = (table.get("content") or "").strip()
+        if content:
+            chunks.append(content)
+    return "\n\n".join(chunks)
+
+
+def _build_guidelines_context(retrieval_result: dict) -> str:
+    """Concatenate SQL guideline content from *retrieval_result*."""
+    chunks: list[str] = []
+    for guideline in retrieval_result.get("matched_sql_guidelines", []):
+        content = (guideline.get("content") or "").strip()
+        if content:
+            chunks.append(content)
+    for section_data in retrieval_result.get("always_inject", {}).values():
+        if not isinstance(section_data, dict):
+            continue
+        for sub_file in section_data.get("sub_files", []):
+            content = (sub_file.get("content") or "").strip()
+            if content:
+                chunks.append(content)
+    return "\n\n".join(chunks)
+
+
 def cmd_query(user_query: str) -> None:
     """Run a full pipeline query: relevance gate → retrieve → assemble → generate SQL → PEER.
 
@@ -206,6 +233,9 @@ def cmd_query(user_query: str) -> None:
     from utils.prompt_builder import build_sql_prompt
     from sql_generator import generate_sql, extract_sql_from_response, is_query_relevant, answer_meta_query, build_retry_prompt
     from sql_validator.sql_verifier import verify_sql
+    from sql_validator.sql_reviewer import review_sql
+    import openai as _openai
+    from utils.config import OPENAI_API_KEY
 
     print(f"\n{'=' * 60}")
     print(f"  Query: {user_query}")
@@ -324,6 +354,39 @@ def cmd_query(user_query: str) -> None:
         print(f"{'=' * 60}")
         print(final_sql)
         print(f"{'=' * 60}\n")
+
+    # --- SQL Reviewer: LLM quality gate (runs after schema verification) ---
+    if SQL_REVIEWER_ENABLED:
+        _reviewer_client = _openai.OpenAI(api_key=OPENAI_API_KEY)
+        ddl_context = _build_ddl_context(retrieval_result)
+        guidelines_context = _build_guidelines_context(retrieval_result)
+
+        review = review_sql(
+            user_query=user_query,
+            generated_sql=final_sql,
+            ddl_context=ddl_context,
+            guidelines_context=guidelines_context,
+            client=_reviewer_client,
+            model=SQL_REVIEWER_MODEL,
+        )
+
+        if review.approved:
+            print("[sql_reviewer] Approved — no changes.")
+        else:
+            print(f"[sql_reviewer] Revised. Changes:")
+            for change in review.changes:
+                print(f"  - {change}")
+
+            revised = review.revised_sql or ""
+            if revised:
+                revised_check = verify_sql(revised, _COLUMN_REGISTRY)
+                if revised_check.is_valid:
+                    final_sql = revised
+                    print("[sql_reviewer] Revised SQL passed schema check — using revised SQL.")
+                else:
+                    print("[sql_reviewer] Revised SQL failed schema check — using original.")
+                    for err in revised_check.errors:
+                        print(f"  [schema] {err.message}")
 
     print(f"\n{'=' * 60}")
     if peer_result.patched:
