@@ -322,7 +322,7 @@ def cmd_query(user_query: str) -> None:
 
         if verification.warnings:
             for w in verification.warnings:
-                print(f"[verifier] Warning: {w}")
+                print(f"\n\n[verifier] Warning: {w}")
 
         if verification.is_valid:
             break

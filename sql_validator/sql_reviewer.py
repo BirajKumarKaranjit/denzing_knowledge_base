@@ -27,15 +27,33 @@ _REVIEWER_SYSTEM_PROMPT = (
     "- Use ONLY table names and column names present in the provided DDL. Never add a column\n"
     "  or table that does not explicitly exist in the DDL.\n"
     "- Do not change the fundamental query approach if it is logically correct.\n"
+    "- Keep fixes minimal — change only what is wrong; preserve the original structure.\n"
     "- Do not add complexity that is not needed to answer the question.\n\n"
     "REVIEW CHECKLIST — flag an issue only if clearly wrong:\n"
     "1. Does the SQL answer what the user actually asked?\n"
+    "   If user intent is ambiguous, do not block — state the assumed interpretation.\n"
     "2. If a CTE computed a value to scope the query, does that value appear in the final SELECT?\n"
     "3. Is the aggregation logic applied at the correct level (per-row vs per-group)?\n"
+    "   Every non-aggregated SELECT column must appear in GROUP BY.\n"
     "4. Are the contextual dimension columns included alongside aggregates\n"
-    "   (time period, entity name, sample size)?\n"
-    "5. Does any JOIN pattern produce duplicate rows before a LIMIT or ORDER BY?\n"
-    "6. Do all UNION ALL branches return the same number of columns?\n\n"
+    "   (time period, entity name, sample size)? Expose human-readable names, not raw IDs.\n"
+    "5. Does any JOIN pattern produce duplicate rows before a LIMIT, ORDER BY, or window function?\n"
+    "   Flag OR conditions inside JOIN (e.g. JOIN t ON f.fk_a = t.id OR f.fk_b = t.id) —\n"
+    "   these multiply rows. Recommend resolving the entity ID in a CTE first, then filter\n"
+    "   using WHERE.\n"
+    "6. Do all UNION ALL branches return the same number of columns?\n"
+    "7. When the question implies a time scope ('this season', 'last game', 'career'),\n"
+    "   is an explicit date or season filter applied or clearly stated as an assumption?\n"
+    "8. If WHERE mixes AND and OR conditions, are parentheses explicit?\n"
+    "   Never rely on implicit operator precedence.\n"
+    "9. For averages: prefer AVG(col) over SUM(col)/COUNT(*) to avoid integer division.\n"
+    "   If integer types are used in division, cast to numeric/float explicitly.\n"
+    "10. For percent or ratio columns, verify the stored range (0–1 vs 0–100) before\n"
+    "    applying any transformation like /100 or *100.\n"
+    "11. If a fuzzy name match (ILIKE) could match multiple entities, flag the ambiguity\n"
+    "    and state which match was assumed.\n"
+    "12. Flag any LIMIT applied inside an intermediate CTE — this silently drops data\n"
+    "    before the final aggregation. LIMIT belongs only on the final SELECT.\n\n"
     "RESPONSE FORMAT — return exactly one of these two formats, nothing else:\n\n"
     "If SQL is correct and complete:\n"
     "APPROVED\n\n"
@@ -103,7 +121,7 @@ def review_sql(
             temperature=0.0,
         )
     except Exception as exc:  # noqa: BLE001
-        _log.warning("[sql_reviewer] LLM call failed: %s — treating as approved.", exc)
+        _log.warning("\n[sql_reviewer] LLM call failed: %s — treating as approved.", exc)
         return ReviewResult(approved=True)
 
     return _parse_response(raw)
