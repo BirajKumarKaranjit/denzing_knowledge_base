@@ -138,6 +138,19 @@ ORDER BY g.game_date DESC LIMIT 1;
 ```
 
 ---
+## Data Granularity Limitations
+
+If the question requires a level of detail not present in the schema
+(sub-record, event-level, or time-slice granularity), do not silently
+answer at a coarser level. Prepend the SQL result with a clear note:
+
+```sql
+-- NOTE: <required granularity> is not available in the schema.
+--       This query returns <what is actually computed> as the closest approximation.
+```
+
+Never return a plausible-looking result without disclosing that the question
+could not be fully answered with the available data.
 
 ## Quick Reference
 

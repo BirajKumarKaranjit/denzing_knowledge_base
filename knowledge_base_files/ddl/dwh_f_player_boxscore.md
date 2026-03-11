@@ -136,6 +136,7 @@ CREATE TABLE dwh_f_player_boxscore (
 - **technical_foul_description1**: Description of the first technical foul. Nullable.
 - **technical_foul_description2**: Description of the second technical foul. Nullable.
 
+
 ## Common Query Patterns
 
 - Retrieve player performance metrics for a specific game: `SELECT * FROM dwh_f_player_boxscore WHERE game_id = 'game123';`

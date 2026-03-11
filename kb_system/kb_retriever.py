@@ -48,9 +48,7 @@ _CROSS_ENCODER_CANDIDATE_K: int = 10
 _ELBOW_DROP_THRESHOLD: float = 0.50
 
 # Top-N tables for FK expansion after re-ranking.
-# Only expand FKs from the single top-ranked table.  Expanding from rank 2+ pulls in dimension tables that are already present via rank-1 expansion,
-# wasting tokens without adding new information.
-_FK_EXPANSION_TOP_N: int = 1
+_FK_EXPANSION_TOP_N: int = 2
 
 _SECTION_DESCRIPTIONS: dict[str, str] = {
     "ddl": (

@@ -344,11 +344,38 @@ def cmd_query(user_query: str) -> None:
             break
 
         # First failure — regenerate once with the schema error context.
+        # Collect every table that appears in the errors and inject its full
+        # column list from the registry so the LLM cannot guess again.
+        affected_tables: set[str] = set()
+        for e in verification.errors:
+            if e.table and e.table in _COLUMN_REGISTRY:
+                affected_tables.add(e.table)
+            # wrong_table_for_column errors carry the suggestion text
+            # "It exists on: ['t1', 't2']" — extract those too so the LLM
+            # knows the correct table's columns as well.
+            if e.suggestion:
+                for t in _COLUMN_REGISTRY:
+                    if t in (e.suggestion or ""):
+                        affected_tables.add(t)
+
+        table_column_reference = ""
+        if affected_tables:
+            lines = [
+                "\n\n## ACTUAL COLUMN LISTS FOR AFFECTED TABLES\n",
+                "Use ONLY the columns listed below for each table. "
+                "Do not reference any column not in this list.\n",
+            ]
+            for t in sorted(affected_tables):
+                cols = ", ".join(_COLUMN_REGISTRY[t])
+                lines.append(f"- **{t}**: {cols}")
+            table_column_reference = "\n".join(lines)
+
         schema_error_block = (
             "\n\n## SCHEMA VALIDATION ERRORS\n\n"
             "The SQL you generated contains column references that do not match the DDL.\n"
             "Fix only the column/table errors listed below. Do not change the query logic.\n\n"
             + "\n".join(f"- {e.message}" for e in verification.errors)
+            + table_column_reference
         )
         verify_retry_prompt = prompt + schema_error_block
         verify_retry_response = generate_sql(verify_retry_prompt)
