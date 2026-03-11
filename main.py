@@ -22,7 +22,12 @@ from __future__ import annotations
 
 from utils.config import overwrite, NBA_POSTGRES_DSN, POSTGRES_DSN
 from utils.sample_values_for_testing import Sample_NBA_DDL_DICT
+from sql_validator.schema_linker import build_column_registry
 import sys
+
+# Build the column registry once at startup from the known DDL.
+# Used by the SQL verifier to catch column hallucinations before execution.
+_COLUMN_REGISTRY: dict[str, list[str]] = build_column_registry(Sample_NBA_DDL_DICT)
 
 
 def _build_schema_context(ddl_dict: dict[str, str]) -> str:
@@ -200,6 +205,7 @@ def cmd_query(user_query: str) -> None:
     from kb_system.peer import run_peer
     from utils.prompt_builder import build_sql_prompt
     from sql_generator import generate_sql, extract_sql_from_response, is_query_relevant, answer_meta_query, build_retry_prompt
+    from sql_validator.sql_verifier import verify_sql
 
     print(f"\n{'=' * 60}")
     print(f"  Query: {user_query}")
@@ -266,6 +272,59 @@ def cmd_query(user_query: str) -> None:
 
     final_sql = peer_result.sql
 
+    # --- SQL Verification: catch column hallucinations before hitting the DB ---
+    # verification_attempts tracks how many verify_sql calls have been made.
+    # Max is 2: one for the initial SQL, one for the regenerated SQL.
+    # After 2 attempts the SQL proceeds to execution regardless of remaining errors.
+    verification_attempts: int = 0
+    _MAX_VERIFICATION_ATTEMPTS: int = 2
+
+    while verification_attempts < _MAX_VERIFICATION_ATTEMPTS:
+        verification = verify_sql(final_sql, _COLUMN_REGISTRY)
+        verification_attempts += 1
+
+        if verification.warnings:
+            for w in verification.warnings:
+                print(f"[verifier] Warning: {w}")
+
+        if verification.is_valid:
+            break
+
+        # Verification failed — decide whether to regenerate or fall through.
+        print(
+            f"\n[verifier] Schema errors detected (attempt {verification_attempts}"
+            f"/{_MAX_VERIFICATION_ATTEMPTS}):"
+        )
+        for err in verification.errors:
+            print(f"  [{err.error_type}] {err.message}")
+
+        if verification_attempts >= _MAX_VERIFICATION_ATTEMPTS:
+            # Second failure — log as warnings and send to execution as-is.
+            print(
+                "[verifier] Max verification attempts reached. "
+                "Proceeding to execution with remaining schema warnings."
+            )
+            break
+
+        # First failure — regenerate once with the schema error context.
+        schema_error_block = (
+            "\n\n## SCHEMA VALIDATION ERRORS\n\n"
+            "The SQL you generated contains column references that do not match the DDL.\n"
+            "Fix only the column/table errors listed below. Do not change the query logic.\n\n"
+            + "\n".join(f"- {e.message}" for e in verification.errors)
+        )
+        verify_retry_prompt = prompt + schema_error_block
+        verify_retry_response = generate_sql(verify_retry_prompt)
+        verify_retry_sql = extract_sql_from_response(verify_retry_response)
+        verify_peer = run_peer(verify_retry_sql, remote_conn)
+        final_sql = verify_peer.sql
+
+        print(f"\n{'=' * 60}")
+        print("  Verification-Corrected SQL (attempt 2):")
+        print(f"{'=' * 60}")
+        print(final_sql)
+        print(f"{'=' * 60}\n")
+
     print(f"\n{'=' * 60}")
     if peer_result.patched:
         print("  Generated SQL (PEER-patched):")
@@ -274,8 +333,6 @@ def cmd_query(user_query: str) -> None:
     print(f"{'=' * 60}")
     print(final_sql)
     print(f"{'=' * 60}\n")
-    final_sql="SELECT p.ffull_name, g.season_year, COUNT(DISTINCT pb.game_id) AS games_played, SUM(pb.points) AS total_points, ROUND(AVG(pb.points)::NUMERIC, 1) AS points_per_game, ROUND(AVG(pb.assists)::NUMERIC, 1) AS assists_per_game,  ROUND(AVG(pb.rebounds_offensive + pb.rebounds_defensive)::NUMERIC, 1) AS rebounds_per_game FROM dwh_f_player_boxscore pb JOIN dwh_d_players p ON pb.player_id = p.player_id JOIN dwh_d_games g ON pb.game_id = g.game_id WHERE p.full_name ILIKE '%LeBron James%' AND g.game_type ILIKE '%Regular Season%' AND g.season_year = '2022' GROUP BY p.full_name, g.season_year;"
-
     print("[executor] Executing SQL against remote database...")
     success, exec_error = _execute_sql(final_sql)
 
