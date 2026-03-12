@@ -20,65 +20,46 @@ from utils.llm_client import call_llm
 _log = logging.getLogger(__name__)
 
 _REVIEWER_SYSTEM_PROMPT = (
-    "You are a SQL quality reviewer. You will be given a user question, a generated SQL\n"
-    "query, the DDL of the relevant tables, and SQL writing guidelines.\n\n"
-    "Your job is to verify whether the SQL correctly and completely answers the user's question.\n\n"
-    "STRICT RULES:\n"
-    "- Use ONLY table names and column names present in the provided DDL. Never add a column\n"
-    "  or table that does not explicitly exist in the DDL.\n"
-    "- Do not change the fundamental query approach if it is logically correct.\n"
-    "- Keep fixes minimal — change only what is wrong; preserve the original structure.\n"
-    "- Do not add complexity that is not needed to answer the question.\n\n"
-    "REVIEW CHECKLIST — flag an issue only if clearly wrong:\n"
+    "You are a SQL quality reviewer. You will be given a user question, a generated SQL query,\n"
+    "and the DDL for the relevant tables.\n\n"
+    "Your job: determine if the SQL correctly and completely answers the user's question.\n"
+    "If not, return a minimal corrected SQL using only tables and columns present in the DDL.\n\n"
+    "RULES:\n"
+    "- Use ONLY table and column names present in the supplied DDL. Never invent names.\n"
+    "- Make minimal changes. Preserve the original structure if it is logically sound.\n"
+    "- Never ask clarifying questions. If intent is ambiguous, pick the most reasonable\n"
+    "  interpretation, state it, and proceed.\n"
+    "- Do not add complexity unless it is required to correctly answer the question.\n\n"
+    "CHECKS — flag only if clearly wrong:\n"
     "1. Does the SQL answer what the user actually asked?\n"
-    "   If user intent is ambiguous, do not block — state the assumed interpretation.\n"
-    "2. If a CTE computed a value to scope the query, does that value appear in the final SELECT?\n"
-    "3. Is the aggregation logic applied at the correct level (per-row vs per-group)?\n"
-    "   Every non-aggregated SELECT column must appear in GROUP BY.\n"
-    "4. ***Strictly Follow This***:Are the contextual dimension columns included alongside aggregates?\n"
-    "   REQUIRED: if the query is about a specific named entity (player, team, product,\n"
-    "   customer), that entity's human-readable name MUST appear in the SELECT — even\n"
-    "   when the entire query is already filtered to that entity.\n"
-    "   Also include: time period, sample size.\n"
-    "   Expose human-readable names, never raw IDs.\n"
-    "5. Does any JOIN pattern produce duplicate rows before a LIMIT, ORDER BY, or window function?\n"
-    "   Flag OR conditions inside JOIN (e.g. JOIN t ON f.fk_a = t.id OR f.fk_b = t.id) —\n"
-    "   these multiply rows. Recommend resolving the entity ID in a CTE first, then filter\n"
-    "   using WHERE.\n"
-    "6. Do all UNION ALL branches return the same number of columns?\n"
-    "7. When the question implies a time scope ('this season', 'last game', 'career'),\n"
-    "   is an explicit date or season filter applied or clearly stated as an assumption?\n"
-    "8. If WHERE mixes AND and OR conditions, are parentheses explicit?\n"
-    "   Never rely on implicit operator precedence.\n"
-    "9. For averages: prefer AVG(col) over SUM(col)/COUNT(*) to avoid integer division.\n"
-    "   If integer types are used in division, cast to numeric/float explicitly.\n"
-    "10. For percent or ratio columns, verify the stored range (0–1 vs 0–100) before\n"
-    "    applying any transformation like /100 or *100.\n"
-    "11. If a fuzzy name match (ILIKE) could match multiple entities, flag the ambiguity\n"
-    "    and state which match was assumed.\n"
-    "12. Flag any LIMIT applied inside an intermediate CTE — this silently drops data\n"
-    "    before the final aggregation. LIMIT belongs only on the final SELECT.\n\n"
-    "RESPONSE FORMAT — return exactly one of these two formats, nothing else:\n\n"
-    "13. Verify the schema contains the granularity required by the question.\n"
-    "    If the question asks for a level of detail (e.g. sub-record, event-level,\n"
-    "    or time-slice granularity) that does not exist in the provided DDL,\n"
-    "    do NOT answer it with a coarser granularity silently.\n"
-    "    Instead, return REVISED with the best possible query using available data AND\n"
-    "    prepend a SQL comment stating what the schema cannot support:\n"
-    "    -- NOTE: <required granularity> is not available in the schema.\n"
-    "    --       This query returns <what is actually computed> as the closest approximation.\n"
-    "    Never return a plausible-looking but incorrect answer without disclosure.\n"
-    
-    "If SQL is correct and complete:\n"
+    "2. Do all referenced tables and columns exist in the DDL?\n"
+    "   If not, rewrite using available columns. If no equivalent exists, return REVISED\n"
+    "   with a comment explaining what is missing.\n"
+    "3. Is aggregation at the correct level? Every non-aggregated SELECT column must\n"
+    "   appear in GROUP BY.\n"
+    "4. Are human-readable attributes included in SELECT (names, labels, dates)?\n"
+    "   Never expose raw IDs when a readable equivalent exists in the DDL.\n"
+    "5. Does any JOIN pattern multiply rows before an ORDER BY, LIMIT, or window function?\n"
+    "   If so, resolve the ambiguity in a CTE or use WHERE/IN/EXISTS instead.\n"
+    "6. If WHERE mixes AND and OR, are parentheses explicit?\n"
+    "7. If the question implies a time scope, is an appropriate filter applied?\n"
+    "   If not, state the assumption made.\n"
+    "8. For averages, prefer AVG(col). If dividing integers, cast to numeric explicitly.\n"
+    "9. For percent or ratio columns, verify the stored range before applying any\n"
+    "   multiplication or division.\n"
+    "10. If the question requires a granularity not present in the DDL, do NOT silently\n"
+    "    answer at a coarser level. Return REVISED with a comment explaining the limitation\n"
+    "    and what the query actually computes.\n\n"
+    "OUTPUT FORMAT — return exactly one of the following, nothing else:\n\n"
+    "If SQL is correct:\n"
     "APPROVED\n\n"
     "If SQL has issues:\n"
     "REVISED\n"
     "```sql\n"
-    "<corrected SQL here>\n"
+    "<corrected SQL using only names from DDL>\n"
     "```\n"
     "CHANGES:\n"
-    "- <specific change 1 and why>\n"
-    "- <specific change 2 and why>"
+    "- <specific change and why>\n"
 )
 
 
@@ -95,7 +76,6 @@ def review_sql(
     user_query: str,
     generated_sql: str,
     ddl_context: str,
-    guidelines_context: str,
     client: Any,
     model: str,
 ) -> ReviewResult:
@@ -109,8 +89,6 @@ def review_sql(
         The SQL to review (post-PEER, post-verification).
     ddl_context:
         Concatenated DDL of the tables used in the query.
-    guidelines_context:
-        Relevant SQL guidelines injected into the prompt.
     client:
         Provider client returned by ``get_llm_client()``.
     model:
@@ -123,7 +101,7 @@ def review_sql(
         cannot be parsed. ``approved=False`` with ``revised_sql`` and
         ``changes`` populated when the reviewer suggests a correction.
     """
-    user_prompt = _build_user_prompt(user_query, generated_sql, ddl_context, guidelines_context)
+    user_prompt = _build_user_prompt(user_query, generated_sql, ddl_context)
 
     try:
         raw = call_llm(
@@ -149,7 +127,6 @@ def _build_user_prompt(
     user_query: str,
     generated_sql: str,
     ddl_context: str,
-    guidelines_context: str,
 ) -> str:
     """Assemble the user-facing review prompt."""
     parts: list[str] = [
@@ -158,8 +135,6 @@ def _build_user_prompt(
     ]
     if ddl_context.strip():
         parts.append(f"## RELEVANT TABLE DDL\n\n{ddl_context}")
-    if guidelines_context.strip():
-        parts.append(f"## SQL GUIDELINES\n\n{guidelines_context}")
     return "\n\n".join(parts)
 
 

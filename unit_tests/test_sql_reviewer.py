@@ -52,51 +52,50 @@ class TestParseResponse:
         assert r.changes == ["A trimmed", "B"]
 class TestBuildUserPrompt:
     def test_all_sections_present(self):
-        p = _build_user_prompt("Q?", "SELECT 1;", "DDL", "Guidelines")
-        assert all(s in p for s in ["Q?", "SELECT 1;", "DDL", "Guidelines"])
+        p = _build_user_prompt("Q?", "SELECT 1;", "DDL here")
+        assert all(s in p for s in ["Q?", "SELECT 1;", "DDL here"])
+
     def test_empty_ddl_omitted(self):
-        p = _build_user_prompt("Q?", "SELECT 1;", "", "Guidelines")
+        p = _build_user_prompt("Q?", "SELECT 1;", "")
         assert "RELEVANT TABLE DDL" not in p
-    def test_empty_guidelines_omitted(self):
-        p = _build_user_prompt("Q?", "SELECT 1;", "DDL", "   ")
-        assert "SQL GUIDELINES" not in p
+
     def test_sql_in_code_block(self):
-        p = _build_user_prompt("Q?", "SELECT 1;", "", "")
+        p = _build_user_prompt("Q?", "SELECT 1;", "")
         assert "```sql" in p and "SELECT 1;" in p
 class TestReviewSQLApproved:
     def test_approved_response(self):
         with patch(_CALL_LLM_PATCH, return_value="APPROVED"):
-            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _make_client(), "gpt-4o")
         assert r.approved is True and r.revised_sql is None and r.changes == []
     def test_exception_treated_as_approved(self):
         with patch(_CALL_LLM_PATCH, side_effect=RuntimeError("err")):
-            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _make_client(), "gpt-4o")
         assert r.approved is True
     def test_unparseable_treated_as_approved(self):
         with patch(_CALL_LLM_PATCH, return_value="dunno"):
-            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _make_client(), "gpt-4o")
         assert r.approved is True
 class TestReviewSQLRevised:
     def test_revised_parsed(self):
         raw = "REVISED\n```sql\nSELECT x;\n```\nCHANGES:\n- Added x\n"
         with patch(_CALL_LLM_PATCH, return_value=raw):
-            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _make_client(), "gpt-4o")
         assert not r.approved and "SELECT x;" in r.revised_sql
     def test_model_forwarded(self):
         with patch(_CALL_LLM_PATCH, return_value="APPROVED") as m:
-            review_sql("q", "SELECT 1;", "", "", _make_client(), "gpt-4o-mini")
+            review_sql("q", "SELECT 1;", "", _make_client(), "gpt-4o-mini")
         assert m.call_args.kwargs["model"] == "gpt-4o-mini"
     def test_temperature_zero(self):
         with patch(_CALL_LLM_PATCH, return_value="APPROVED") as m:
-            review_sql("q", "SELECT 1;", "", "", _make_client(), "gpt-4o")
+            review_sql("q", "SELECT 1;", "", _make_client(), "gpt-4o")
         assert m.call_args.kwargs["temperature"] == 0.0
     def test_system_prompt_contains_reviewer_text(self):
         with patch(_CALL_LLM_PATCH, return_value="APPROVED") as m:
-            review_sql("q", "SELECT 1;", "", "", _make_client(), "gpt-4o")
+            review_sql("q", "SELECT 1;", "", _make_client(), "gpt-4o")
         assert "SQL quality reviewer" in m.call_args.kwargs["system_prompt"]
     def test_user_prompt_contains_query(self):
         with patch(_CALL_LLM_PATCH, return_value="APPROVED") as m:
-            review_sql("top scorer?", "SELECT 1;", "", "", _make_client(), "gpt-4o")
+            review_sql("top scorer?", "SELECT 1;", "", _make_client(), "gpt-4o")
         assert "top scorer?" in m.call_args.kwargs["user_prompt"]
 class TestReviewerWithSchemaGuard:
     @pytest.fixture()
@@ -112,7 +111,7 @@ class TestReviewerWithSchemaGuard:
         )
         raw = f"REVISED\n```sql\n{revised}\n```\nCHANGES:\n- Added games_played\n"
         with patch(_CALL_LLM_PATCH, return_value=raw):
-            r = review_sql("top?", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+            r = review_sql("top?", _SIMPLE_SQL, _DDL, _make_client(), "gpt-4o")
         assert not r.approved
         assert verify_sql(r.revised_sql, nba_registry).is_valid
     def test_hallucinated_column_rejected(self, nba_registry):
@@ -123,12 +122,12 @@ class TestReviewerWithSchemaGuard:
         )
         raw = f"REVISED\n```sql\n{revised}\n```\nCHANGES:\n- Added season_year\n"
         with patch(_CALL_LLM_PATCH, return_value=raw):
-            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _make_client(), "gpt-4o")
         assert not r.approved
         assert not verify_sql(r.revised_sql, nba_registry).is_valid
     def test_approved_passes_through(self, nba_registry):
         with patch(_CALL_LLM_PATCH, return_value="APPROVED"):
-            r = review_sql("q", _SIMPLE_SQL, _DDL, _GUIDELINES, _make_client(), "gpt-4o")
+            r = review_sql("q", _SIMPLE_SQL, _DDL, _make_client(), "gpt-4o")
         assert r.approved and verify_sql(_SIMPLE_SQL, nba_registry).is_valid
     def test_reviewer_disabled_skips(self):
         with patch(_CALL_LLM_PATCH) as m:

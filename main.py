@@ -395,13 +395,11 @@ def cmd_query(user_query: str) -> None:
     if SQL_REVIEWER_ENABLED:
         _reviewer_client = get_llm_client(SQL_REVIEWER_PROVIDER, SQL_REVIEWER_API_KEY)
         ddl_context = _build_ddl_context(retrieval_result)
-        guidelines_context = _build_guidelines_context(retrieval_result)
 
         review = review_sql(
             user_query=user_query,
             generated_sql=final_sql,
             ddl_context=ddl_context,
-            guidelines_context=guidelines_context,
             client=_reviewer_client,
             model=SQL_REVIEWER_MODEL,
         )
