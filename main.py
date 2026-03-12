@@ -235,6 +235,8 @@ def cmd_query(user_query: str) -> None:
     user_query:
         Natural language question to convert to SQL.
     """
+    import time
+    start_time = time.time()
     from kb_system.kb_store import get_connection
     from kb_system.kb_retriever import retrieve_context_for_query
     from kb_system.peer import run_peer
@@ -479,6 +481,9 @@ def cmd_query(user_query: str) -> None:
             )
 
     print(citation_md)
+    end_time = time.time()
+    Total_Query_Execution_Time = end_time - start_time
+    print(f"\n[main] Total time taken to Execute the query is: {Total_Query_Execution_Time:.2f} seconds")
 
     conn.close()
 
