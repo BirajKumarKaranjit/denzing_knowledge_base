@@ -8,9 +8,10 @@ priority: critical
 # SQL Filtering Guidelines
 
 ---
+#####NOTE: AlLways follow this rule all filters: 
+- If user asks vague questions in which the LLM might get confused whether to return latest game, latest year or what kind of game_type, always default to latest regular season. For example, if user asks "How many points did LeBron James score?" without any time context, interpret as "How many points did LeBron James score in his most recent game?" and apply `ORDER BY g.game_date DESC LIMIT 1` instead of season-level aggregation.
 
 ## RULE 1 — Name Matching: Always ILIKE '%name%', Never =
-
 Player names include suffixes (Jr., II, III) and accents (Jokić). Any `=` match silently returns zero rows when the stored value differs.
 
 ```sql

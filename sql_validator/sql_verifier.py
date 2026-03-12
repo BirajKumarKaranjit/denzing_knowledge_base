@@ -314,10 +314,6 @@ def _check_bare_column(
 
     owning_tables = col_to_tables.get(col_name, set())
     if owning_tables:
-        # Only flag ambiguity when two or more owning tables are actually
-        # present in this query's FROM/JOIN clause.  A bare column on a
-        # single-table FROM is unambiguous at runtime even if other tables
-        # in the registry happen to share the same column name.
         tables_in_scope = owning_tables & tables_in_query
         if len(tables_in_scope) > 1:
             errors.append(
