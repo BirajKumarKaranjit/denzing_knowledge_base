@@ -32,8 +32,6 @@ ORDER BY g.season_year;
 GROUP BY DATE_TRUNC('year', g.game_date)
 ```
 
-**Confirmed successes:** Rows 184, 186, 187.
-
 ---
 
 ## RULE 2 — Current Season: Dynamic MAX, Never Hardcoded Year
@@ -61,8 +59,6 @@ AND g.season_year = (
 )
 ```
 
-**Confirmed successes:** Rows 145, 157, 169, 186, 187.
-
 ---
 
 ## RULE 4 — Rookie Season: Dynamic MIN, Never Hardcoded
@@ -78,9 +74,6 @@ AND g.season_year = (
     )
 )
 ```
-
-**Confirmed failure fixed:** Rows 32, 33. **Confirmed successes:** Rows 58, 59.
-
 ---
 
 ## RULE 5 — Last Game: ORDER BY game_date DESC LIMIT 1, Never CURRENT_DATE
@@ -104,8 +97,6 @@ WHERE g.game_date = CURRENT_DATE - 1
 WHERE g.game_date = CURRENT_DATE
 ```
 
-**Confirmed failure fixed:** Row 62. **Confirmed successes:** Rows 14, 43, 44, 65, 80, 106, 181, 195.
-
 ---
 
 ## RULE 6 — Last N Games: ORDER BY game_date DESC, Never game_id DESC
@@ -119,8 +110,6 @@ ORDER BY g.game_date DESC LIMIT 10
 -- WRONG: game_id may not be chronological
 ORDER BY pb.game_id DESC LIMIT 10
 ```
-
-**Confirmed successes:** Rows 47, 118, 203.
 
 ---
 
@@ -156,8 +145,6 @@ SELECT * FROM team_schedule
 WHERE game_date - prev_game_date = 1;  -- back-to-back
 ```
 
-**Confirmed success:** Row 173.
-
 ---
 
 ## RULE 9 — Player Age at Game Date: EXTRACT(YEAR FROM AGE(...))
@@ -181,25 +168,19 @@ GROUP BY g.season_year
 ORDER BY g.season_year;
 ```
 
-**Confirmed successes:** Rows 127, 128, 184.
-
 ---
 
 ## RULE 10 — Month Filter: EXTRACT or DATE_TRUNC
 
-```sql
--- This month
-WHERE EXTRACT(MONTH FROM g.game_date) = EXTRACT(MONTH FROM CURRENT_DATE)
-  AND EXTRACT(YEAR  FROM g.game_date) = EXTRACT(YEAR  FROM CURRENT_DATE)
+-- Last month (dynamic)
+WHERE EXTRACT(MONTH FROM g.game_date) = EXTRACT(MONTH FROM CURRENT_DATE - INTERVAL '1 month')
+  AND EXTRACT(YEAR  FROM g.game_date) = EXTRACT(YEAR  FROM CURRENT_DATE - INTERVAL '1 month')
 
 -- Named month in a specific year
 WHERE DATE_TRUNC('month', g.game_date) = DATE '2025-01-01'
 
 -- Range filter with explicit dates
 WHERE g.game_date BETWEEN '2025-01-01' AND '2025-01-31'
-```
-
-**Confirmed successes:** Rows 70, 83.
 
 ---
 
@@ -219,6 +200,24 @@ WHERE g.game_date = (
 ```
 
 ---
+## RULE 12 — Always Expose the Time Scope in SELECT
+
+When a query filters by a time period (month, season, date range, last N games),
+always include the resolved time scope as a column in the final SELECT.
+Never return aggregates without context of what period they cover.
+
+-- Month-scoped query: include the month
+SELECT DATE_TRUNC('month', MIN(g.game_date)) AS period_month, ...
+
+-- Season-scoped query: include the season
+SELECT g.season_year, ...
+
+-- Last N games: include the date range
+SELECT MIN(g.game_date) AS from_date, MAX(g.game_date) AS to_date, ...
+
+-- Single game (last game): include the game date
+SELECT g.game_date, ...
+---
 
 ## Anti-Pattern Summary
 
@@ -231,3 +230,4 @@ WHERE g.game_date = (
 | `season_year - 1` without cast | Type error on text | `season_year::integer - 1` |
 | Current season filter for past rookies | Player not found | `MIN(season_year)` from player_team_seasons |
 | Previous season filter without `AND game_type` | Includes preseason | Add `game_type ILIKE '%Regular Season%'` |
+| Aggregates with no time column in SELECT | User can't tell what period the data covers | Add DATE_TRUNC('month', ...) or season_year or date range to SELECT |
