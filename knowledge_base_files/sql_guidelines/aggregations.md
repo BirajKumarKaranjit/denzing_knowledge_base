@@ -119,25 +119,47 @@ Check points, total rebounds, assists, steals, and blocks — not just pts/reb/a
 
 ---
 
-## RULE 8 — Consistency: Weight by Sample Size
+## RULE 8 — Consistency Metrics (Sample Size Required)
 
-Low STDDEV alone picks players with 3 games. Always apply a sample-size multiplier.
+Consistency measures how stable a player's performance is across games.
+Always prevent small sample sizes from dominating.
+#Steps:
+- Compute scoring variance.
+- Require a minimum sample size.
+- Exclude zero-variance rows.
+- Weight results by games played.
 
-```sql
+Example:
+
 WITH stats AS (
-    SELECT pb.player_id, p.full_name, COUNT(*) AS games,
-        AVG(pb.points) / NULLIF(STDDEV(pb.points), 0) AS cv_ratio
+    SELECT
+        pb.player_id,
+        p.full_name,
+        COUNT(*) AS games,
+        AVG(pb.points) AS avg_points,
+        STDDEV(pb.points) AS std_points,
+        AVG(pb.points) / NULLIF(STDDEV(pb.points), 0) AS consistency_ratio
     FROM dwh_f_player_boxscore pb
     JOIN dwh_d_players p ON pb.player_id = p.player_id
-    JOIN dwh_d_games g   ON pb.game_id   = g.game_id
+    JOIN dwh_d_games g   ON pb.game_id = g.game_id
     WHERE g.game_type ILIKE '%Regular Season%'
-      AND g.season_year = (SELECT MAX(season_year) FROM dwh_d_games WHERE game_type ILIKE '%Regular Season%')
+      AND g.season_year = (
+          SELECT MAX(season_year)
+          FROM dwh_d_games
+          WHERE game_type ILIKE '%Regular Season%'
+      )
     GROUP BY pb.player_id, p.full_name
-),
-threshold AS (SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY games) AS min_games FROM stats)
-SELECT full_name, cv_ratio * LEAST(games::numeric / min_games, 1) AS weighted_consistency
-FROM stats, threshold WHERE games >= min_games
-ORDER BY weighted_consistency DESC;
+)
+SELECT
+    full_name,
+    consistency_ratio * LN(games) AS weighted_consistency
+FROM stats
+WHERE
+    games >= 30
+    AND consistency_ratio IS NOT NULL
+    AND avg_points >= 10
+ORDER BY weighted_consistency DESC
+LIMIT 1;
 ```
 
 ---
