@@ -29,27 +29,53 @@ class TestParseResponse:
     def test_approved_simple(self):
         r = _parse_response("APPROVED")
         assert r.approved is True and r.revised_sql is None and r.changes == []
+
     def test_approved_with_whitespace(self):
         assert _parse_response("  APPROVED  ").approved is True
+
+    def test_approved_narrative_first_line(self):
+        # LLM responds with "The SQL is APPROVED." instead of bare "APPROVED"
+        assert _parse_response("The SQL is APPROVED.").approved is True
+
+    def test_approved_narrative_with_explanation(self):
+        assert _parse_response("The query looks APPROVED — no issues found.").approved is True
+
     def test_revised_with_sql_and_changes(self):
         raw = "REVISED\n```sql\nSELECT x;\n```\nCHANGES:\n- Fix A\n- Fix B\n"
         r = _parse_response(raw)
         assert not r.approved
         assert r.revised_sql == "SELECT x;"
         assert len(r.changes) == 2
+
+    def test_revised_narrative_first_line(self):
+        # "THE SQL NEEDS REVISION" style response
+        raw = "THE SQL NEEDS TO BE REVISED\n```sql\nSELECT 1;\n```\nCHANGES:\n- Fixed\n"
+        r = _parse_response(raw)
+        assert not r.approved and r.revised_sql == "SELECT 1;"
+
     def test_revised_no_sql_block_approved(self):
         assert _parse_response("REVISED\nCHANGES:\n- x\n").approved is True
+
     def test_unparseable_approved(self):
         assert _parse_response("cannot determine").approved is True
+
     def test_empty_approved(self):
         assert _parse_response("").approved is True
+
     def test_revised_no_changes_section(self):
         r = _parse_response("REVISED\n```sql\nSELECT 1;\n```\n")
         assert not r.approved and r.revised_sql == "SELECT 1;" and r.changes == []
+
     def test_changes_stripped(self):
         raw = "REVISED\n```sql\nSELECT 1;\n```\nCHANGES:\n-  A trimmed  \n-  B\n"
         r = _parse_response(raw)
         assert r.changes == ["A trimmed", "B"]
+
+    def test_approved_not_triggered_when_revised_also_present(self):
+        # If both words appear on first line, REVISED takes precedence
+        raw = "REVISED (not APPROVED)\n```sql\nSELECT 1;\n```\nCHANGES:\n- x\n"
+        r = _parse_response(raw)
+        assert not r.approved
 class TestBuildUserPrompt:
     def test_all_sections_present(self):
         p = _build_user_prompt("Q?", "SELECT 1;", "DDL here")

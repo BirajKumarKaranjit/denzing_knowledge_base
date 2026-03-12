@@ -172,9 +172,9 @@ class TestValidSQL:
 
     def test_union_all_same_column_count(self, registry):
         sql = (
-            "SELECT full_name, 'player' AS entity_type FROM dwh_d_players "
+            "SELECT p.full_name, 'player' AS entity_type FROM dwh_d_players p "
             "UNION ALL "
-            "SELECT full_name, 'team' AS entity_type FROM dwh_d_teams"
+            "SELECT t.full_name, 'team' AS entity_type FROM dwh_d_teams t"
         )
         result = verify_sql(sql, registry)
         assert result.is_valid
@@ -336,16 +336,22 @@ class TestColumnErrors:
         assert result.is_valid
         assert result.errors == []
 
-    def test_bare_ambiguous_column_produces_warning(self, registry):
-        # 'team_id' exists on multiple tables — bare reference should warn
+    def test_bare_ambiguous_column_produces_error(self, registry):
+        # game_id exists on both dwh_f_player_boxscore and dwh_d_games.
+        # When both tables are joined and the column is bare (no alias prefix),
+        # the verifier must emit a hard ambiguous_bare_column error.
         sql = (
-            "SELECT team_id, SUM(points) AS pts "
-            "FROM dwh_f_player_boxscore "
-            "GROUP BY team_id"
+            "SELECT game_id, SUM(pb.points) AS pts "
+            "FROM dwh_f_player_boxscore pb "
+            "JOIN dwh_d_games g ON pb.game_id = g.game_id "
+            "GROUP BY game_id"
         )
         result = verify_sql(sql, registry)
-        ambiguous_warnings = [w for w in result.warnings if "ambiguous" in w.lower()]
-        assert len(ambiguous_warnings) >= 1
+        assert not result.is_valid
+        ambiguous_errors = [
+            e for e in result.errors if e.error_type == "ambiguous_bare_column"
+        ]
+        assert len(ambiguous_errors) >= 1
 
     def test_bare_column_not_in_schema_is_error(self, registry):
         sql = "SELECT completely_made_up FROM dwh_d_players"

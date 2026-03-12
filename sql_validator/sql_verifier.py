@@ -225,8 +225,11 @@ def _validate_columns(
                 col_name, qualifier, registry, col_to_tables, errors
             )
         else:
-            # Bare column reference — no table qualifier
-            _check_bare_column(col_name, col_to_tables, cte_columns, warnings, errors)
+            # Bare column reference — no table qualifier.
+            # Pass the set of tables actually in scope for this query so we
+            # only flag ambiguity when two owning tables are both joined.
+            tables_in_query = set(alias_map.values())
+            _check_bare_column(col_name, col_to_tables, cte_columns, tables_in_query, warnings, errors)
 
     return errors, warnings
 
@@ -301,6 +304,7 @@ def _check_bare_column(
     col_name: str,
     col_to_tables: dict[str, set[str]],
     cte_columns: set[str],
+    tables_in_query: set[str],
     warnings: list[str],
     errors: list[VerificationError],
 ) -> None:
@@ -310,14 +314,29 @@ def _check_bare_column(
 
     owning_tables = col_to_tables.get(col_name, set())
     if owning_tables:
-        if len(owning_tables) > 1:
-            warnings.append(
-                f"Bare column '{col_name}' is ambiguous — exists on: "
-                f"{sorted(owning_tables)}. Use a table alias to be explicit."
+        # Only flag ambiguity when two or more owning tables are actually
+        # present in this query's FROM/JOIN clause.  A bare column on a
+        # single-table FROM is unambiguous at runtime even if other tables
+        # in the registry happen to share the same column name.
+        tables_in_scope = owning_tables & tables_in_query
+        if len(tables_in_scope) > 1:
+            errors.append(
+                VerificationError(
+                    error_type="ambiguous_bare_column",
+                    message=(
+                        f"Column '{col_name}' is unqualified and exists on multiple "
+                        f"joined tables: {sorted(tables_in_scope)}. "
+                        f"Prefix it with the correct table alias (e.g. alias.{col_name})."
+                    ),
+                    column=col_name,
+                    suggestion=(
+                        f"Add a table alias prefix to '{col_name}' to remove the ambiguity."
+                    ),
+                )
             )
-        # Single-table ownership → valid, no warning needed
+        # Single-table ownership in this query → valid, no warning needed
     else:
-        # Column found nowhere — hard error only if it's clearly invented
+        # Column found nowhere — hard error
         errors.append(
             VerificationError(
                 error_type="column_not_in_ddl",

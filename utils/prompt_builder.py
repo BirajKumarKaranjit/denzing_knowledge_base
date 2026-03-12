@@ -91,7 +91,10 @@ def build_sql_prompt(
         "     UNION ALL\n"
         "     SELECT col1, col2 FROM cte WHERE col1 ILIKE '%name%';\n"
         "4. Use ONLY the tables listed in the <kb_retrieval_citations> block below.\n"
-        "   Do not reference any table or column not present in the provided schemas."
+        "   Do not reference any table or column not present in the provided schemas.\n"
+        "5. Every column reference MUST be qualified with its table alias (e.g. <<table_alias>>.<<col_name>>,\n"
+        "  ). Never write a bare unqualified column name. This is\n"
+        "   mandatory even when only one table is in scope."
     )
     if agent_backstory:
         system_header = f"{agent_backstory}\n\n{system_header}"

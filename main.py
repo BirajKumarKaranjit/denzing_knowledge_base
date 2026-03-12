@@ -327,6 +327,10 @@ def cmd_query(user_query: str) -> None:
                 print(f"\n\n[verifier] Warning: {w}")
 
         if verification.is_valid:
+            if verification_attempts == 1:
+                print("[verifier] Passed — no schema errors.")
+            else:
+                print("[verifier] Passed on attempt 2.")
             break
 
         # Verification failed — decide whether to regenerate or fall through.
