@@ -131,10 +131,6 @@ def generate_section_sub_file(
     ddl_dict: Optional[dict[str, str]] = None,
 ) -> str:
     """Generate a single sub-file for any KB section via LLM.
-
-    Uses a dedicated prompt for ``response_guidelines/response_format`` so the
-    output is grounded in real DDL column names. All other sub-sections use the
-    generic ``SECTION_SUB_FILE_SYSTEM_PROMPT``.
     """
     needs_ddl = SECTION_DDL_REQUIRED.get(section, False)
     ddl_summary = _build_ddl_summary(ddl_dict) if (needs_ddl and ddl_dict) else None
@@ -165,11 +161,6 @@ def generate_all_sub_files_for_section(
     overwrite: bool = False,
 ) -> list[Path]:
     """Generate all sub-files for a given KB section.
-
-    Iterates over ``SECTION_SUB_SECTIONS[section]`` and calls
-    ``generate_section_sub_file`` for each entry. Works for any section
-    registered in config — no dedicated function needed per section.
-
     Parameters
     ----------
     section:

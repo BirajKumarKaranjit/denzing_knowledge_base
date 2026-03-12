@@ -1,6 +1,6 @@
 """unit_tests/test_sql_verifier.py
 
-Unit tests for sql_validator.sql_verifier and sql_validator.schema_linker.
+Unit tests for sql_worker.sql_verifier and sql_worker.schema_linker.
 
 Run with:
     pytest unit_tests/test_sql_verifier.py -v
@@ -15,8 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-from sql_validator.schema_linker import build_column_registry, _regex_fallback
-from sql_validator.sql_verifier import (
+from sql_worker.schema_linker import build_column_registry, _regex_fallback
+from sql_worker.sql_verifier import (
     VerificationResult,
     verify_sql,
 )

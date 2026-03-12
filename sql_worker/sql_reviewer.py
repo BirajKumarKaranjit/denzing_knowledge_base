@@ -1,4 +1,4 @@
-"""sql_validator/sql_reviewer.py
+"""sql_worker/sql_reviewer.py
 
 LLM-based SQL quality review stage.
 
@@ -123,10 +123,6 @@ def review_sql(
     return _parse_response(raw)
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
 def _build_user_prompt(
     user_query: str,
     generated_sql: str,
@@ -151,11 +147,9 @@ def _parse_response(raw: str) -> ReviewResult:
     # Normalize the entire response for case-insensitive matching
     normalized = raw.upper()
 
-    # Check for APPROVED anywhere in the response
     if "APPROVED" in normalized and "REVISED" not in normalized:
         return ReviewResult(approved=True)
 
-    # Check for REVISED anywhere in the response
     if "REVISED" in normalized:
         sql_match = re.search(r"```(?:sql)?\s*\n?(.*?)```", raw, re.DOTALL | re.IGNORECASE)
         if not sql_match:
@@ -176,7 +170,6 @@ def _parse_response(raw: str) -> ReviewResult:
 
         return ReviewResult(approved=False, revised_sql=revised_sql, changes=changes)
 
-    # If neither APPROVED nor REVISED found anywhere, treat as approved
     _log.warning(
         "[sql_reviewer] Unparseable response (no APPROVED/REVISED found) — treating as approved.",
     )

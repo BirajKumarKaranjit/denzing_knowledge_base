@@ -355,12 +355,6 @@ def cross_encoder_user_prompt(user_query: str, candidates: list[dict]) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# SQL DIALECT INSTRUCTION BLOCKS
-# ---------------------------------------------------------------------------
-# Each block is injected verbatim into the SQL generation prompt so the LLM
-# produces engine-correct SQL without being told the dialect inline.
-
 _DIALECT_INSTRUCTIONS: dict[str, str] = {
     "postgresql": (
         "TARGET DATABASE: PostgreSQL\n"
@@ -441,10 +435,6 @@ def get_dialect_instruction(dialect: str) -> str:
     """Return the dialect-specific SQL instruction block for the given engine name."""
     return _DIALECT_INSTRUCTIONS.get(dialect.lower(), _DIALECT_FALLBACK)
 
-
-# ---------------------------------------------------------------------------
-# PEER — ENTITY EXTRACTION PROMPTS
-# ---------------------------------------------------------------------------
 
 PEER_ENTITY_EXTRACTION_SYSTEM_PROMPT = (
     "You are a SQL analysis assistant for a Text2SQL system.\n"

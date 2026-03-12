@@ -1,5 +1,4 @@
-"""utils/prompt_builder.py
-
+"""
 Assembles the final SQL generation prompt from retrieved KB context
 and reports estimated token usage.
 """
@@ -17,7 +16,6 @@ from utils.citation_builder import (
 from utils.config import SQL_DIALECT
 from utils.prompts.kb_generation_prompts import get_dialect_instruction
 
-# Approximate token count: 1 token ≈ 4 characters for English text.
 _CHARS_PER_TOKEN: int = 4
 
 
@@ -44,23 +42,6 @@ def build_sql_prompt(
         [7] Section entry point overviews (DDL KB.md files)
         [8] Matched table schemas with rank-numbered headers
         [9] User question
-
-    Parameters
-    ----------
-    user_query:
-        The original natural language question.
-    retrieval_result:
-        Output from kb_retriever.retrieve_context_for_query().
-    agent_backstory:
-        Optional agent persona prepended to the system header.
-    dialect:
-        Target database engine name.  Defaults to SQL_DIALECT from config.
-        Overridable per-call for multi-tenant scenarios.
-
-    Returns
-    -------
-    tuple[str, str]
-        (prompt_str, citation_md) — prompt for the LLM and markdown citations for the UI.
     """
     matched_tables: list[dict] = retrieval_result.get("matched_tables", [])
     always_inject: dict = retrieval_result.get("always_inject", {})
@@ -74,7 +55,6 @@ def build_sql_prompt(
 
     sections: list[str] = []
 
-    # [1] System header
     system_header = (
         "You are an expert SQL analyst.\n"
         "Generate a single, valid, efficient SQL query to answer the user's question.\n\n"
@@ -98,15 +78,11 @@ def build_sql_prompt(
     )
     if agent_backstory:
         system_header = f"{agent_backstory}\n\n{system_header}"
+
     sections.append(system_header)
-
-    # [2] Dialect instruction block
     sections.append(f"## SQL DIALECT INSTRUCTIONS\n\n{get_dialect_instruction(dialect)}")
-
-    # [3] Citation manifest
     sections.append(citation_xml)
 
-    # [4] Always-inject sections (entry KB.md + all sub-files, e.g. response_format.md)
     for section_name, section_data in always_inject.items():
         label = section_name.replace("_", " ").upper()
         entry = section_data.get("entry") if isinstance(section_data, dict) else section_data
@@ -122,11 +98,9 @@ def build_sql_prompt(
                 sub_label = name.replace("_", " ").title()
                 sections.append(f"## {label} — {sub_label}\n\n{content}")
 
-    # [5] SQL guidelines entry point overview
     if sql_guidelines_entry and sql_guidelines_entry.get("content"):
         sections.append(f"## SQL GUIDELINES OVERVIEW\n\n{sql_guidelines_entry['content']}")
 
-    # [6] Matched SQL guideline sub-files
     if matched_sql_guidelines:
         guideline_blocks: list[str] = []
         for guideline in matched_sql_guidelines:
@@ -139,13 +113,11 @@ def build_sql_prompt(
                 "## RELEVANT SQL GUIDELINES\n\n" + "\n\n---\n\n".join(guideline_blocks)
             )
 
-    # [7] Section entry point overviews
     for section_name, entry in section_entry_points.items():
         if entry and entry.get("content"):
             label = f"{section_name.upper()} SECTION OVERVIEW"
             sections.append(f"## {label}\n\n{entry['content']}")
 
-    # [8] Matched table schemas
     if matched_tables:
         table_blocks: list[str] = []
         for table, citation in zip(matched_tables, citations):
@@ -167,12 +139,10 @@ def build_sql_prompt(
             "Return an empty SQL block if valid SQL cannot be generated."
         )
 
-    # [9] User question
     sections.append(f"## USER QUESTION\n\n{user_query}")
 
     prompt_str = "\n\n".join(sections)
 
-    # Token usage estimate
     estimated_tokens = _estimate_tokens(prompt_str)
     print(
         f"[prompt_builder] Assembled prompt: {len(prompt_str):,} chars "

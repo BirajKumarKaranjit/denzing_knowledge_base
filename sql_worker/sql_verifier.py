@@ -1,4 +1,4 @@
-"""sql_validator/sql_verifier.py
+"""sql_worker/sql_verifier.py
 
 Structural SQL verification using sqlglot AST analysis.
 
@@ -16,13 +16,11 @@ import sqlglot.expressions as exp
 
 _log = logging.getLogger(__name__)
 
-# SQL aggregate function names — used for GROUP BY completeness check.
 _AGGREGATE_FUNCS: frozenset[str] = frozenset(
     {"sum", "avg", "count", "max", "min", "stddev", "variance",
      "array_agg", "string_agg", "json_agg", "jsonb_agg", "listagg"}
 )
 
-# SQL window/scalar functions that should never be flagged as column references.
 _BUILTIN_FUNCS: frozenset[str] = frozenset(
     {"now", "current_date", "current_timestamp", "current_time",
      "extract", "date_trunc", "date_part", "coalesce", "nullif",
@@ -57,24 +55,15 @@ class VerificationResult:
     errors: list[VerificationError] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def verify_sql(sql: str, registry: dict[str, list[str]]) -> VerificationResult:
     """Validate *sql* against *registry* using sqlglot AST analysis.
 
     Parameters
-    ----------
     sql:
-        The generated SQL string to verify.
     registry:
         ``{table_name: [col1, col2, ...]}`` built by ``build_column_registry()``.
         All names must be lowercase.
-
     Returns
-    -------
     VerificationResult
         ``is_valid=False`` when at least one hard error is found.
         ``warnings`` are non-fatal and do not block execution.
@@ -95,20 +84,14 @@ def verify_sql(sql: str, registry: dict[str, list[str]]) -> VerificationResult:
         if statement is None:
             continue
 
-        # --- Step 1: build CTE output set for this statement ---
         cte_columns = _extract_cte_output_columns(statement)
-
-        # --- Step 2: alias → table map ---
         alias_map = _build_alias_map(statement)
-
-        # --- Step 3: column validation ---
         col_errors, col_warnings = _validate_columns(
             statement, registry, alias_map, cte_columns
         )
         errors.extend(col_errors)
         warnings.extend(col_warnings)
 
-        # --- Priority 2: structural compliance ---
         errors.extend(_check_union_column_parity(statement))
         errors.extend(_check_order_by_in_union_branch(statement))
         warnings.extend(_check_group_by_completeness(statement))
@@ -117,16 +100,11 @@ def verify_sql(sql: str, registry: dict[str, list[str]]) -> VerificationResult:
     return VerificationResult(is_valid=is_valid, errors=errors, warnings=warnings)
 
 
-# ---------------------------------------------------------------------------
-# CTE output column extraction
-# ---------------------------------------------------------------------------
-
 def _extract_cte_output_columns(statement: exp.Expression) -> set[str]:
     """Return all column aliases exported by every CTE in *statement*."""
     cte_columns: set[str] = set()
 
     for cte in statement.find_all(exp.CTE):
-        # The CTE query is the second arg (alias is first)
         cte_query = cte.this
         if not isinstance(cte_query, exp.Select):
             continue
@@ -135,7 +113,6 @@ def _extract_cte_output_columns(statement: exp.Expression) -> set[str]:
             if alias:
                 cte_columns.add(alias.lower())
             else:
-                # No alias — try to get the bare column name
                 col_name = _bare_column_name(sel_expr)
                 if col_name:
                     cte_columns.add(col_name.lower())
@@ -157,10 +134,6 @@ def _bare_column_name(expr: exp.Expression) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Alias → table map
-# ---------------------------------------------------------------------------
-
 def _build_alias_map(statement: exp.Expression) -> dict[str, str]:
     """Map all table aliases (and bare table names) to their table names.
 
@@ -176,17 +149,12 @@ def _build_alias_map(statement: exp.Expression) -> dict[str, str]:
         alias = (table.alias or "").lower()
         if not table_name:
             continue
-        # The table name itself is always a valid reference
         alias_map[table_name] = table_name
         if alias and alias != table_name:
             alias_map[alias] = table_name
 
     return alias_map
 
-
-# ---------------------------------------------------------------------------
-# Column validation
-# ---------------------------------------------------------------------------
 
 def _validate_columns(
     statement: exp.Expression,
@@ -198,13 +166,11 @@ def _validate_columns(
     errors: list[VerificationError] = []
     warnings: list[str] = []
 
-    # Pre-compute a reverse map: column_name → set of tables that own it
     col_to_tables: dict[str, set[str]] = {}
     for tbl, cols in registry.items():
         for c in cols:
             col_to_tables.setdefault(c.lower(), set()).add(tbl)
 
-    # Collect all SELECT-level aliases so we don't flag them in ORDER BY / HAVING
     select_aliases = _collect_select_aliases(statement)
 
     for col_ref in statement.find_all(exp.Column):
@@ -215,19 +181,14 @@ def _validate_columns(
             continue
         if col_name in _BUILTIN_FUNCS:
             continue
-        # Skip aliases defined within the query itself
         if col_name in select_aliases or col_name in cte_columns:
             continue
 
         if qualifier:
-            # Qualified reference: alias.column or table.column
             _check_qualified_column(
                 col_name, qualifier, registry, col_to_tables, errors
             )
         else:
-            # Bare column reference — no table qualifier.
-            # Pass the set of tables actually in scope for this query so we
-            # only flag ambiguity when two owning tables are both joined.
             tables_in_query = set(alias_map.values())
             _check_bare_column(col_name, col_to_tables, cte_columns, tables_in_query, warnings, errors)
 
@@ -250,7 +211,6 @@ def _resolve_qualifier(col_ref: exp.Column, alias_map: dict[str, str]) -> str | 
     if not table_part:
         return None
     table_str = str(table_part).lower()
-    # Try alias map first; fall back to the raw qualifier (may be a CTE name)
     return alias_map.get(table_str, table_str)
 
 
@@ -263,14 +223,11 @@ def _check_qualified_column(
 ) -> None:
     """Validate a qualified column reference (table.column)."""
     if table_name not in registry:
-        # Table not in registry — could be a CTE name or external table; skip silently
         return
 
     table_cols = [c.lower() for c in registry[table_name]]
     if col_name in table_cols:
-        return  # All good
-
-    # Column not found on this table — check if it lives elsewhere
+        return
     other_tables = col_to_tables.get(col_name, set()) - {table_name}
     if other_tables:
         errors.append(
@@ -310,7 +267,7 @@ def _check_bare_column(
 ) -> None:
     """Validate a bare (unqualified) column reference."""
     if col_name in cte_columns:
-        return  # CTE-derived, always valid
+        return
 
     owning_tables = col_to_tables.get(col_name, set())
     if owning_tables:
@@ -330,9 +287,7 @@ def _check_bare_column(
                     ),
                 )
             )
-        # Single-table ownership in this query → valid, no warning needed
     else:
-        # Column found nowhere — hard error
         errors.append(
             VerificationError(
                 error_type="column_not_in_ddl",
@@ -342,11 +297,6 @@ def _check_bare_column(
                 column=col_name,
             )
         )
-
-
-# ---------------------------------------------------------------------------
-# Priority 2 — Structural compliance checks
-# ---------------------------------------------------------------------------
 
 def _check_union_column_parity(statement: exp.Expression) -> list[VerificationError]:
     """Verify all UNION / UNION ALL branches return the same number of columns."""
@@ -393,8 +343,6 @@ def _check_order_by_in_union_branch(statement: exp.Expression) -> list[Verificat
         for side in (union.left, union.right):
             if not isinstance(side, exp.Select):
                 continue
-            # Only flag ORDER BY / LIMIT that are *direct* children of the SELECT,
-            # not ones nested inside a Subquery expression within the branch.
             for child in side.args.values():
                 if child is None:
                     continue
@@ -432,13 +380,11 @@ def _check_group_by_completeness(statement: exp.Expression) -> list[str]:
                 if isinstance(g_expr, exp.Column):
                     grouped_cols.add(g_expr.name.lower())
                 elif isinstance(g_expr, exp.Literal):
-                    # positional GROUP BY (e.g., GROUP BY 1, 2) — skip
                     pass
 
         for sel_expr in select.expressions:
             if _is_aggregate(sel_expr):
                 continue
-            # Strip the alias wrapper to get the inner expression
             inner = sel_expr.this if isinstance(sel_expr, exp.Alias) else sel_expr
             if isinstance(inner, exp.Column):
                 col_name = inner.name.lower()
@@ -462,7 +408,7 @@ def _has_aggregates(select: exp.Select) -> bool:
 def _is_aggregate(expr: exp.Expression) -> bool:
     """Return True if *expr* is or wraps an aggregate function call."""
     for func in expr.find_all(exp.AggFunc):
-        return True  # any AggFunc subclass means this expression is an aggregate
+        return True
     for func in expr.find_all(exp.Anonymous):
         fn_name = (func.name or "").lower()
         if fn_name in _AGGREGATE_FUNCS:

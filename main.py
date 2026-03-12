@@ -30,21 +30,14 @@ from utils.config import (
     SQL_REVIEWER_API_KEY,
 )
 from utils.sample_values_for_testing import Sample_NBA_DDL_DICT
-from sql_validator.schema_linker import build_column_registry
+from sql_worker.schema_linker import build_column_registry
 import sys
 
-# Build the column registry once at startup from the known DDL.
-# Used by the SQL verifier to catch column hallucinations before execution.
 _COLUMN_REGISTRY: dict[str, list[str]] = build_column_registry(Sample_NBA_DDL_DICT)
 
 
 def _build_schema_context(ddl_dict: dict[str, str]) -> str:
     """Derive a compact table+column context string from the DDL dict.
-
-    Extracts table names and column names from each CREATE TABLE statement
-    so the relevance gate can infer domain vocabulary without a hardcoded
-    schema summary. Works for any domain — not NBA-specific.
-
     Parameters
     ----------
     ddl_dict:
@@ -58,27 +51,18 @@ def _build_schema_context(ddl_dict: dict[str, str]) -> str:
     import re
     lines: list[str] = []
     for table_name, ddl_sql in ddl_dict.items():
-        # Extract column names: first word on each indented line inside the CREATE TABLE body
         col_matches = re.findall(r'^\s{2,}(\w+)\s+\w+', ddl_sql, re.MULTILINE)
-        # Fall back: grab all word tokens that look like column names
         if not col_matches:
             col_matches = re.findall(r'\b([a-z][a-z0-9_]{2,})\b', ddl_sql)
-        cols = ", ".join(col_matches[:15])  # cap at 15 columns to keep context compact
+        cols = ", ".join(col_matches[:15])
         lines.append(f"- {table_name}: {cols}")
     return "\n".join(lines)
 
-
-# Build schema context once at module load from the actual DDL
 _SCHEMA_CONTEXT = _build_schema_context(Sample_NBA_DDL_DICT)
 
 
 def _load_meta_kb_context() -> str:
     """Load KB files relevant to meta/project questions.
-
-    Reads the root KB.md and business_rules sub-files from the local filesystem.
-    This is intentionally a local file read — meta queries bypass the DB pipeline
-    and do not require embeddings or Postgres.
-
     Returns
     -------
     str
@@ -241,9 +225,9 @@ def cmd_query(user_query: str) -> None:
     from kb_system.kb_retriever import retrieve_context_for_query
     from kb_system.peer import run_peer
     from utils.prompt_builder import build_sql_prompt
-    from sql_generator import generate_sql, extract_sql_from_response, is_query_relevant, answer_meta_query, build_retry_prompt
-    from sql_validator.sql_verifier import verify_sql
-    from sql_validator.sql_reviewer import review_sql
+    from sql_worker.sql_generator import generate_sql, extract_sql_from_response, is_query_relevant, answer_meta_query, build_retry_prompt
+    from sql_worker.sql_verifier import verify_sql
+    from sql_worker.sql_reviewer import review_sql
     from utils.llm_client import get_llm_client
 
     print(f"\n{'=' * 60}")
@@ -291,11 +275,9 @@ def cmd_query(user_query: str) -> None:
     print(raw_sql)
     print(f"{'=' * 60}")
 
-    # --- PEER: Pre-Execution Entity Resolution ---
     remote_conn = get_connection(NBA_POSTGRES_DSN)
     peer_result = run_peer(raw_sql, remote_conn)
 
-    # Surface PEER messages to the user before presenting the SQL
     if peer_result.messages:
         print(f"\n{'=' * 60}")
         print("  Entity Resolution Notes:")
@@ -311,29 +293,24 @@ def cmd_query(user_query: str) -> None:
 
     final_sql = peer_result.sql
 
-    # --- SQL Verification: catch column hallucinations before hitting the DB ---
-    # verification_attempts tracks how many verify_sql calls have been made.
-    # Max is 2: one for the initial SQL, one for the regenerated SQL.
-    # After 2 attempts the SQL proceeds to execution regardless of remaining errors.
     verification_attempts: int = 0
     _MAX_VERIFICATION_ATTEMPTS: int = 2
 
     while verification_attempts < _MAX_VERIFICATION_ATTEMPTS:
         verification = verify_sql(final_sql, _COLUMN_REGISTRY)
         verification_attempts += 1
-
+        print(f"\n{'=' * 60}")
         if verification.warnings:
             for w in verification.warnings:
                 print(f"\n\n[verifier] Warning: {w}")
 
         if verification.is_valid:
             if verification_attempts == 1:
-                print("[verifier] Passed — no schema errors.")
+                print("\n[verifier] Passed — no schema errors.")
             else:
                 print("[verifier] Passed on attempt 2.")
             break
 
-        # Verification failed — decide whether to regenerate or fall through.
         print(
             f"\n[verifier] Schema errors detected (attempt {verification_attempts}"
             f"/{_MAX_VERIFICATION_ATTEMPTS}):"
@@ -342,23 +319,16 @@ def cmd_query(user_query: str) -> None:
             print(f"  [{err.error_type}] {err.message}")
 
         if verification_attempts >= _MAX_VERIFICATION_ATTEMPTS:
-            # Second failure — log as warnings and send to execution as-is.
             print(
                 "[verifier] Max verification attempts reached. "
                 "Proceeding to execution with remaining schema warnings."
             )
             break
 
-        # First failure — regenerate once with the schema error context.
-        # Collect every table that appears in the errors and inject its full
-        # column list from the registry so the LLM cannot guess again.
         affected_tables: set[str] = set()
         for e in verification.errors:
             if e.table and e.table in _COLUMN_REGISTRY:
                 affected_tables.add(e.table)
-            # wrong_table_for_column errors carry the suggestion text
-            # "It exists on: ['t1', 't2']" — extract those too so the LLM
-            # knows the correct table's columns as well.
             if e.suggestion:
                 for t in _COLUMN_REGISTRY:
                     if t in (e.suggestion or ""):
@@ -395,7 +365,6 @@ def cmd_query(user_query: str) -> None:
         print(final_sql)
         print(f"{'=' * 60}\n")
 
-    # --- SQL Reviewer: LLM quality gate (runs after schema verification) ---
     if SQL_REVIEWER_ENABLED:
         _reviewer_client = get_llm_client(SQL_REVIEWER_PROVIDER, SQL_REVIEWER_API_KEY)
         ddl_context = _build_ddl_context(retrieval_result)
@@ -407,11 +376,11 @@ def cmd_query(user_query: str) -> None:
             client=_reviewer_client,
             model=SQL_REVIEWER_MODEL,
         )
-
+        print(f"\n{'=' * 60}")
         if review.approved:
-            print("[sql_reviewer] Approved — no changes.")
+            print("\n[sql_reviewer] Approved — no changes.")
         else:
-            print(f"[sql_reviewer] Revised. Changes:")
+            print(f"\n[sql_reviewer] Revised. Changes:")
             for change in review.changes:
                 print(f"  - {change}")
 
@@ -420,9 +389,9 @@ def cmd_query(user_query: str) -> None:
                 revised_check = verify_sql(revised, _COLUMN_REGISTRY)
                 if revised_check.is_valid:
                     final_sql = revised
-                    print("[sql_reviewer] Revised SQL passed schema check — using revised SQL.")
+                    print("\n[sql_reviewer] Revised SQL passed schema check — using revised SQL.")
                 else:
-                    print("[sql_reviewer] Revised SQL failed schema check — using original.")
+                    print("\n[sql_reviewer] Revised SQL failed schema check — using original.")
                     for err in revised_check.errors:
                         print(f"  [schema] {err.message}")
 
@@ -434,7 +403,7 @@ def cmd_query(user_query: str) -> None:
     print(f"{'=' * 60}")
     print(final_sql)
     print(f"{'=' * 60}\n")
-    print("[executor] Executing SQL against remote database...")
+    print("\n[executor] Executing SQL against remote database...")
     success, exec_error = _execute_sql(final_sql)
 
     if not success and exec_error:

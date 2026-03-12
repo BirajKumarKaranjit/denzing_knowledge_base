@@ -7,24 +7,6 @@ Responsibilities:
     - Compute a single embedding for a text string (get_embedding)
     - Batch-compute embeddings for multiple texts (get_embeddings_batch)
     - Provide a consistent interface so swapping to another embedding
-      provider (e.g., Cohere, Voyage AI) only requires changing this file.
-
-Why embeddings?
-    The retrieval system compares a user's query against pre-computed
-    table description embeddings stored in Postgres. By representing both
-    query and descriptions as high-dimensional vectors, we can rank tables
-    by semantic similarity rather than keyword overlap — which is essential
-    for NBA queries where users might say "scoring leaders" and we need
-    to match against "box_scores" whose description says "player performance
-    statistics per game including points, rebounds, assists".
-
-Embedding model choice:
-    text-embedding-3-small (1536 dims) is used by default. It is:
-    - Fast: ~100ms per call
-    - Cheap: $0.02 per 1M tokens
-    - Accurate enough for this use case (table routing, not doc similarity)
-    Upgrade to text-embedding-3-large (3072 dims) for higher accuracy at
-    higher cost if retrieval quality needs improvement.
 """
 
 from __future__ import annotations
@@ -39,8 +21,6 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.config import OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL
 
-# Module-level client — created once, reused across all calls in a process.
-# This avoids the overhead of creating a new client on every embedding call.
 _client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 
@@ -53,36 +33,16 @@ def get_embedding(
     """
     Compute a single text embedding using the OpenAI embeddings API.
 
-    Automatically retries on transient API errors (rate limits, network issues)
-    using exponential backoff. This makes the function safe to call in a loop
-    when processing many table descriptions during KB build.
-
     Parameters
     ----------
     text : str
-        The text to embed. For KB table files, this should be
-        ParsedKBFile.embedding_text (name + description concatenated).
-        For user queries at retrieval time, this is the raw query string.
     model : str
-        OpenAI embedding model name. Defaults to OPENAI_EMBEDDING_MODEL
-        from config.py (text-embedding-3-small). Must match the model
-        used when building the KB — mixing models produces incorrect
-        similarity scores.
     retry_attempts : int
-        Maximum number of retry attempts on API failure. After exhausting
-        retries, the last exception is re-raised to the caller.
     retry_delay_seconds : float
-        Base delay between retries in seconds. Each subsequent retry doubles
-        the delay (exponential backoff): 1s, 2s, 4s, ...
-
     Returns
     -------
     list[float]
-        Dense vector of floats. Length is determined by the model:
-        - text-embedding-3-small → 1536 dimensions
-        - text-embedding-3-large → 3072 dimensions
-        This must match the EMBEDDING_DIMENSION in config.py and the
-        vector column dimension in the kb_files Postgres table.
+        Dense vector of floats.
 
     Raises
     ------
@@ -122,10 +82,9 @@ def get_embedding(
             time.sleep(wait)
 
         except openai.OpenAIError:
-            # Non-retryable errors (auth failure, invalid model, etc.) — raise immediately
             raise
 
-    raise last_exception  # type: ignore[misc]
+    raise last_exception
 
 
 def get_embeddings_batch(
@@ -135,24 +94,10 @@ def get_embeddings_batch(
     """
     Compute embeddings for a batch of texts in a single API call.
 
-    OpenAI's embeddings endpoint accepts a list of inputs, making batching
-    more efficient than calling get_embedding() in a loop. Use this during
-    KB build when computing embeddings for all table descriptions at once.
-
-    The API enforces a per-request token limit (~8191 tokens per input).
-    For typical KB descriptions (100-500 tokens each), a batch of 20-30
-    is safe. For very large descriptions, fall back to get_embedding().
-
     Parameters
     ----------
     texts : list[str]
-        List of text strings to embed. Each string will produce one embedding.
-        For KB builds, this would be one entry per table file description.
-        Empty strings are replaced with a single space to avoid API errors.
     model : str
-        OpenAI embedding model name. Must be consistent across all KB operations
-        (build time and query time) since mixing models invalidates comparisons.
-
     Returns
     -------
     list[list[float]]

@@ -1,7 +1,4 @@
 """kb_system/peer.py
-
-Pre-Execution Entity Resolution (PEER) layer.
-
 After SQL is generated, PEER validates named-entity filter values against
 the actual database using fuzzy matching and patches the SQL if needed.
 PEER is non-fatal: any failure returns the original SQL unchanged.
@@ -55,7 +52,6 @@ from utils.prompts.kb_generation_prompts import (
 _log = logging.getLogger(__name__)
 _client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# Valid SQL comparison operators that can precede a string literal entity filter.
 _COMPARISON_OPERATORS = {"=", "like", "ilike"}
 
 
@@ -85,18 +81,12 @@ class PEERResult:
 
 def _extract_cte_names(sql: str) -> set[str]:
     """Return the set of CTE names defined in the WITH clause of *sql* (lower-cased).
-
-    Matches patterns like:  WITH cte_name AS (  or  , cte_name AS (
-    This is used to guard the probe loop: entities whose table resolves to a CTE
-    name are virtual and cannot be queried against the database.
     """
     return {m.lower() for m in re.findall(r"\b(\w+)\s+AS\s*\(", sql, re.IGNORECASE)}
 
 
 def _extract_entities(sql: str) -> list[_EntityMatch]:
     """Call the LLM to extract named-entity filter values from the SQL.
-
-    Returns an empty list if no entity filters exist or if parsing fails.
     """
     try:
         response = _client.chat.completions.create(
@@ -155,8 +145,6 @@ def _strip_sql_wildcards(value: str) -> str:
 
 def _build_word_prefixes(value: str) -> list[str]:
     """Extract PEER_PROBE_PREFIX_LEN-char prefixes from every word in value.
-
-    Used only by the ILIKE fallback path when pg_trgm is unavailable.
     """
     seen: set[str] = set()
     result: list[str] = []
@@ -168,19 +156,11 @@ def _build_word_prefixes(value: str) -> list[str]:
     return result
 
 
-# ---------------------------------------------------------------------------
-# pg_trgm capability detection
-# ---------------------------------------------------------------------------
-
-# Per-connection cache: maps connection id → bool (True = pg_trgm usable).
 _trgm_cache: dict[int, bool] = {}
 
 
 def _trgm_available(conn: psycopg2.extensions.connection) -> bool:
     """Return True if pg_trgm similarity() is callable on this connection.
-
-    Result is cached per connection object so the probe SELECT runs at most
-    once per PEER call chain, not once per entity.
     """
     if not PEER_USE_TRIGRAM:
         return False
@@ -199,11 +179,6 @@ def _trgm_available(conn: psycopg2.extensions.connection) -> bool:
         _log.debug("PEER: pg_trgm not available — will use ILIKE fallback.")
     return _trgm_cache[conn_id]
 
-
-# ---------------------------------------------------------------------------
-# Probe strategies
-# ---------------------------------------------------------------------------
-
 def _probe_trigram(
     conn: psycopg2.extensions.connection,
     qualified_table: str,
@@ -219,7 +194,6 @@ def _probe_trigram(
     Each step returns immediately when it finds results, so the expensive
     trigram scan is only reached when exact and prefix both miss.
     """
-    # Step A: exact match
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -234,7 +208,6 @@ def _probe_trigram(
         _log.warning("PEER trigram Step A failed (%s.%s): %s", qualified_table, column, exc)
         conn.rollback()
 
-    # Step B: prefix match — the user may have typed just the start of the value
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -250,7 +223,6 @@ def _probe_trigram(
         _log.warning("PEER trigram Step B failed (%s.%s): %s", qualified_table, column, exc)
         conn.rollback()
 
-    # Step C: trigram similarity — handles partial words, abbreviations, typos
     try:
         with conn.cursor() as cur:
             cur.execute(f"SET pg_trgm.similarity_threshold = {PEER_TRGM_SIMILARITY_THRESHOLD};")
@@ -309,7 +281,6 @@ def _probe_ilike_fallback(
     if not prefixes:
         return _run("TRUE", ())
 
-    # Layer 1: multi-word AND intersection
     conditions = " AND ".join(
         [f"{column} ILIKE %s"] + [f"{column} ILIKE %s" for _ in prefixes[1:]]
     )
@@ -321,7 +292,6 @@ def _probe_ilike_fallback(
         qualified_table, column, prefixes, len(candidates),
     )
 
-    # Layer 2: first-word anchored prefix only
     if not candidates and len(prefixes) > 1:
         candidates = _run(f"{column} ILIKE %s", (f"{prefixes[0]}%",))
         _log.debug(
@@ -329,7 +299,6 @@ def _probe_ilike_fallback(
             qualified_table, column, len(candidates),
         )
 
-    # Layer 3: all-word contains patterns (catches non-first-word entity words)
     if not candidates:
         contains_conditions = " AND ".join(f"{column} ILIKE %s" for _ in prefixes)
         contains_params = tuple(f"%{p}%" for p in prefixes)
@@ -350,10 +319,6 @@ def _probe_candidates(
     db_schema: str = "",
 ) -> list[str]:
     """Return candidate column values for *value* using the best available strategy.
-
-    Delegates to the trigram pipeline when pg_trgm is detected on the connection,
-    and falls back to the multi-prefix ILIKE strategy otherwise.  The decision is
-    cached per connection so the capability probe runs at most once.
     """
     clean_value = _strip_sql_wildcards(value)
     if not clean_value:
@@ -371,11 +336,6 @@ def _probe_candidates(
 
 def _fuzzy_match(value: str, candidates: list[str]) -> tuple[str, int]:
     """Return the best candidate and its score using both token scorers.
-
-    Uses ``max(token_sort_ratio, token_set_ratio)`` so that:
-    - token_sort_ratio handles word-order differences ("James LeBron" vs "LeBron James")
-    - token_set_ratio handles subset matches ("Joel Embiid" vs "Joel Embiid III")
-    Both are computed on pre-processed (lower-cased, stripped) strings.
     """
     best_candidate = ""
     best_score = 0
@@ -428,7 +388,6 @@ def _get_column_name(left_token: sqlparse.sql.Token) -> str:
         return left_token.normalized.lower()
 
     if isinstance(left_token, Function):
-        # The argument list is a Parenthesis token; the real column lives inside it.
         for tok in left_token.tokens:
             if isinstance(tok, Parenthesis):
                 for inner in tok.tokens:
@@ -438,7 +397,6 @@ def _get_column_name(left_token: sqlparse.sql.Token) -> str:
                     if inner.ttype == T.Name:
                         return inner.normalized.lower()
 
-    # Generic fallback: walk all sub-tokens and return the last Name found.
     if getattr(left_token, "tokens", None):
         for tok in reversed(left_token.tokens):
             if isinstance(tok, Identifier):
@@ -490,15 +448,12 @@ def _find_rhs_string_token(
             if tok.value.strip().lower() in _COMPARISON_OPERATORS:
                 found_op = True
             continue
-        # Direct string literal (the common case).
         if tok.ttype == T.Literal.String.Single:
             return tok
-        # TokenList on RHS (e.g. CAST expression): search via flatten().
         if getattr(tok, "tokens", None):
             for flat in tok.flatten():
                 if flat.ttype == T.Literal.String.Single:
                     return flat
-        # Non-string token after operator (function result, column, etc.) — skip.
         if tok.ttype is not None:
             _log.debug(
                 "PEER: RHS of comparison is not a string literal (ttype=%s, val=%r) — skipping.",
@@ -567,17 +522,10 @@ def _patch_comparison(comparison: Comparison, sub: _EntityMatch) -> bool:
         return False
 
     original_raw = rhs_token.value
-
-    # Value-match guard: only patch this specific comparison if its current
-    # RHS value matches the original extracted value for this substitution.
-    # Without this guard, an OR clause with two same-column comparisons
-    # (e.g. full_name ILIKE '%Luka%' OR full_name ILIKE '%Joel%') would
-    # have both nodes rewritten to sub.corrected when only the first matched.
     inner_unescaped = _sql_unescape(original_raw).strip("%")
     if inner_unescaped.lower() != sub.value.lower():
         return False
 
-    # Idempotence: already the corrected value — nothing to do.
     if inner_unescaped == sub.corrected:
         return False
 
@@ -649,10 +597,6 @@ def run_peer(
     conn: psycopg2.extensions.connection,
 ) -> PEERResult:
     """Execute the full PEER pipeline against the generated SQL.
-
-    Extracts entity filters, probes the DB for candidates, fuzzy-matches,
-    and patches the SQL. Non-fatal: any exception returns the original SQL.
-
     Parameters
     ----------
     sql : str

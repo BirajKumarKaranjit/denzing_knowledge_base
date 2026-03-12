@@ -1,5 +1,4 @@
 """kb_system/kb_parser.py
-
 Parses KB markdown files into structured Python objects.
 Each file has YAML frontmatter (metadata/routing) and a markdown body (data/context).
 """
@@ -19,19 +18,12 @@ class ParsedKBFile:
     """Structured representation of a parsed KB markdown file.
 
     Attributes
-    ----------
     file_path : str
-        Relative path from KB_ROOT (e.g. ``"ddl/players.md"``).
     section : str
-        Top-level folder name (e.g. ``"ddl"``, ``"business_rules"``).
     metadata : dict
-        Parsed YAML frontmatter fields.
     content : str
-        Raw markdown body below the frontmatter.
     is_entry_point : bool
-        True for KB.md section index files; these are not similarity-searched.
     embedding_text : str
-        Text to embed for similarity search. Empty for entry points.
     """
 
     file_path: str
@@ -46,22 +38,11 @@ def parse_markdown_file(md_path: Path, kb_root: Path) -> ParsedKBFile:
     """Parse a single KB markdown file into a ParsedKBFile.
 
     Parameters
-    ----------
     md_path : Path
-        Absolute path to the .md file.
     kb_root : Path
-        KB root directory used to compute the relative file_path.
-
     Returns
-    -------
     ParsedKBFile
 
-    Raises
-    ------
-    ValueError
-        If the file has no YAML frontmatter.
-    yaml.YAMLError
-        If the frontmatter YAML is malformed.
     """
     raw_text = md_path.read_text(encoding="utf-8")
 
@@ -105,15 +86,10 @@ def parse_markdown_file(md_path: Path, kb_root: Path) -> ParsedKBFile:
 def scan_kb_directory(kb_root: Path) -> list[ParsedKBFile]:
     """Recursively scan the KB root and parse all .md files.
 
-    Files that fail parsing are logged and skipped.
-
     Parameters
-    ----------
     kb_root : Path
-        Absolute path to the KB root directory.
 
     Returns
-    -------
     list[ParsedKBFile]
     """
     if not kb_root.exists():

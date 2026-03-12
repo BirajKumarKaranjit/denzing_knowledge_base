@@ -1,5 +1,5 @@
 """unit_tests/test_sql_reviewer.py
-Unit tests for sql_validator.sql_reviewer and utils.llm_client.
+Unit tests for sql_worker.sql_reviewer and utils.llm_client.
 All tests are network-free: call_llm is patched at the module level so no
 real LLM calls are made.
 Run with:
@@ -11,9 +11,9 @@ import os
 from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
-from sql_validator.sql_reviewer import ReviewResult, review_sql, _parse_response, _build_user_prompt
-from sql_validator.schema_linker import build_column_registry
-from sql_validator.sql_verifier import verify_sql
+from sql_worker.sql_reviewer import ReviewResult, review_sql, _parse_response, _build_user_prompt
+from sql_worker.schema_linker import build_column_registry
+from sql_worker.sql_verifier import verify_sql
 _SIMPLE_SQL = (
     "SELECT p.full_name, SUM(pb.points) AS total_points "
     "FROM dwh_f_player_boxscore pb "
@@ -22,7 +22,7 @@ _SIMPLE_SQL = (
 )
 _DDL = "CREATE TABLE dwh_d_players (player_id text, full_name text, position text);"
 _GUIDELINES = "Always use table aliases. Apply ILIKE for text filters."
-_CALL_LLM_PATCH = "sql_validator.sql_reviewer.call_llm"
+_CALL_LLM_PATCH = "sql_worker.sql_reviewer.call_llm"
 def _make_client() -> MagicMock:
     return MagicMock()
 class TestParseResponse:

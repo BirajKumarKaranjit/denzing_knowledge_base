@@ -1,17 +1,6 @@
 """
 Builds structured citations explaining how KB retrieval selected the tables
 that were injected into the SQL generation prompt.
-
-PURPOSE — two audiences:
-    1. The LLM (via XML in the prompt)
-       Gives the model an explicit "approved table manifest" before it reads
-       the schemas. This prevents it from hallucinating table names it was
-       not given. Placed at the top of the SQL prompt.
-
-    2. The end user (via markdown in the API/UI response)
-       Shows which KB files were retrieved, why (description snippet that
-       matched), and how confident the system is. Satisfies your senior's
-       requirement for retrieval transparency.
 """
 
 from __future__ import annotations
@@ -23,10 +12,6 @@ from typing import Any
 class TableCitation:
     """
     Structured citation for a single retrieved KB table file.
-
-    One of these is created per matched table in the retrieval result.
-    The collection of citations is used to produce both the XML block
-    injected into the LLM prompt and the markdown shown to the end user.
 
     Attributes
     ----------

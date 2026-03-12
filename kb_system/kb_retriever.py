@@ -40,14 +40,8 @@ from utils.prompts.kb_generation_prompts import (
 )
 
 _client = openai.OpenAI(api_key=OPENAI_API_KEY)
-
-# How many RRF candidates to feed into the cross-encoder.
 _CROSS_ENCODER_CANDIDATE_K: int = 10
-
-# Elbow detection: drop candidates if the score gap exceeds this fraction.
 _ELBOW_DROP_THRESHOLD: float = 0.50
-
-# Top-N tables for FK expansion after re-ranking.
 _FK_EXPANSION_TOP_N: int = 2
 
 _SECTION_DESCRIPTIONS: dict[str, str] = {
@@ -75,12 +69,8 @@ def classify_sections_with_llm(user_query: str) -> list[str]:
     """Use an LLM call to decide which KB sections are relevant to the query.
 
     Parameters
-    ----------
-    user_query:
-        Raw user question.
-
+    user_query
     Returns
-    -------
     list[str]
         Ordered list of section names to search. Always includes "ddl".
     """
@@ -129,18 +119,11 @@ def classify_sections_with_llm(user_query: str) -> list[str]:
 def expand_query_with_llm(user_query: str, n: int = MULTI_QUERY_EXPANSION_COUNT) -> list[str]:
     """Generate N semantically equivalent re-phrasings of the user query.
 
-    Multi-Query Expansion addresses the vocabulary mismatch problem between
-    how users phrase questions and how table descriptions are written.
-
     Parameters
-    ----------
-    user_query:
-        Original question.
-    n:
-        Number of variants to generate (excluding the original).
+    user_query
+    n:Number of variants to generate (excluding the original).
 
     Returns
-    -------
     list[str]
         Original query prepended to the generated variants.
     """
@@ -183,19 +166,9 @@ def _score_candidates_batched(
     candidates: list[dict],
 ) -> list[float]:
     """Score all candidates in a single LLM call (batched cross-encoder).
-
-    Sends all (query, table) pairs in one prompt and parses the returned
-    JSON array — replacing the previous per-candidate loop that made N
-    separate API calls.
-
     Parameters
-    ----------
-    user_query:
-        The original user question.
-    candidates:
-        List of records from RRF retrieval. Each must have a ``metadata``
-        dict containing at least ``name`` and ``description``.
-
+    user_query
+    candidates
     Returns
     -------
     list[float]
@@ -277,9 +250,6 @@ def _extract_foreign_key_refs(ddl_content: str) -> list[str]:
 
 def _extract_fk_refs_from_metadata(metadata: dict) -> list[str]:
     """Extract referenced table names from the frontmatter ``fk_to`` field.
-
-    This is the primary FK resolution path for schemas where DDL was generated
-    without explicit REFERENCES clauses. The ``fk_to`` list in frontmatter
     is structured as::
 
         fk_to:
@@ -366,10 +336,6 @@ def _apply_cross_encoder_reranking(
 
     reranked = sorted(candidates, key=lambda r: r["cross_encoder_score"], reverse=True)
 
-    # --- Step 2: FK expansion (runs BEFORE elbow cutoff) ---
-    # Dimension tables referenced by fact tables often score lower on semantic
-    # similarity but are required for JOIN-correct SQL generation. Expanding
-    # here ensures they are present and protected before the cutoff runs.
     existing_paths = {r["file_path"] for r in reranked}
     top_tables = reranked[:_FK_EXPANSION_TOP_N]
 
@@ -377,15 +343,10 @@ def _apply_cross_encoder_reranking(
         content = table_record.get("content", "")
         record_metadata = table_record.get("metadata") or {}
 
-        # Primary path: fk_to / related_tables in frontmatter metadata.
-        # Most generated DDL files have no REFERENCES clauses, so this is
-        # the reliable source for FK relationships.
         fk_refs = _extract_fk_refs_from_metadata(record_metadata)
 
-        # Fallback path: REFERENCES clauses in the DDL body.
         fk_refs += _extract_foreign_key_refs(content)
 
-        # Deduplicate across both sources
         seen_refs: set[str] = set()
         unique_fk_refs: list[str] = []
         for ref in fk_refs:
@@ -394,10 +355,6 @@ def _apply_cross_encoder_reranking(
                 unique_fk_refs.append(ref)
 
         for ref_table in unique_fk_refs:
-            # If the referenced table is already in the candidate list, mark it
-            # as FK-protected in-place so the elbow cutoff cannot drop it.
-            # This is the common case: dwh_d_teams is in the RRF top-10 at a
-            # low score but must survive because the top fact table references it.
             in_place_protected = False
             for r in reranked:
                 if (
@@ -443,9 +400,6 @@ def _apply_cross_encoder_reranking(
                     f"(referenced by {table_record.get('metadata', {}).get('name', '')})"
                 )
 
-    # --- Step 3: Elbow detection (FK-expanded tables are protected) ---
-    # Only scored records participate in gap analysis; FK-expanded records
-    # are always preserved after the survivors.
     scored = [r for r in reranked if not r.get("_fk_expanded")]
     fk_protected = [r for r in reranked if r.get("_fk_expanded")]
 
@@ -527,7 +481,6 @@ def retrieve_context_for_query(
     for section in target_sections:
         section_entry_points[section] = get_entry_point(conn, section)
 
-        # Fetch more candidates than top_k so the cross-encoder has enough to work with
         candidate_k = min(_CROSS_ENCODER_CANDIDATE_K, max(top_k * 4, 10))
         tables = retrieve_with_rrf(
             conn=conn,
@@ -543,7 +496,6 @@ def retrieve_context_for_query(
         all_matched_tables.extend(tables)
         print(f"[kb_retriever] [{section}]: {len(tables)} candidate(s) from RRF")
 
-    # Deduplicate across sections
     seen_paths: set[str] = set()
     unique_candidates: list[dict] = []
     for table in sorted(all_matched_tables, key=lambda x: x["rrf_score"], reverse=True):
@@ -551,16 +503,11 @@ def retrieve_context_for_query(
             seen_paths.add(table["file_path"])
             unique_candidates.append(table)
 
-    # Cap at _CROSS_ENCODER_CANDIDATE_K before re-ranking
     unique_candidates = unique_candidates[:_CROSS_ENCODER_CANDIDATE_K]
 
     print(f"\n[kb_retriever] Step 5: Cross-encoder re-ranking {len(unique_candidates)} candidate(s)...")
     reranked_tables = _apply_cross_encoder_reranking(user_query, unique_candidates, conn)
 
-    # After re-ranking, respect top_k for semantic results only.
-    # FK-expanded tables are always preserved regardless of the top_k cap
-    # because they are required for JOIN-correct SQL and may not have ranked
-    # highly on semantic similarity alone.
     semantic_tables = [t for t in reranked_tables if not t.get("_fk_expanded")]
     fk_tables = [t for t in reranked_tables if t.get("_fk_expanded")]
     final_tables = semantic_tables[:top_k] + fk_tables

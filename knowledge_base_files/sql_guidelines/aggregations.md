@@ -128,6 +128,10 @@ Always prevent small sample sizes from dominating.
 - Require a minimum sample size.
 - Exclude zero-variance rows.
 - Weight results by games played.
+  - Consistency metrics must exclude zero-variance and zero-average rows.
+  Always filter:
+   -STDDEV(stat) > 0
+   -AVG(stat) > 0
 
 Example:
 

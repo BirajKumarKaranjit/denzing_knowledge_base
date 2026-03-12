@@ -1,4 +1,4 @@
-"""sql_validator/schema_linker.py
+"""sql_worker/schema_linker.py
 
 Builds a column registry from a DDL dict for use by the SQL verifier.
 """
@@ -22,8 +22,6 @@ def build_column_registry(ddl_dict: dict[str, str]) -> dict[str, list[str]]:
     Parameters
     ----------
     ddl_dict:
-        Mapping of ``table_name -> CREATE TABLE SQL string``.
-        Supports both single-line and multi-line DDL formats.
 
     Returns
     -------

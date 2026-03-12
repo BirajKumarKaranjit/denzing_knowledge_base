@@ -1,11 +1,3 @@
-"""sql_generator.py
-
-Calls the OpenAI chat API to generate SQL from the assembled prompt.
-
-Also provides a query relevance gate that short-circuits the pipeline for
-questions that cannot be answered from the database.
-"""
-
 from __future__ import annotations
 
 import json
@@ -35,15 +27,10 @@ def is_query_relevant(
     """Unified relevance gate: garbage, greeting, out-of-domain, or SQL-relevant.
 
     Parameters
-    ----------
-    user_query:
-        Raw user input.
-    schema_context:
-        Table and column names derived from the actual DDL, used to infer
-        the domain and entity vocabulary. Generated dynamically — not hardcoded.
+    user_query
+    schema_context
 
     Returns
-    -------
     tuple[bool, str, str, list[str]]
         (is_relevant, category, response_message, suggested_questions).
         If is_relevant is True, response_message and suggested_questions are empty.
@@ -76,7 +63,6 @@ def is_query_relevant(
             return is_relevant, category, msg, suggestions
     except (json.JSONDecodeError, openai.OpenAIError, KeyError):
         pass
-    # Fail open — if parsing fails, allow SQL generation
     return True, "SQL_RELEVANT", "", []
 
 
@@ -84,12 +70,8 @@ def answer_meta_query(user_query: str, kb_context: str) -> str:
     """Answer a META_QUERY using knowledge base documentation instead of SQL.
 
     Parameters
-    ----------
-    user_query:
-        The user's question about the system, platform, or project.
-    kb_context:
-        Concatenated content from relevant KB files (project_information.md,
-        business_rules/KB.md, root KB.md).
+    user_query
+    kb_context
 
     Returns
     -------
@@ -208,14 +190,10 @@ def generate_sql(prompt: str, temperature: float = 0.0) -> str:
     """Send the assembled prompt to the LLM and return the generated SQL.
 
     Parameters
-    ----------
     prompt:
-        Fully assembled prompt from prompt_builder.build_sql_prompt().
     temperature:
-        LLM sampling temperature. Defaults to 0.0 for maximum determinism.
 
     Returns
-    -------
     str
         Raw LLM response text containing a SQL code block.
     """
@@ -238,7 +216,6 @@ def extract_sql_from_response(llm_response: str) -> str:
     """Extract the raw SQL string from an LLM response containing a code block.
 
     Parameters
-    ----------
     llm_response:
         Raw string returned by generate_sql().
 
@@ -256,20 +233,12 @@ def extract_sql_from_response(llm_response: str) -> str:
 def build_retry_prompt(original_prompt: str, failed_sql: str, error_message: str) -> str:
     """Append an error-feedback block to *original_prompt* for a single retry.
 
-    The original prompt is left entirely intact — only the error context is
-    appended so the LLM can see exactly what failed and why.
-
     Parameters
-    ----------
-    original_prompt:
-        The prompt that produced the failing SQL.
-    failed_sql:
-        The SQL that was executed and raised an error.
-    error_message:
-        The database error message returned by the executor.
+    original_prompt
+    failed_sql
+    error_message
 
     Returns
-    -------
     str
         Extended prompt ready for a second generate_sql() call.
     """

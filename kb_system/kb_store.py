@@ -1,23 +1,6 @@
 """
 kb_system/kb_store.py
----------------------
 Handles all Postgres persistence for the KB system.
-
-Database schema:
-    kb_files — one row per markdown file, stores:
-        - file_path: relative path within knowledge_base_files/
-        - section: top-level folder (ddl, business_rules, etc.)
-        - metadata: JSONB (all frontmatter fields — flexible, no migrations needed)
-        - content: TEXT (raw markdown body — DDL, rules, guidelines)
-        - is_entry_point: BOOLEAN (True for KB.md section index files)
-        - embedding: vector(1536) — NULL for entry points, populated for table files
-
-The pgvector extension enables cosine similarity search using the <=> operator
-directly in SQL, which is orders of magnitude faster than computing similarity
-in Python across thousands of vectors.
-
-Connection pooling note: for production use, replace psycopg2 direct connections
-with psycopg2.pool.ThreadedConnectionPool or SQLAlchemy connection pool.
 """
 
 from __future__ import annotations
@@ -40,18 +23,10 @@ def get_connection(database_creds) -> PgConnection:
     """
     Open and return a new Postgres connection using the DSN from config.
 
-    Each call creates a fresh connection. For scripts that run many
-    operations, pass the connection around explicitly rather than calling
-    this repeatedly.
-
     Returns
-    -------
     psycopg2.connection
-        Open database connection. Caller is responsible for closing it
-        (use as a context manager or call conn.close() explicitly).
 
     Raises
-    ------
     psycopg2.OperationalError
         If the database is unreachable or credentials are wrong.
     """
@@ -62,24 +37,14 @@ def init_schema(conn: PgConnection) -> None:
     """
     Create the kb_files table and required indexes if they don't exist.
 
-    Installs the pgvector extension, creates the kb_files table with a
-    JSONB metadata column (schema-flexible) and a vector embedding column,
-    then creates appropriate indexes for both similarity search and metadata
-    filtering.
-
-    Safe to run multiple times — all statements use IF NOT EXISTS.
-
     Parameters
     ----------
     conn : psycopg2.connection
         Open database connection. Changes are committed inside this function.
     """
     with conn.cursor() as cur:
-        # Enable pgvector — must be installed on the Postgres server first:
-        # CREATE EXTENSION vector; (or via apt: postgresql-16-pgvector)
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-        # Main KB files table
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS kb_files (
                 id          SERIAL PRIMARY KEY,
@@ -97,10 +62,6 @@ def init_schema(conn: PgConnection) -> None:
             );
         """)
 
-        # HNSW index for fast and accurate nearest-neighbor search at any dataset size.
-        # Unlike IVFFlat (which requires hundreds of rows to train its clusters),
-        # HNSW works correctly with as few as 1 row and scales to millions.
-        # m=16 and ef_construction=64 are safe defaults for a KB of this size.
         cur.execute(f"""
             CREATE INDEX IF NOT EXISTS idx_kb_embedding
             ON kb_files
@@ -109,15 +70,12 @@ def init_schema(conn: PgConnection) -> None:
             WHERE embedding IS NOT NULL;
         """)
 
-        # GIN index on JSONB metadata for fast key/value queries
-        # e.g., WHERE metadata->>'priority' = 'high'
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_kb_metadata
             ON kb_files
             USING GIN (metadata);
         """)
 
-        # Index on section for fast section-scoped retrieval
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_kb_section
             ON kb_files (section);
@@ -135,11 +93,6 @@ def upsert_kb_file(
     """
     Insert or update a single KB file record in the database.
 
-    Uses INSERT ... ON CONFLICT DO UPDATE (upsert) so this function is
-    idempotent — running it twice with the same file just updates the
-    existing record. This is important for the KB rebuild workflow where
-    you re-run kb_builder.py after editing markdown files.
-
     Parameters
     ----------
     conn : psycopg2.connection
@@ -155,10 +108,8 @@ def upsert_kb_file(
     int
         The database row ID (id column) of the upserted record.
     """
-    # Register psycopg2 adapters so Python lists serialize to Postgres vector
     psycopg2.extras.register_uuid()
 
-    # Convert embedding list to the string format pgvector expects: '[0.1, 0.2, ...]'
     embedding_value = _format_embedding(embedding) if embedding else None
 
     with conn.cursor() as cur:
@@ -181,10 +132,10 @@ def upsert_kb_file(
             (
                 parsed_file.file_path,
                 parsed_file.section,
-                json.dumps(parsed_file.metadata),   # JSONB
+                json.dumps(parsed_file.metadata),
                 parsed_file.content,
                 parsed_file.is_entry_point,
-                embedding_value,                    # vector or NULL
+                embedding_value,
             ),
         )
         row_id = cur.fetchone()[0]
@@ -199,9 +150,6 @@ def _fetch_mandatory_files(
     filenames: list[str],
 ) -> list[dict[str, Any]]:
     """Fetch specific files from the DB by their basename within a section.
-
-    Used to guarantee that foundational guideline files are always present
-    in the retrieved context, regardless of their semantic similarity score.
 
     Parameters
     ----------
@@ -240,7 +188,6 @@ def _fetch_mandatory_files(
         if isinstance(record.get("metadata"), str):
             record["metadata"] = json.loads(record["metadata"])
 
-        # These records are injected, not ranked — assign neutral scores.
         record["rrf_score"] = 0.0
         record["best_cosine_score"] = 0.0
         record["relevance_score"] = 0.0
@@ -259,15 +206,6 @@ def retrieve_with_rrf(
     rrf_k: int = RRF_K,
 ) -> list[dict[str, Any]]:
     """Retrieve the top-K most relevant files using Reciprocal Rank Fusion (RRF).
-
-    For sections listed in ``MANDATORY_FILES`` (e.g., ``sql_guidelines``),
-    certain files are always appended to the result regardless of their
-    similarity rank.  The semantic pool is limited to ``top_k`` results
-    *after* removing any mandatory files that were already retrieved — so
-    the final list is:  semantic_results[:top_k] + missing_mandatory_files.
-
-    For all other sections the behaviour is unchanged: top-K by RRF score.
-
     Parameters
     ----------
     conn : psycopg2.connection
@@ -331,8 +269,6 @@ def retrieve_with_rrf(
 
     mandatory_filenames: list[str] = MANDATORY_FILES.get(section, [])
 
-    # Separate mandatory files from the semantic pool so that they do not
-    # consume slots from the top_k semantic budget.
     mandatory_paths: set[str] = set()
     semantic_paths: list[str] = []
 
@@ -344,7 +280,6 @@ def retrieve_with_rrf(
         else:
             semantic_paths.append(fp)
 
-    # Build semantic results capped at top_k.
     results: list[dict] = []
     for fp in semantic_paths[:top_k]:
         record = dict(record_cache[fp])
@@ -356,13 +291,9 @@ def retrieve_with_rrf(
     if not mandatory_filenames:
         return results
 
-    # Collect mandatory files that were already retrieved semantically (from the
-    # full RRF pool, not just the top_k slice) so we can deduplicate correctly.
     already_present: set[str] = {r["file_path"] for r in results}
     already_present.update(mandatory_paths)
 
-    # Inject mandatory files that appeared in the RRF pool but were pushed out
-    # of the semantic top_k, annotating them so callers can tell them apart.
     for fp in mandatory_paths:
         record = dict(record_cache[fp])
         record["rrf_score"] = round(rrf_scores[fp], 6)
@@ -371,8 +302,6 @@ def retrieve_with_rrf(
         record["_mandatory"] = True
         results.append(record)
 
-    # Fetch any mandatory files that did not appear in the RRF pool at all
-    # (e.g., their embeddings scored below the per_query_k cut-off).
     missing_filenames = [
         fn for fn in mandatory_filenames
         if not any(fp.split("/")[-1] == fn for fp in already_present)
@@ -448,9 +377,6 @@ def retrieve_similar_tables(
 def get_section_sub_files(conn: PgConnection, section: str) -> list[dict[str, Any]]:
     """Fetch all non-entry-point files for a given section.
 
-    Used to unconditionally inject every sub-file from sections listed in
-    ``ALWAYS_INJECT_SECTIONS`` (e.g., response_guidelines/response_format.md).
-
     Parameters
     ----------
     conn : psycopg2.connection
@@ -485,9 +411,6 @@ def get_section_sub_files(conn: PgConnection, section: str) -> list[dict[str, An
 def get_entry_point(conn: PgConnection, section: str) -> Optional[dict[str, Any]]:
     """
     Fetch the KB.md index file for a given section.
-
-    Entry points are injected alongside matched table files to give the
-    LLM section-level context (e.g., what the DDL section covers overall).
 
     Parameters
     ----------
@@ -526,10 +449,6 @@ def get_entry_point(conn: PgConnection, section: str) -> Optional[dict[str, Any]
 def list_all_files(conn: PgConnection, section: Optional[str] = None) -> list[dict]:
     """
     List all KB files stored in the database, optionally filtered by section.
-
-    Useful for debugging, auditing which files are loaded, and verifying
-    that embeddings have been computed for all table files.
-
     Parameters
     ----------
     conn : psycopg2.connection
@@ -578,9 +497,6 @@ def list_all_files(conn: PgConnection, section: Optional[str] = None) -> list[di
 def _format_embedding(embedding: list[float]) -> str:
     """
     Convert a Python float list to the string format pgvector expects.
-
-    pgvector accepts embeddings as a string like '[0.123, 0.456, ...]'
-    when cast with ::vector in SQL. This helper ensures consistent formatting.
 
     Parameters
     ----------

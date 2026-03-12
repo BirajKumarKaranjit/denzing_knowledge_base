@@ -1,9 +1,5 @@
-"""utils/llm_client.py
-
+"""
 Single place for constructing LLM clients and making chat completions calls.
-
-Supports OpenAI and Anthropic. Other components in the project that need
-multi-provider support can adopt these helpers at any point.
 """
 
 from __future__ import annotations
@@ -49,10 +45,6 @@ def call_llm(
     temperature: float = 0.0,
 ) -> str:
     """Make a single chat completion call and return the response text.
-
-    Abstracts the API differences between OpenAI and Anthropic so callers
-    work the same way regardless of provider.
-
     Parameters
     ----------
     client:
@@ -101,7 +93,6 @@ def call_llm(
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        # Anthropic returns a list of content blocks; first text block is the response
         for block in response.content:
             if getattr(block, "type", None) == "text":
                 return block.text.strip()
