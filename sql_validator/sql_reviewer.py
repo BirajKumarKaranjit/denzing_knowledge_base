@@ -52,7 +52,7 @@ _REVIEWER_SYSTEM_PROMPT = (
     "    and what the query actually computes.\n\n"
     "11. Prefer human-readable attributes (name, title, label) over raw ID columns in SELECT.\n"
     "   If a readable equivalent exists in the DDL, replace the ID with it.\n"
-    "   Exception: keep the ID if the user explicitly asked for it."
+    "   Exception: keep the ID if the user explicitly asked for it.\n\n"
     "OUTPUT FORMAT — return exactly one of the following, nothing else:\n\n"
     "If SQL is correct:\n"
     "APPROVED\n\n"
@@ -147,18 +147,15 @@ def _parse_response(raw: str) -> ReviewResult:
     Returns ``approved=True`` on any parsing failure so the reviewer never
     blocks execution.
     """
-    # Scan the first non-empty line for APPROVED / REVISED.
-    # Handles both exact ("APPROVED") and narrative ("The SQL is APPROVED.")
-    # responses without being so loose that unrelated text triggers a false match.
-    first_line = next(
-        (line.strip() for line in raw.splitlines() if line.strip()),
-        "",
-    ).upper()
+    # Normalize the entire response for case-insensitive matching
+    normalized = raw.upper()
 
-    if "APPROVED" in first_line and "REVISED" not in first_line:
+    # Check for APPROVED anywhere in the response
+    if "APPROVED" in normalized and "REVISED" not in normalized:
         return ReviewResult(approved=True)
 
-    if "REVISED" in first_line:
+    # Check for REVISED anywhere in the response
+    if "REVISED" in normalized:
         sql_match = re.search(r"```(?:sql)?\s*\n?(.*?)```", raw, re.DOTALL | re.IGNORECASE)
         if not sql_match:
             _log.warning(
@@ -178,9 +175,8 @@ def _parse_response(raw: str) -> ReviewResult:
 
         return ReviewResult(approved=False, revised_sql=revised_sql, changes=changes)
 
+    # If neither APPROVED nor REVISED found anywhere, treat as approved
     _log.warning(
-        "[sql_reviewer] Unparseable response (first line: %r) — treating as approved.",
-        first_line[:120],
+        "[sql_reviewer] Unparseable response (no APPROVED/REVISED found) — treating as approved.",
     )
     return ReviewResult(approved=True)
-
