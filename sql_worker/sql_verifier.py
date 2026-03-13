@@ -181,14 +181,14 @@ def _validate_columns(
             continue
         if col_name in _BUILTIN_FUNCS:
             continue
-        if col_name in select_aliases or col_name in cte_columns:
-            continue
 
         if qualifier:
             _check_qualified_column(
                 col_name, qualifier, registry, col_to_tables, errors
             )
         else:
+            if col_name in select_aliases or col_name in cte_columns:
+                continue
             tables_in_query = set(alias_map.values())
             _check_bare_column(col_name, col_to_tables, cte_columns, tables_in_query, warnings, errors)
 

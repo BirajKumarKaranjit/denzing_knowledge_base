@@ -360,6 +360,21 @@ class TestColumnErrors:
         errors = [e for e in result.errors if e.error_type == "column_not_in_ddl"]
         assert len(errors) >= 1
 
+    def test_qualified_column_in_cte_not_masked_by_cte_output_name(self, registry):
+        sql = (
+            "WITH cte_a AS ("
+            "  SELECT g.season_year FROM dwh_d_games g"
+            "), cte_b AS ("
+            "  SELECT tc.playoff_round "
+            "  FROM dwh_f_team_boxscore tc"
+            ") "
+            "SELECT season_year FROM cte_a"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        errors = [e for e in result.errors if e.error_type == "column_not_in_ddl"]
+        assert any(e.table == "dwh_f_team_boxscore" and e.column == "playoff_round" for e in errors)
+
 
 # ===========================================================================
 # verify_sql — UNION ALL structural checks
