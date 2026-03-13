@@ -318,6 +318,17 @@ Interpretation: season = 2022, game_type = playoffs (both applied).
 AND g.game_type ILIKE '%playoff%'
 AND g.season_year = '2022'
 ---
+
+## LIMIT on Superlative Queries
+
+When the user asks for the "best", "most", "highest", "lowest", "worst", or any
+superlative that implies a ranking, do not use LIMIT 1.
+Use LIMIT 10 so the user can compare values across the top results.
+LIMIT 1 is only appropriate when the user explicitly asks for a single record
+(e.g. "what was the last game", "who holds the record").
+
+---
+
 ## Quick-Reference
 
 | Situation | Filter |
