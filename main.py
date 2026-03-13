@@ -294,7 +294,7 @@ def cmd_query(user_query: str) -> None:
     from kb_system.kb_retriever import retrieve_context_for_query
     from kb_system.peer import run_peer
     from utils.prompt_builder import build_sql_prompt
-    from sql_worker.sql_generator import generate_sql, extract_sql_from_response, build_retry_prompt
+    from sql_worker.sql_generator import generate_sql, extract_sql_from_response, build_retry_prompt, is_query_relevant, answer_meta_query
     from sql_worker.sql_verifier import verify_sql
     from sql_worker.sql_reviewer import review_sql
     from utils.llm_client import get_llm_client
