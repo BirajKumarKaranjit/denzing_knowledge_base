@@ -55,3 +55,13 @@ CREATE TABLE dwh_f_player_team_seasons (player_id text, season text, team_id tex
 - **team_id**: Commonly joins with a team dimension table on team_id to access team-specific information like team name, location, etc.
 
 - **season**: May be used in conjunction with a calendar or season dimension table to provide additional temporal context or attributes related to the season.
+
+## When to Use This Table
+
+Use this table when the question involves:
+- Which team was a player on during a specific season
+- How many games did a player's team play that season
+- Filtering players who were on a specific team in a specific year
+
+Do NOT use dwh_d_players.team_id for historical season-team questions.
+This table is the authoritative source for player-team-season relationships.

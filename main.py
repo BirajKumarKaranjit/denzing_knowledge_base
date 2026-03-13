@@ -194,6 +194,47 @@ def _build_ddl_context(retrieval_result: dict) -> str:
     return "\n\n".join(chunks)
 
 
+def _extract_table_names_from_sql(sql: str) -> set[str]:
+    """Extract referenced physical table names from SQL text."""
+    from sqlglot import exp, parse
+
+    tables: set[str] = set()
+    try:
+        statements = parse(sql)
+    except Exception:
+        return tables
+
+    for stmt in statements:
+        for table in stmt.find_all(exp.Table):
+            name = (table.name or "").strip()
+            if name:
+                tables.add(name)
+    return tables
+
+
+def _build_reviewer_ddl_context(retrieval_result: dict, sql: str) -> str:
+    """Build reviewer DDL context from retrieval plus SQL-referenced tables."""
+    chunks: list[str] = []
+    seen: set[str] = set()
+
+    for table in retrieval_result.get("matched_tables", []):
+        table_name = (table.get("table_name") or "").strip()
+        content = (table.get("content") or "").strip()
+        if table_name and content and table_name not in seen:
+            seen.add(table_name)
+            chunks.append(content)
+
+    for table_name in sorted(_extract_table_names_from_sql(sql)):
+        if table_name in seen:
+            continue
+        ddl = (Sample_NBA_DDL_DICT.get(table_name) or "").strip()
+        if ddl:
+            seen.add(table_name)
+            chunks.append(ddl)
+
+    return "\n\n".join(chunks)
+
+
 def _build_guidelines_context(retrieval_result: dict) -> str:
     """Concatenate SQL guideline content from *retrieval_result*."""
     chunks: list[str] = []
@@ -211,6 +252,29 @@ def _build_guidelines_context(retrieval_result: dict) -> str:
     return "\n\n".join(chunks)
 
 
+def _is_executable_sql(sql: str) -> bool:
+    """Return True when SQL has at least one executable statement."""
+    import re
+
+    if not sql or not sql.strip():
+        return False
+
+    without_block_comments = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    without_line_comments = re.sub(r"--.*?$", "", without_block_comments, flags=re.MULTILINE)
+    candidate = without_line_comments.strip().strip(";").strip()
+    if not candidate:
+        return False
+
+    try:
+        from sqlglot import parse
+
+        statements = parse(candidate)
+    except Exception:
+        return False
+
+    return bool(statements)
+
+
 def cmd_query(user_query: str) -> None:
     """Run a full pipeline query: relevance gate → retrieve → assemble → generate SQL → PEER.
 
@@ -225,7 +289,7 @@ def cmd_query(user_query: str) -> None:
     from kb_system.kb_retriever import retrieve_context_for_query
     from kb_system.peer import run_peer
     from utils.prompt_builder import build_sql_prompt
-    from sql_worker.sql_generator import generate_sql, extract_sql_from_response, is_query_relevant, answer_meta_query, build_retry_prompt
+    from sql_worker.sql_generator import generate_sql, extract_sql_from_response, build_retry_prompt
     from sql_worker.sql_verifier import verify_sql
     from sql_worker.sql_reviewer import review_sql
     from utils.llm_client import get_llm_client
@@ -292,6 +356,7 @@ def cmd_query(user_query: str) -> None:
         print(f"\n[peer] Warning: PEER encountered an error: {peer_result.error}")
 
     final_sql = peer_result.sql
+    verification_passed: bool = False
 
     verification_attempts: int = 0
     _MAX_VERIFICATION_ATTEMPTS: int = 2
@@ -305,6 +370,7 @@ def cmd_query(user_query: str) -> None:
                 print(f"\n\n[verifier] Warning: {w}")
 
         if verification.is_valid:
+            verification_passed = True
             if verification_attempts == 1:
                 print("\n[verifier] Passed — no schema errors.")
             else:
@@ -367,7 +433,7 @@ def cmd_query(user_query: str) -> None:
 
     if SQL_REVIEWER_ENABLED:
         _reviewer_client = get_llm_client(SQL_REVIEWER_PROVIDER, SQL_REVIEWER_API_KEY)
-        ddl_context = _build_ddl_context(retrieval_result)
+        ddl_context = _build_reviewer_ddl_context(retrieval_result, final_sql)
 
         review = review_sql(
             user_query=user_query,
@@ -386,8 +452,24 @@ def cmd_query(user_query: str) -> None:
 
             revised = review.revised_sql or ""
             if revised:
+                if not _is_executable_sql(revised):
+                    print(
+                        "\n[sql_reviewer] Revised SQL is empty/comment-only — using original."
+                    )
+                    revised = ""
+
+            if revised:
                 revised_check = verify_sql(revised, _COLUMN_REGISTRY)
-                if revised_check.is_valid:
+                original_tables = _extract_table_names_from_sql(final_sql)
+                revised_tables = _extract_table_names_from_sql(revised)
+                dropped_tables = sorted(original_tables - revised_tables)
+
+                if verification_passed and dropped_tables:
+                    print(
+                        "\n[sql_reviewer] Revised SQL dropped referenced table(s) "
+                        f"{dropped_tables} after verifier passed — using original."
+                    )
+                elif revised_check.is_valid:
                     final_sql = revised
                     print("\n[sql_reviewer] Revised SQL passed schema check — using revised SQL.")
                 else:
@@ -403,8 +485,14 @@ def cmd_query(user_query: str) -> None:
     print(f"{'=' * 60}")
     print(final_sql)
     print(f"{'=' * 60}\n")
-    print("\n[executor] Executing SQL against remote database...")
-    success, exec_error = _execute_sql(final_sql)
+
+    if not _is_executable_sql(final_sql):
+        print("[main] Generated SQL is empty/comment-only and not executable.")
+        exec_error = "Generated SQL is empty/comment-only"
+        success = False
+    else:
+        print("\n[executor] Executing SQL against remote database...")
+        success, exec_error = _execute_sql(final_sql)
 
     if not success and exec_error:
         print(f"\n[sql_generator] Attempt 1 failed: {exec_error}. Retrying...")
@@ -440,8 +528,12 @@ def cmd_query(user_query: str) -> None:
         print(final_retry_sql)
         print(f"{'=' * 60}\n")
 
-        print("[executor] Executing retry SQL against remote database...")
-        retry_success, retry_error = _execute_sql(final_retry_sql)
+        if not _is_executable_sql(final_retry_sql):
+            print("[main] Retry SQL is empty/comment-only and not executable.")
+            retry_success, retry_error = False, "Retry SQL is empty/comment-only"
+        else:
+            print("[executor] Executing retry SQL against remote database...")
+            retry_success, retry_error = _execute_sql(final_retry_sql)
 
         if not retry_success:
             print(f"\n[sql_generator] Attempt 2 failed: {retry_error}")

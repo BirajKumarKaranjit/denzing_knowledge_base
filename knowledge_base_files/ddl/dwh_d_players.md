@@ -72,3 +72,11 @@ CREATE TABLE dwh_d_players (
 - **team_id**: Typically joined with a team dimension table to get detailed team information.
 - **player_id**: Used to join with other player-related tables, such as performance statistics or contract details.
 - **country**: Can be joined with a country reference table for additional geographic data.
+
+## Column Notes
+
+- team_id: represents the player's CURRENT team only (point-in-time snapshot).
+  Do NOT use this to determine which team a player was on in a past season.
+  For historical team membership use dwh_f_player_team_seasons.team_id
+  (one row per player per season per team).
+  For game-level team use dwh_f_player_boxscore.team_id.

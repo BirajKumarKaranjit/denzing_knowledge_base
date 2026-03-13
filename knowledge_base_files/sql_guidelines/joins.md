@@ -234,6 +234,21 @@ LIMIT 1;
 Use JOIN for relationships, and WHERE for membership checks when multiple foreign keys reference the same entity.
 ---
 
+## RULE: Collapse Multi-Row Dimension Tables Before Joining
+
+Tables that store one-to-many relationships per entity per season
+(awards, nicknames, tags, transactions) must be collapsed to one row
+per join key in a CTE before joining to fact or aggregation CTEs.
+Joining them directly multiplies rows and produces duplicate output.
+
+Pattern:
+WITH collapsed AS (
+    SELECT player_id, season, COUNT(*) AS award_count
+    FROM dwh_f_player_awards
+    GROUP BY player_id, season
+)
+-- then join collapsed, not the raw table
+---
 ## Anti-Pattern Summary
 
 | Bad Pattern | Fix |

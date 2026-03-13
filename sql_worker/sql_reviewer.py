@@ -21,43 +21,42 @@ _log = logging.getLogger(__name__)
 
 _REVIEWER_SYSTEM_PROMPT = (
     "You are a SQL quality reviewer. You will be given a user question, a generated SQL query,\n"
-    "and the DDL for the relevant tables.\n\n"
-    "Your job: determine if the SQL correctly and completely answers the user's question.\n"
-    "If not, return a minimal corrected SQL using only tables and columns present in the DDL.\n\n"
+    "and DDL context.\n\n"
+    "Your job: determine whether the SQL answers the question correctly and completely.\n"
+    "If not, return a minimal corrected SQL.\n\n"
     "RULES:\n"
-    "- Use ONLY table and column names present in the supplied DDL. Never invent names.\n"
-    "- Make minimal changes. Preserve the original structure if it is logically sound.\n"
-    "- Never ask clarifying questions. If intent is ambiguous, pick the most reasonable\n"
-    "  interpretation, state it, and proceed.\n"
-    "- Do not add complexity unless it is required to correctly answer the question.\n\n"
+    "- The SQL has already passed schema verification upstream. Do not remove, rename, or\n"
+    "  question any table or column because it appears absent from DDL context.\n"
+    "  Schema existence is not your concern — focus on logic and result quality only.\n"
+    "- Use only names present in the supplied SQL and DDL context. Never invent new names.\n"
+    "- Make minimal edits. Preserve the original structure when it is logically sound.\n"
+    "- Do not add complexity unless required to correctly answer the question.\n"
+    "- Always prefix every column reference with its table alias (e.g. pb.points, g.game_date).\n"
+    "  This applies to SELECT, WHERE, JOIN ON, GROUP BY, HAVING, and ORDER BY.\n"
+    "  Never use bare column names.\n\n"
     "CHECKS — flag only if clearly wrong:\n"
-    "1. Does the SQL answer what the user actually asked?\n"
-    "2. Do all referenced tables and columns exist in the DDL?\n"
-    "   If not, rewrite using available columns. If no equivalent exists, return REVISED\n"
-    "   with a comment explaining what is missing.\n"
-    "3. Is aggregation at the correct level? Every non-aggregated SELECT column must\n"
-    "   appear in GROUP BY.\n"
-    "4. Are human-readable attributes included in SELECT (names, labels, dates)?\n"
-    "   Never expose raw IDs when a readable equivalent exists in the DDL.\n"
-    "5. Does any JOIN pattern multiply rows before an ORDER BY, LIMIT, or window function?\n"
-    "   If so, resolve the ambiguity in a CTE or use WHERE/IN/EXISTS instead.\n"
-    "6. If WHERE mixes AND and OR, are parentheses explicit?\n"
-    "7. If the question implies a time scope, is an appropriate filter applied?\n"
-    "   If not, state the assumption made.\n"
-    "8. For averages, prefer AVG(col). If dividing integers, cast to numeric explicitly.\n"
-    "9. For percent or ratio columns, verify the stored range before applying any\n"
-    "   multiplication or division.\n"
-    "10. If the question requires a granularity not present in the DDL, do NOT silently\n"
-    "    answer at a coarser level. Return REVISED with a comment explaining the limitation\n"
-    "    and what the query actually computes.\n\n"
-    "11. Always prefix every column reference with its table alias (e.g. <alias_name>.<column_name>, not <column_name>).\n"
-    "    Always prefix every column reference with its table alias without exception.\n" " This applies to WHERE, JOIN ON, SELECT, GROUP BY, and ORDER BY clauses.\n"
-    "  Never use bare column names regardless of whether ambiguity exists.\n\n"
-    "12. If the SQL returns an aggregate over time and no explicit timeframe is present, include MIN(date) and MAX(date) (or a clarifying comment) in the output, or apply a default time-scope and state that assumption.\n\n"
-    "13. Prefer human-readable attributes (name, title, label) over raw ID columns in SELECT.\n"
-    "   If a readable equivalent exists in the DDL, replace the ID with it.\n"
-    "   Exception: keep the ID if the user explicitly asked for it.\n\n"
-    "OUTPUT FORMAT — return exactly one of the following, nothing else:\n\n"
+    "1.  Does the SQL answer what the user actually asked?\n"
+    "2.  Is aggregation at the correct level? Every non-aggregated SELECT column must\n"
+    "    appear in GROUP BY.\n"
+    "3.  Are contextual dimension columns included alongside aggregates?\n"
+    "    If the query is about a specific named entity (player, team, product, customer),\n"
+    "    that entity's human-readable name MUST appear in SELECT — even when the query\n"
+    "    is already filtered to that entity. Also include time period and sample size.\n"
+    "4.  Does any JOIN pattern multiply rows before an ORDER BY, LIMIT, or window function?\n"
+    "    Resolve in a CTE or use WHERE/IN/EXISTS instead.\n"
+    "5.  If WHERE mixes AND and OR, are parentheses explicit?\n"
+    "6.  If the question implies a time scope, is an explicit filter applied or assumption stated?\n"
+    "7.  For averages, prefer AVG(col). If dividing integers, cast to numeric explicitly.\n"
+    "8.  For percent or ratio columns, verify the stored range (0–1 vs 0–100) before\n"
+    "    applying any multiplication or division.\n"
+    "9.  If the question requires a data granularity not present in the DDL, do NOT silently\n"
+    "    answer at a coarser level. Return REVISED with a SQL comment explaining the\n"
+    "    limitation and what the query actually computes.\n"
+    "10. Do all UNION ALL branches return the same number of columns?\n"
+    "11. If the question contains superlative intent ('best', 'most', 'highest', 'lowest',\n"
+    "    'worst', 'top'), use LIMIT 10 not LIMIT 1, unless the user explicitly asked\n"
+    "    for a single result.\n\n"
+    "OUTPUT FORMAT — return exactly one of the following. First line must be APPROVED or REVISED:\n\n"
     "If SQL is correct:\n"
     "APPROVED\n\n"
     "If SQL has issues:\n"
@@ -68,7 +67,6 @@ _REVIEWER_SYSTEM_PROMPT = (
     "CHANGES:\n"
     "- <specific change and why>\n"
 )
-
 
 @dataclass
 class ReviewResult:
@@ -147,13 +145,18 @@ def _parse_response(raw: str) -> ReviewResult:
     Returns ``approved=True`` on any parsing failure so the reviewer never
     blocks execution.
     """
-    # Normalize the entire response for case-insensitive matching
-    normalized = raw.upper()
-
-    if "APPROVED" in normalized and "REVISED" not in normalized:
+    stripped = raw.strip()
+    if not stripped:
+        _log.warning("[sql_reviewer] Empty response — treating as approved.")
         return ReviewResult(approved=True)
 
-    if "REVISED" in normalized:
+    first_line = stripped.splitlines()[0].strip().upper()
+    normalized = stripped.upper()
+
+    if first_line.startswith("APPROVED"):
+        return ReviewResult(approved=True)
+
+    if first_line.startswith("REVISED") or "REVISED" in normalized:
         sql_match = re.search(r"```(?:sql)?\s*\n?(.*?)```", raw, re.DOTALL | re.IGNORECASE)
         if not sql_match:
             _log.warning(
@@ -173,7 +176,8 @@ def _parse_response(raw: str) -> ReviewResult:
 
         return ReviewResult(approved=False, revised_sql=revised_sql, changes=changes)
 
-    _log.warning(
-        "[sql_reviewer] Unparseable response (no APPROVED/REVISED found) — treating as approved.",
-    )
+    if "APPROVED" in normalized and "REVISED" not in normalized:
+        return ReviewResult(approved=True)
+
+    _log.warning("[sql_reviewer] Unparseable response (first line: '%s') — treating as approved.", first_line)
     return ReviewResult(approved=True)
