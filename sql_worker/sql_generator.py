@@ -181,8 +181,9 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
     "  3. All UNION ALL branches have the same number and type of columns.\n"
     "  4. No ORDER BY / LIMIT appears directly inside a UNION ALL branch (wrap in subquery if needed).\n"
     "  5. GROUP BY is complete — every non-aggregated SELECT column is listed.\n"
-    "  6. Exactly one SQL statement is produced."
-    "  7. Whenever AND and OR appear in the same WHERE clause, always add parentheses to make the intended logic explicit to avoid precedence errors."
+    "  6. Exactly one SQL statement is produced.\n"
+    "  7. Whenever AND and OR appear in the same WHERE clause, always add parentheses to make the intended logic explicit to avoid precedence errors.\n"
+    "  8.Every column reference must be prefixed with its table alias without exception. Never use bare column names. Write <alias_name>.<column_name>, not <column_name>.\n"
 )
 
 

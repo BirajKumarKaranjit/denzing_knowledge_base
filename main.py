@@ -234,26 +234,26 @@ def cmd_query(user_query: str) -> None:
     print(f"  Query: {user_query}")
     print(f"{'=' * 60}")
 
-    relevant, category, response_msg, suggested_questions = is_query_relevant(
-        user_query, _SCHEMA_CONTEXT
-    )
-
-    if category == "META_QUERY":
-        print(f"\n[main] Meta query detected — answering from knowledge base documentation.")
-        kb_context = _load_meta_kb_context()
-        answer = answer_meta_query(user_query, kb_context)
-        print(f"\n{answer}\n")
-        return
-
-    if not relevant:
-        print(f"\n[main] Query rejected — category: {category}")
-        if response_msg:
-            print(f"  {response_msg}")
-        if suggested_questions:
-            print("\n  Try one of these instead:")
-            for i, q in enumerate(suggested_questions, 1):
-                print(f"    {i}. {q}")
-        return
+    # relevant, category, response_msg, suggested_questions = is_query_relevant(
+    #     user_query, _SCHEMA_CONTEXT
+    # )
+    #
+    # if category == "META_QUERY":
+    #     print(f"\n[main] Meta query detected — answering from knowledge base documentation.")
+    #     kb_context = _load_meta_kb_context()
+    #     answer = answer_meta_query(user_query, kb_context)
+    #     print(f"\n{answer}\n")
+    #     return
+    #
+    # if not relevant:
+    #     print(f"\n[main] Query rejected — category: {category}")
+    #     if response_msg:
+    #         print(f"  {response_msg}")
+    #     if suggested_questions:
+    #         print("\n  Try one of these instead:")
+    #         for i, q in enumerate(suggested_questions, 1):
+    #             print(f"    {i}. {q}")
+    #     return
 
     conn = get_connection(POSTGRES_DSN)
     retrieval_result = retrieve_context_for_query(conn, user_query)
@@ -488,5 +488,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
-    # cmd_query(input("\nEnter a natural language question to convert to SQL: "))
+    # main()
+    cmd_query(input("\nEnter a natural language question to convert to SQL: "))
