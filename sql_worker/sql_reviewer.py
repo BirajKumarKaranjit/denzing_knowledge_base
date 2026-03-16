@@ -16,6 +16,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+import sqlglot
+
 from utils.llm_client import call_llm
 from utils.prompts.kb_generation_prompts import get_dialect_instruction
 
@@ -133,7 +135,7 @@ def review_sql(
         _log.warning("\n[sql_reviewer] LLM call failed: %s — treating as approved.", exc)
         return ReviewResult(approved=True)
 
-    return _parse_response(raw)
+    return _parse_response(raw, dialect=dialect)
 
 
 def _build_user_prompt(
@@ -160,7 +162,7 @@ def _build_user_prompt(
     return "\n\n".join(parts)
 
 
-def _parse_response(raw: str) -> ReviewResult:
+def _parse_response(raw: str, dialect: str = "") -> ReviewResult:
     """Parse the raw LLM response into a ReviewResult.
 
     Returns ``approved=True`` on any parsing failure so the reviewer never
@@ -171,7 +173,7 @@ def _parse_response(raw: str) -> ReviewResult:
         _log.warning("[sql_reviewer] Empty response — treating as approved.")
         return ReviewResult(approved=True)
 
-    json_result = _parse_json_response(stripped)
+    json_result = _parse_json_response(stripped, dialect=dialect)
     if json_result is not None:
         return json_result
 
@@ -189,7 +191,7 @@ def _parse_response(raw: str) -> ReviewResult:
             )
             return ReviewResult(approved=True)
 
-        revised_sql = sql_match.group(1).strip()
+        revised_sql = format_sql(sql_match.group(1).strip(), dialect=dialect)
 
         changes: list[str] = []
         changes_match = re.search(r"CHANGES:\s*\n((?:\s*-[^\n]+\n?)+)", raw, re.IGNORECASE)
@@ -208,7 +210,7 @@ def _parse_response(raw: str) -> ReviewResult:
     return ReviewResult(approved=True)
 
 
-def _parse_json_response(raw: str) -> ReviewResult | None:
+def _parse_json_response(raw: str, dialect: str = "") -> ReviewResult | None:
     """Parse JSON-formatted reviewer response. Returns None when not JSON-like."""
     payload = raw
     if payload.startswith("```"):
@@ -237,5 +239,51 @@ def _parse_json_response(raw: str) -> ReviewResult | None:
         )
         return ReviewResult(approved=True)
 
-    return ReviewResult(approved=False, revised_sql=revised_sql.strip(), changes=changes)
+    formatted = format_sql(revised_sql.strip(), dialect=dialect)
+    return ReviewResult(approved=False, revised_sql=formatted, changes=changes)
+
+
+def format_sql(sql: str, dialect: str = "") -> str:
+    """Format SQL into a readable pretty-printed statement."""
+    cleaned = (sql or "").strip()
+    if not cleaned:
+        return cleaned
+
+    read_write = _normalize_sqlglot_dialect(dialect)
+    try:
+        return sqlglot.transpile(
+            cleaned,
+            read=read_write,
+            write=read_write,
+            pretty=True,
+        )[0]
+    except Exception:
+        return cleaned
+
+
+def _normalize_sqlglot_dialect(dialect: str) -> str:
+    """Map configured dialect names to sqlglot dialect names."""
+    normalized = (dialect or "").strip().lower()
+    if not normalized:
+        return "postgres"
+
+    mapping = {
+        "postgresql": "postgres",
+        "postgres": "postgres",
+        "snowflake": "snowflake",
+        "bigquery": "bigquery",
+        "mysql": "mysql",
+        "mariadb": "mysql",
+        "sqlserver": "tsql",
+        "mssql": "tsql",
+        "tsql": "tsql",
+        "sqlite": "sqlite",
+        "oracle": "oracle",
+        "redshift": "redshift",
+        "duckdb": "duckdb",
+        "trino": "trino",
+        "presto": "presto",
+        "databricks": "databricks",
+    }
+    return mapping.get(normalized, normalized)
 
