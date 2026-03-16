@@ -32,34 +32,49 @@ from utils.config import (
 from utils.sample_values_for_testing import Sample_NBA_DDL_DICT
 from sql_worker.schema_linker import build_column_registry
 import sys
+import re
 
 _COLUMN_REGISTRY: dict[str, list[str]] = build_column_registry(Sample_NBA_DDL_DICT)
 
 
 def _build_schema_context(ddl_dict: dict[str, str]) -> str:
-    """Derive a compact table+column context string from the DDL dict.
-    Parameters
-    ----------
-    ddl_dict:
-        Mapping of table_name -> raw CREATE TABLE SQL string.
-
-    Returns
-    -------
-    str
-        Compact multi-line string listing each table and its columns.
     """
+    Build schema context string from the NBA DDL dictionary.
+
+    Output format:
+    table_name: col1, col2, col3
+    """
+
     import re
-    lines: list[str] = []
+
+    lines = []
+
     for table_name, ddl_sql in ddl_dict.items():
-        col_matches = re.findall(r'^\s{2,}(\w+)\s+\w+', ddl_sql, re.MULTILINE)
-        if not col_matches:
-            col_matches = re.findall(r'\b([a-z][a-z0-9_]{2,})\b', ddl_sql)
-        cols = ", ".join(col_matches[:15])
-        lines.append(f"- {table_name}: {cols}")
+
+        # extract content inside parentheses
+        match = re.search(r"\((.*)\)", ddl_sql)
+        if not match:
+            continue
+
+        column_block = match.group(1)
+
+        columns = []
+
+        # split columns by comma
+        for col_def in column_block.split(","):
+            col_def = col_def.strip()
+
+            if not col_def:
+                continue
+
+            col_name = col_def.split()[0]
+            columns.append(col_name)
+
+        lines.append(f"{table_name}: {', '.join(columns)}")
+
     return "\n".join(lines)
 
 _SCHEMA_CONTEXT = _build_schema_context(Sample_NBA_DDL_DICT)
-
 
 def _load_meta_kb_context() -> str:
     """Load KB files relevant to meta/project questions.
@@ -184,16 +199,6 @@ def _print_table(headers: list[str], rows: list[tuple]) -> None:
     print()
 
 
-def _build_ddl_context(retrieval_result: dict) -> str:
-    """Concatenate DDL content from matched tables in *retrieval_result*."""
-    chunks: list[str] = []
-    for table in retrieval_result.get("matched_tables", []):
-        content = (table.get("content") or "").strip()
-        if content:
-            chunks.append(content)
-    return "\n\n".join(chunks)
-
-
 def _extract_table_names_from_sql(sql: str) -> set[str]:
     """Extract referenced physical table names from SQL text."""
     from sqlglot import exp, parse
@@ -237,23 +242,6 @@ def _build_reviewer_ddl_context(retrieval_result: dict, sql: str) -> str:
             seen.add(table_name)
             chunks.append(ddl)
 
-    return "\n\n".join(chunks)
-
-
-def _build_guidelines_context(retrieval_result: dict) -> str:
-    """Concatenate SQL guideline content from *retrieval_result*."""
-    chunks: list[str] = []
-    for guideline in retrieval_result.get("matched_sql_guidelines", []):
-        content = (guideline.get("content") or "").strip()
-        if content:
-            chunks.append(content)
-    for section_data in retrieval_result.get("always_inject", {}).values():
-        if not isinstance(section_data, dict):
-            continue
-        for sub_file in section_data.get("sub_files", []):
-            content = (sub_file.get("content") or "").strip()
-            if content:
-                chunks.append(content)
     return "\n\n".join(chunks)
 
 
