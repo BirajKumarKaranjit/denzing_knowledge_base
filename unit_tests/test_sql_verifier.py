@@ -280,6 +280,17 @@ class TestValidSQL:
 # ===========================================================================
 
 class TestColumnErrors:
+    def test_window_alias_used_in_where_is_invalid(self, registry):
+        sql = (
+            "SELECT p.full_name, RANK() OVER (ORDER BY pb.points DESC) AS rank "
+            "FROM dwh_f_player_boxscore pb "
+            "JOIN dwh_d_players p ON pb.player_id = p.player_id "
+            "WHERE rank = 1"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        assert any(e.column == "rank" for e in result.errors)
+
     def test_wrong_table_for_column(self, registry):
         # season_year lives on dwh_d_games, not dwh_d_players
         sql = "SELECT p.season_year FROM dwh_d_players p"
@@ -290,6 +301,16 @@ class TestColumnErrors:
         assert errors[0].column == "season_year"
         assert errors[0].table == "dwh_d_players"
         assert "dwh_d_games" in errors[0].message
+
+    def test_bare_column_not_in_query_scope_is_invalid(self, registry):
+        sql = (
+            "SELECT p.full_name "
+            "FROM dwh_d_players p "
+            "WHERE game_type = 'Regular Season'"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        assert any(e.error_type == "column_not_in_scope" for e in result.errors)
 
     def test_column_not_in_any_table(self, registry):
         sql = "SELECT p.invented_column FROM dwh_d_players p"

@@ -11,63 +11,67 @@ execution.
 from __future__ import annotations
 
 import logging
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from utils.llm_client import call_llm
+from utils.prompts.kb_generation_prompts import get_dialect_instruction
 
 _log = logging.getLogger(__name__)
 
 _REVIEWER_SYSTEM_PROMPT = (
-    "You are a SQL quality reviewer. You will be given a user question, a generated SQL query,\n"
-    "and DDL context.\n\n"
-    "Your job: determine whether the SQL answers the question correctly and completely.\n"
-    "If not, return a minimal corrected SQL.\n\n"
+    "You are a SQL quality reviewer. You will be given a user question, generated SQL,\n"
+    "relevant DDL, and dialect instructions.\n\n"
+    "Goal: judge whether the SQL is logically correct and complete for the question.\n"
+    "If incorrect, return a minimal corrected SQL.\n\n"
     "RULES:\n"
-    "- The SQL has already passed schema verification upstream. Do not remove, rename, or\n"
-    "  question any table or column because it appears absent from DDL context.\n"
-    "  Schema existence is not your concern — focus on logic and result quality only.\n"
-    "- Use only names present in the supplied SQL and DDL context. Never invent new names.\n"
-    "- Make minimal edits. Preserve the original structure when it is logically sound.\n"
-    "- Do not add complexity unless required to correctly answer the question.\n"
-    "- Always prefix every column reference with its table alias (e.g. pb.points, g.game_date).\n"
-    "  This applies to SELECT, WHERE, JOIN ON, GROUP BY, HAVING, and ORDER BY.\n"
-    "  Never use bare column names.\n\n"
-    "CHECKS — flag only if clearly wrong:\n"
-    "1.  Does the SQL answer what the user actually asked?\n"
-    "2.  Is aggregation at the correct level? Every non-aggregated SELECT column must\n"
-    "    appear in GROUP BY.\n"
-    "3.  Are contextual dimension columns included alongside aggregates?\n"
-    "    If the query is about a specific named entity (player, team, product, customer),\n"
-    "    that entity's human-readable name MUST appear in SELECT — even when the query\n"
-    "    is already filtered to that entity. Also include time period and sample size.\n"
-    "4.  Does any JOIN pattern multiply rows before an ORDER BY, LIMIT, or window function?\n"
-    "    Resolve in a CTE or use WHERE/IN/EXISTS instead.\n"
-    "5.  If WHERE mixes AND and OR, are parentheses explicit?\n"
-    "6.  If the question implies a time scope, is an explicit filter applied or assumption stated?\n"
-    "7.  For averages, prefer AVG(col). If dividing integers, cast to numeric explicitly.\n"
-    "8.  For percent or ratio columns, verify the stored range (0–1 vs 0–100) before\n"
-    "    applying any multiplication or division.\n"
-    "9.  If the question requires a data granularity not present in the DDL, do NOT silently\n"
-    "    answer at a coarser level. Return REVISED with a SQL comment explaining the\n"
-    "    limitation and what the query actually computes.\n"
-    "10. Do all UNION ALL branches return the same number of columns?\n"
-    "11. If the question contains superlative intent ('best', 'most', 'highest', 'lowest',\n"
-    "    'worst', 'top'), use LIMIT 10 not LIMIT 1, unless the user explicitly asked\n"
-    "    for a single result.\n\n"
-    "12. If the provided SQL is empty or a comment-only stub, return APPROVED with no changes.\n"
-    "    Never construct SQL from scratch. Your role is to review and minimally correct, not to generate.\n\n"
-    "OUTPUT FORMAT — return exactly one of the following. First line must be APPROVED or REVISED:\n\n"
-    "If SQL is correct:\n"
-    "APPROVED\n\n"
-    "If SQL has issues:\n"
-    "REVISED\n"
-    "```sql\n"
-    "<corrected SQL using only names from DDL>\n"
-    "```\n"
-    "CHANGES:\n"
-    "- <specific change and why>\n"
+    "- Schema existence validation is handled upstream. Do not remove or question any\n"
+    "  table or column. Focus on logic and answer quality only.\n"
+    "- If the provided SQL is empty or comment-only, return approved=true immediately.\n"
+    "  Never construct SQL from scratch - only review and minimally correct.\n"
+    "- Do not invent table or column names. Use only names present in the SQL or DDL.\n"
+    "- Make minimal edits. Preserve the original structure when logically sound.\n"
+    "- Follow dialect instructions exactly.\n"
+    "- Always prefix every column reference with its table alias in any SQL you write.\n"
+    "  Never use bare column names in SELECT, WHERE, JOIN ON, GROUP BY, HAVING, ORDER BY.\n"
+    "- Never filter a window-function alias at the same SELECT level where it is computed.\n"
+    "  Wrap in an outer CTE first: WITH ranked AS (...) SELECT * FROM ranked WHERE rank = 1.\n"
+    "- Keep revised SQL executable as a single statement with no prose or markdown.\n\n"
+    "CHECKLIST - flag only if clearly wrong:\n"
+    "1) Intent: does the SQL answer exactly what the user asked?\n"
+    "2) Aggregation grain: grouping and calculation level are correct.\n"
+    "   Every non-aggregated SELECT column must appear in GROUP BY.\n"
+    "3) Named entity in SELECT: if the question is about a specific entity\n"
+    "   (player, team, product, customer), its human-readable name must appear\n"
+    "   in SELECT even when the query is already filtered to that entity.\n"
+    "4) Scope: time and entity filters match the question intent.\n"
+    "   If implied scope is missing, apply a sensible default and note it in changes.\n"
+    "5) Join correctness: no row multiplication before ORDER BY, LIMIT, or window functions.\n"
+    "   Resolve fan-out joins in a CTE or use WHERE/IN/EXISTS.\n"
+    "6) Superlative intent: if question contains 'best', 'most', 'highest', 'lowest',\n"
+    "   'worst', or 'top', use LIMIT 10 not LIMIT 1 unless user asked for a single result.\n"
+    "   When using RANK(), filter in an outer CTE - never WHERE rank=1 inside the same CTE.\n"
+    "7) UNION compatibility: all branches return the same number of columns.\n"
+    "8) AND/OR predicates: parentheses are explicit when AND and OR are mixed.\n"
+    "9) Averages: prefer AVG(col) over SUM/COUNT. Cast integers to numeric before division.\n"
+    "10) Percent/ratio columns: verify stored range (0-1 vs 0-100) before any transformation.\n"
+    "11) Granularity: if the question requires detail not in the DDL, do not silently answer\n"
+    "    at a coarser level. Set approved=false, include a SQL comment explaining the\n"
+    "    limitation, and compute the closest available approximation.\n"
+    "12) Output usefulness: include human-readable dimensions (names, dates, sample size)\n"
+    "    alongside aggregates. Never return bare aggregates without context columns.\n"
+    "- Only flag genuine issues. Approve confidently when SQL is correct.\n\n"
+    "OUTPUT - strictly a JSON object, no markdown:\n"
+    "{\n"
+    "  \"approved\": true | false,\n"
+    "  \"revised_sql\": string | null,\n"
+    "  \"changes\": [string, ...]\n"
+    "}\n"
+    "If approved=true: revised_sql must be null, changes must be [], no exceptions.\n"
+    "If approved=false: revised_sql must be a complete executable SQL statement.\n"
+    "Return only the JSON object; any extra text will be discarded.\n"
 )
 
 @dataclass
@@ -85,6 +89,7 @@ def review_sql(
     ddl_context: str,
     client: Any,
     model: str,
+    dialect: str = "",
 ) -> ReviewResult:
     """Submit *generated_sql* to the LLM reviewer and return a ReviewResult.
 
@@ -108,7 +113,12 @@ def review_sql(
         cannot be parsed. ``approved=False`` with ``revised_sql`` and
         ``changes`` populated when the reviewer suggests a correction.
     """
-    user_prompt = _build_user_prompt(user_query, generated_sql, ddl_context)
+    user_prompt = _build_user_prompt(
+        user_query=user_query,
+        generated_sql=generated_sql,
+        ddl_context=ddl_context,
+        dialect=dialect,
+    )
 
     try:
         raw = call_llm(
@@ -130,12 +140,21 @@ def _build_user_prompt(
     user_query: str,
     generated_sql: str,
     ddl_context: str,
+    dialect: str,
 ) -> str:
     """Assemble the user-facing review prompt."""
     parts: list[str] = [
         f"## USER QUESTION\n\n{user_query}",
         f"## GENERATED SQL\n\n```sql\n{generated_sql}\n```",
     ]
+
+    if dialect.strip():
+        parts.append(
+            "## SQL DIALECT INSTRUCTIONS\n\n"
+            f"Target dialect: {dialect}\n\n"
+            f"{get_dialect_instruction(dialect)}"
+        )
+
     if ddl_context.strip():
         parts.append(f"## RELEVANT TABLE DDL\n\n{ddl_context}")
     return "\n\n".join(parts)
@@ -151,6 +170,10 @@ def _parse_response(raw: str) -> ReviewResult:
     if not stripped:
         _log.warning("[sql_reviewer] Empty response — treating as approved.")
         return ReviewResult(approved=True)
+
+    json_result = _parse_json_response(stripped)
+    if json_result is not None:
+        return json_result
 
     first_line = stripped.splitlines()[0].strip().upper()
     normalized = stripped.upper()
@@ -183,3 +206,36 @@ def _parse_response(raw: str) -> ReviewResult:
 
     _log.warning("[sql_reviewer] Unparseable response (first line: '%s') — treating as approved.", first_line)
     return ReviewResult(approved=True)
+
+
+def _parse_json_response(raw: str) -> ReviewResult | None:
+    """Parse JSON-formatted reviewer response. Returns None when not JSON-like."""
+    payload = raw
+    if payload.startswith("```"):
+        payload = re.sub(r"^```(?:json)?\s*", "", payload, flags=re.IGNORECASE)
+        payload = re.sub(r"\s*```$", "", payload)
+
+    if not payload.startswith("{"):
+        return None
+
+    try:
+        obj = json.loads(payload)
+    except Exception:  # noqa: BLE001
+        return None
+
+    approved = bool(obj.get("approved", True))
+    revised_sql = obj.get("revised_sql")
+    changes_raw = obj.get("changes", [])
+    changes = [str(c).strip() for c in changes_raw if str(c).strip()]
+
+    if approved:
+        return ReviewResult(approved=True)
+
+    if not isinstance(revised_sql, str) or not revised_sql.strip():
+        _log.warning(
+            "[sql_reviewer] JSON response had approved=false but empty revised_sql — treating as approved."
+        )
+        return ReviewResult(approved=True)
+
+    return ReviewResult(approved=False, revised_sql=revised_sql.strip(), changes=changes)
+

@@ -28,11 +28,11 @@ from utils.config import (
     SQL_REVIEWER_MODEL,
     SQL_REVIEWER_PROVIDER,
     SQL_REVIEWER_API_KEY,
+    SQL_DIALECT,
 )
 from utils.sample_values_for_testing import Sample_NBA_DDL_DICT
 from sql_worker.schema_linker import build_column_registry
 import sys
-import re
 
 _COLUMN_REGISTRY: dict[str, list[str]] = build_column_registry(Sample_NBA_DDL_DICT)
 
@@ -355,7 +355,7 @@ def cmd_query(user_query: str) -> None:
     _MAX_VERIFICATION_ATTEMPTS: int = 2
 
     while verification_attempts < _MAX_VERIFICATION_ATTEMPTS:
-        verification = verify_sql(final_sql, _COLUMN_REGISTRY)
+        verification = verify_sql(final_sql, _COLUMN_REGISTRY, dialect=SQL_DIALECT)
         verification_attempts += 1
         print(f"\n{'=' * 60}")
         if verification.warnings:
@@ -434,6 +434,7 @@ def cmd_query(user_query: str) -> None:
             ddl_context=ddl_context,
             client=_reviewer_client,
             model=SQL_REVIEWER_MODEL,
+            dialect=SQL_DIALECT,
         )
         print(f"\n{'=' * 60}")
         if review.approved:
@@ -452,7 +453,7 @@ def cmd_query(user_query: str) -> None:
                     revised = ""
 
             if revised:
-                revised_check = verify_sql(revised, _COLUMN_REGISTRY)
+                revised_check = verify_sql(revised, _COLUMN_REGISTRY, dialect=SQL_DIALECT)
                 original_tables = _extract_table_names_from_sql(final_sql)
                 revised_tables = _extract_table_names_from_sql(revised)
                 dropped_tables = sorted(original_tables - revised_tables)

@@ -11,7 +11,7 @@ import os
 from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
-from sql_worker.sql_reviewer import ReviewResult, review_sql, _parse_response, _build_user_prompt
+from sql_worker.sql_reviewer import review_sql, _parse_response, _build_user_prompt
 from sql_worker.schema_linker import build_column_registry
 from sql_worker.sql_verifier import verify_sql
 _SIMPLE_SQL = (
@@ -78,16 +78,21 @@ class TestParseResponse:
         assert not r.approved
 class TestBuildUserPrompt:
     def test_all_sections_present(self):
-        p = _build_user_prompt("Q?", "SELECT 1;", "DDL here")
+        p = _build_user_prompt("Q?", "SELECT 1;", "DDL here", "postgresql")
         assert all(s in p for s in ["Q?", "SELECT 1;", "DDL here"])
 
     def test_empty_ddl_omitted(self):
-        p = _build_user_prompt("Q?", "SELECT 1;", "")
+        p = _build_user_prompt("Q?", "SELECT 1;", "", "postgresql")
         assert "RELEVANT TABLE DDL" not in p
 
     def test_sql_in_code_block(self):
-        p = _build_user_prompt("Q?", "SELECT 1;", "")
+        p = _build_user_prompt("Q?", "SELECT 1;", "", "postgresql")
         assert "```sql" in p and "SELECT 1;" in p
+
+    def test_dialect_instructions_present(self):
+        p = _build_user_prompt("Q?", "SELECT 1;", "", "snowflake")
+        assert "SQL DIALECT INSTRUCTIONS" in p
+        assert "Target dialect: snowflake" in p
 class TestReviewSQLApproved:
     def test_approved_response(self):
         with patch(_CALL_LLM_PATCH, return_value="APPROVED"):

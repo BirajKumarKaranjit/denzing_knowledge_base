@@ -21,18 +21,6 @@ _AGGREGATE_FUNCS: frozenset[str] = frozenset(
      "array_agg", "string_agg", "json_agg", "jsonb_agg", "listagg"}
 )
 
-_BUILTIN_FUNCS: frozenset[str] = frozenset(
-    {"now", "current_date", "current_timestamp", "current_time",
-     "extract", "date_trunc", "date_part", "coalesce", "nullif",
-     "cast", "convert", "lower", "upper", "trim", "length",
-     "substr", "substring", "replace", "concat", "row_number",
-     "rank", "dense_rank", "lag", "lead", "ntile", "percent_rank",
-     "cume_dist", "first_value", "last_value", "generate_series",
-     "unnest", "greatest", "least", "abs", "ceil", "floor", "round",
-     "to_char", "to_date", "to_timestamp", "regexp_replace",
-     "regexp_match", "regexp_matches", "split_part", "string_to_array"}
-)
-
 
 @dataclass
 class VerificationError:
@@ -55,7 +43,11 @@ class VerificationResult:
     errors: list[VerificationError] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
-def verify_sql(sql: str, registry: dict[str, list[str]]) -> VerificationResult:
+def verify_sql(
+    sql: str,
+    registry: dict[str, list[str]],
+    dialect: str = "",
+) -> VerificationResult:
     """Validate *sql* against *registry* using sqlglot AST analysis.
 
     Parameters
@@ -63,6 +55,9 @@ def verify_sql(sql: str, registry: dict[str, list[str]]) -> VerificationResult:
     registry:
         ``{table_name: [col1, col2, ...]}`` built by ``build_column_registry()``.
         All names must be lowercase.
+    dialect:
+        SQL dialect name used for sqlglot parsing (for example: postgresql,
+        snowflake, bigquery).
     Returns
     VerificationResult
         ``is_valid=False`` when at least one hard error is found.
@@ -74,8 +69,14 @@ def verify_sql(sql: str, registry: dict[str, list[str]]) -> VerificationResult:
     errors: list[VerificationError] = []
     warnings: list[str] = []
 
+    read_dialect = _normalize_sqlglot_dialect(dialect=dialect)
+
     try:
-        statements = sqlglot.parse(sql, error_level=sqlglot.ErrorLevel.IGNORE)
+        statements = sqlglot.parse(
+            sql,
+            read=read_dialect,
+            error_level=sqlglot.ErrorLevel.IGNORE,
+        )
     except Exception as exc:  # noqa: BLE001
         _log.debug("sqlglot parse error (non-fatal): %s", exc)
         return VerificationResult(is_valid=True, warnings=[f"Parse warning: {exc}"])
@@ -179,15 +180,15 @@ def _validate_columns(
 
         if not col_name or col_name == "*":
             continue
-        if col_name in _BUILTIN_FUNCS:
-            continue
 
         if qualifier:
             _check_qualified_column(
                 col_name, qualifier, registry, col_to_tables, errors
             )
         else:
-            if col_name in select_aliases or col_name in cte_columns:
+            if col_name in cte_columns:
+                continue
+            if col_name in select_aliases and _is_order_by_reference(col_ref):
                 continue
             tables_in_query = set(alias_map.values())
             _check_bare_column(col_name, col_to_tables, cte_columns, tables_in_query, warnings, errors)
@@ -212,6 +213,38 @@ def _resolve_qualifier(col_ref: exp.Column, alias_map: dict[str, str]) -> str | 
         return None
     table_str = str(table_part).lower()
     return alias_map.get(table_str, table_str)
+
+
+def _is_order_by_reference(col_ref: exp.Column) -> bool:
+    """Return True when the column is referenced inside ORDER BY."""
+    return col_ref.find_ancestor(exp.Order) is not None
+
+
+def _normalize_sqlglot_dialect(dialect: str) -> str:
+    """Map configured dialect names to sqlglot parser dialect names."""
+    normalized = (dialect or "").strip().lower()
+    if not normalized:
+        return "postgres"
+
+    mapping = {
+        "postgresql": "postgres",
+        "postgres": "postgres",
+        "snowflake": "snowflake",
+        "bigquery": "bigquery",
+        "mysql": "mysql",
+        "mariadb": "mysql",
+        "sqlserver": "tsql",
+        "mssql": "tsql",
+        "tsql": "tsql",
+        "sqlite": "sqlite",
+        "oracle": "oracle",
+        "redshift": "redshift",
+        "duckdb": "duckdb",
+        "trino": "trino",
+        "presto": "presto",
+        "databricks": "databricks",
+    }
+    return mapping.get(normalized, normalized)
 
 
 def _check_qualified_column(
@@ -272,6 +305,21 @@ def _check_bare_column(
     owning_tables = col_to_tables.get(col_name, set())
     if owning_tables:
         tables_in_scope = owning_tables & tables_in_query
+        if not tables_in_scope:
+            errors.append(
+                VerificationError(
+                    error_type="column_not_in_scope",
+                    message=(
+                        f"Column '{col_name}' exists on tables {sorted(owning_tables)} "
+                        "but none of those tables are present in this query scope."
+                    ),
+                    column=col_name,
+                    suggestion=(
+                        f"Join the table containing '{col_name}' or use the correct alias."
+                    ),
+                )
+            )
+            return
         if len(tables_in_scope) > 1:
             errors.append(
                 VerificationError(
