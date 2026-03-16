@@ -333,22 +333,7 @@ def cmd_query(user_query: str) -> None:
     print(f"{'=' * 60}")
 
     remote_conn = get_connection(NBA_POSTGRES_DSN)
-    peer_result = run_peer(raw_sql, remote_conn)
-
-    if peer_result.messages:
-        print(f"\n{'=' * 60}")
-        print("  Entity Resolution Notes:")
-        print(f"{'=' * 60}")
-        for msg in peer_result.messages:
-            print(f"  {msg}")
-
-    if peer_result.unvalidatable:
-        print(f"\n[peer] Could not validate: {', '.join(peer_result.unvalidatable)}")
-
-    if peer_result.error:
-        print(f"\n[peer] Warning: PEER encountered an error: {peer_result.error}")
-
-    final_sql = peer_result.sql
+    final_sql = raw_sql
     verification_passed: bool = False
 
     verification_attempts: int = 0
@@ -415,8 +400,7 @@ def cmd_query(user_query: str) -> None:
         verify_retry_prompt = prompt + schema_error_block
         verify_retry_response = generate_sql(verify_retry_prompt)
         verify_retry_sql = extract_sql_from_response(verify_retry_response)
-        verify_peer = run_peer(verify_retry_sql, remote_conn)
-        final_sql = verify_peer.sql
+        final_sql = verify_retry_sql
 
         print(f"\n{'=' * 60}")
         print("  Verification-Corrected SQL (attempt 2):")
@@ -470,6 +454,23 @@ def cmd_query(user_query: str) -> None:
                     print("\n[sql_reviewer] Revised SQL failed schema check — using original.")
                     for err in revised_check.errors:
                         print(f"  [schema] {err.message}")
+
+    peer_result = run_peer(final_sql, remote_conn)
+
+    if peer_result.messages:
+        print(f"\n{'=' * 60}")
+        print("  Entity Resolution Notes:")
+        print(f"{'=' * 60}")
+        for msg in peer_result.messages:
+            print(f"  {msg}")
+
+    if peer_result.unvalidatable:
+        print(f"\n[peer] Could not validate: {', '.join(peer_result.unvalidatable)}")
+
+    if peer_result.error:
+        print(f"\n[peer] Warning: PEER encountered an error: {peer_result.error}")
+
+    final_sql = peer_result.sql
 
     print(f"\n{'=' * 60}")
     if peer_result.patched:

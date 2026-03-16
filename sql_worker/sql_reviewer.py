@@ -34,6 +34,8 @@ _REVIEWER_SYSTEM_PROMPT = (
     "- If the provided SQL is empty or comment-only, return approved=true immediately.\n"
     "  Never construct SQL from scratch - only review and minimally correct.\n"
     "- Do not invent table or column names. Use only names present in the SQL or DDL.\n"
+    "- Do not rewrite string literal filter values in WHERE/HAVING (entity names, labels, enums).\n"
+    "  Preserve filter literals exactly as provided unless a SQL syntax fix requires escaping only.\n"
     "- Make minimal edits. Preserve the original structure when logically sound.\n"
     "- Follow dialect instructions exactly.\n"
     "- Always prefix every column reference with its table alias in any SQL you write.\n"
