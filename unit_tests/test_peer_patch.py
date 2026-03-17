@@ -30,6 +30,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import kb_system.peer as peer_mod
 from kb_system.peer import (
     _EntityMatch,
     _patch_python,
@@ -41,6 +42,8 @@ from kb_system.peer import (
     _collect_comparisons,
     _build_word_prefixes,
     _fuzzy_match,
+    _probe_ilike_fallback,
+    _probe_candidates,
 )
 import sqlparse
 
@@ -55,6 +58,42 @@ def _sub(column: str, table: str, value: str, corrected: str) -> _EntityMatch:
     e.corrected = corrected
     e.action = "auto_sub"
     return e
+
+
+class _FakeCursor:
+    def __init__(self, conn: "_FakeConn"):
+        self._conn = conn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, query, params=None):
+        self._conn.calls.append((str(query), tuple(params or ())))
+
+    def fetchall(self):
+        if self._conn.fetchall_queue:
+            return self._conn.fetchall_queue.pop(0)
+        return []
+
+    def fetchone(self):
+        rows = self.fetchall()
+        return rows[0] if rows else None
+
+
+class _FakeConn:
+    def __init__(self, fetchall_queue=None):
+        self.fetchall_queue = list(fetchall_queue or [])
+        self.calls = []
+        self.rollback_count = 0
+
+    def cursor(self):
+        return _FakeCursor(self)
+
+    def rollback(self):
+        self.rollback_count += 1
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +131,83 @@ class TestBuildWordPrefixes:
 
     def test_output_is_lowercase(self):
         assert _build_word_prefixes("JOEL EMBIID") == ["jo", "em"]
+
+    def test_hyphenated_name_is_split(self):
+        assert _build_word_prefixes("Karl-Anthony Towns") == ["ka", "an", "to"]
+
+    def test_apostrophe_name_is_split(self):
+        assert _build_word_prefixes("Shaquille O'Neal") == ["sh", "o", "ne"]
+
+    def test_smart_apostrophe_is_split(self):
+        assert _build_word_prefixes("D'Angelo O\u2019Neal") == ["d", "an", "o", "ne"]
+
+    def test_repeated_delimiters_are_ignored(self):
+        assert _build_word_prefixes("  Karl--Anthony   O''Neal  ") == ["ka", "an", "o", "ne"]
+
+
+class TestProbeIlikeFallback:
+    def test_layer_1_hits_without_fallback(self):
+        conn = _FakeConn(fetchall_queue=[[('Karl-Anthony Towns',)]])
+        result = _probe_ilike_fallback(conn, "dw.players", "full_name", "Karl Anthony Towns")
+        assert result == ["Karl-Anthony Towns"]
+        assert len(conn.calls) == 1
+        _, params = conn.calls[0]
+        assert params[:-1] == ("ka%", "% an%", "% to%")
+
+    def test_layer_2_runs_after_layer_1_miss(self):
+        conn = _FakeConn(fetchall_queue=[[], [('Minnesota Timberwolves',)]])
+        result = _probe_ilike_fallback(conn, "dw.teams", "full_name", "Minnesota Timber")
+        assert result == ["Minnesota Timberwolves"]
+        assert len(conn.calls) == 2
+        assert conn.calls[1][1][:-1] == ("mi%",)
+
+    def test_layer_3_uses_space_hyphen_and_apostrophe_boundaries(self):
+        conn = _FakeConn(fetchall_queue=[[], [], [('Karl-Anthony Towns',)]])
+        _probe_ilike_fallback(conn, "dw.players", "full_name", "Anthony Towns")
+        assert len(conn.calls) == 3
+        layer3_query, layer3_params = conn.calls[2]
+        assert "OR full_name ILIKE %s OR full_name ILIKE %s OR full_name ILIKE %s" in layer3_query
+        assert layer3_params[:-1] == (
+            "an%", "% an%", "%-an%", "%'an%",
+            "to%", "% to%", "%-to%", "%'to%",
+        )
+
+    def test_layer_3_catches_apostrophe_word_start_patterns(self):
+        conn = _FakeConn(fetchall_queue=[[], [], [("Shaquille O'Neal",)]])
+        result = _probe_ilike_fallback(conn, "dw.players", "full_name", "O Neal")
+        assert result == ["Shaquille O'Neal"]
+        layer3_params = conn.calls[2][1][:-1]
+        assert "%'ne%" in layer3_params
+
+
+class TestProbeCandidates:
+    def test_empty_value_short_circuits_without_db_calls(self):
+        conn = _FakeConn()
+        assert _probe_candidates(conn, "dwh_d_players", "full_name", "%%%", "dw") == []
+        assert conn.calls == []
+
+    def test_calls_ilike_fallback_with_wildcards_removed(self, monkeypatch):
+        conn = _FakeConn()
+
+        monkeypatch.setattr(peer_mod, "_trgm_available", lambda _conn: False)
+
+        captured = {}
+
+        def _fake_probe(_conn, qualified_table, column, value):
+            captured["qualified_table"] = qualified_table
+            captured["column"] = column
+            captured["value"] = value
+            return ["LeBron James"]
+
+        monkeypatch.setattr(peer_mod, "_probe_ilike_fallback", _fake_probe)
+
+        result = _probe_candidates(conn, "dwh_d_players", "full_name", "'%LeBron James%'", "dw_dwh")
+        assert result == ["LeBron James"]
+        assert captured == {
+            "qualified_table": "dw_dwh.dwh_d_players",
+            "column": "full_name",
+            "value": "LeBron James",
+        }
 
 
 # ---------------------------------------------------------------------------

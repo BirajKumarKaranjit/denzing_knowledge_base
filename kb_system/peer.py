@@ -148,7 +148,8 @@ def _build_word_prefixes(value: str) -> list[str]:
     """
     seen: set[str] = set()
     result: list[str] = []
-    for word in value.split():
+    # Treat hyphens/apostrophes (including common Unicode variants) as delimiters.
+    for word in filter(None, re.split(r"[\s\-'\u2019\u2010-\u2015]+", value)):
         prefix = word[:PEER_PROBE_PREFIX_LEN].lower()
         if prefix and prefix not in seen:
             seen.add(prefix)
@@ -256,10 +257,9 @@ def _probe_ilike_fallback(
     """Resolve candidates using the multi-prefix ILIKE strategy.
 
     Used when pg_trgm is not available. Applies three layers in order:
-    1. Multi-word AND intersection (most selective)
+    1. Positional word-start anchoring (most selective)
     2. First-word anchored prefix only (when AND returns nothing)
-    3. All-word contains patterns (when the entity word is not the first word
-       in the stored value, e.g. "Timberwolves" vs "Minnesota Timberwolves")
+    3. Word-start contains patterns (order-independent)
     """
     prefixes = _build_word_prefixes(value)
 
@@ -284,9 +284,8 @@ def _probe_ilike_fallback(
     conditions = " AND ".join(
         [f"{column} ILIKE %s"] + [f"{column} ILIKE %s" for _ in prefixes[1:]]
     )
-    params_list = [f"{prefixes[0]}%"] + [f"%{p}%" for p in prefixes[1:]]
+    params_list = [f"{prefixes[0]}%"] + [f"% {p}%" for p in prefixes[1:]]
     candidates = _run(conditions, tuple(params_list))
-
     _log.debug(
         "PEER ILIKE layer-1 %s.%s prefixes=%s → %d candidate(s)",
         qualified_table, column, prefixes, len(candidates),
@@ -300,11 +299,21 @@ def _probe_ilike_fallback(
         )
 
     if not candidates:
-        contains_conditions = " AND ".join(f"{column} ILIKE %s" for _ in prefixes)
-        contains_params = tuple(f"%{p}%" for p in prefixes)
+        contains_conditions = " AND ".join(
+            (
+                f"({column} ILIKE %s OR {column} ILIKE %s "
+                f"OR {column} ILIKE %s OR {column} ILIKE %s)"
+            )
+            for _ in prefixes
+        )
+        contains_params = tuple(
+            param
+            for p in prefixes
+            for param in (f"{p}%", f"% {p}%", f"%-{p}%", f"%'{p}%")
+        )
         candidates = _run(contains_conditions, contains_params)
         _log.debug(
-            "PEER ILIKE layer-3 contains fallback %s.%s → %d candidate(s)",
+            "PEER ILIKE layer-3 word-boundary contains fallback %s.%s → %d candidate(s)",
             qualified_table, column, len(candidates),
         )
 
