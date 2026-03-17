@@ -256,10 +256,13 @@ def _probe_ilike_fallback(
 ) -> list[str]:
     """Resolve candidates using the multi-prefix ILIKE strategy.
 
-    Used when pg_trgm is not available. Applies three layers in order:
+    Used when pg_trgm is not available. Applies four layers in order:
     1. Positional word-start anchoring (most selective)
     2. First-word anchored prefix only (when AND returns nothing)
     3. Word-start contains patterns (order-independent)
+    4. Single-character prefix fallback (PEER_PROBE_PREFIX_LEN-1) when all above
+       return nothing — last resort for typos that corrupt the prefix window
+       (e.g. 'Nkola Joick' -> still finds 'Nikola Jokić' via 'n%' and '% j%').
     """
     prefixes = _build_word_prefixes(value)
 
@@ -316,6 +319,35 @@ def _probe_ilike_fallback(
             "PEER ILIKE layer-3 word-boundary contains fallback %s.%s → %d candidate(s)",
             qualified_table, column, len(candidates),
         )
+
+    short_prefix_len = PEER_PROBE_PREFIX_LEN - 1
+    if not candidates and short_prefix_len >= 1:
+        short_seen: set[str] = set()
+        short_prefixes: list[str] = []
+        for word in filter(None, re.split(r"[\s\-'\u2019\u2010-\u2015]+", value)):
+            prefix = word[:short_prefix_len].lower()
+            if prefix and prefix not in short_seen:
+                short_seen.add(prefix)
+                short_prefixes.append(prefix)
+
+        if short_prefixes:
+            short_conditions = " AND ".join(
+                (
+                    f"({column} ILIKE %s OR {column} ILIKE %s "
+                    f"OR {column} ILIKE %s OR {column} ILIKE %s)"
+                )
+                for _ in short_prefixes
+            )
+            short_params = tuple(
+                param
+                for p in short_prefixes
+                for param in (f"{p}%", f"% {p}%", f"%-{p}%", f"%'{p}%")
+            )
+            candidates = _run(short_conditions, short_params)
+            _log.debug(
+                "PEER ILIKE layer-4 short-prefix fallback %s.%s short_prefixes=%s → %d candidate(s)",
+                qualified_table, column, short_prefixes, len(candidates),
+            )
 
     return candidates
 
