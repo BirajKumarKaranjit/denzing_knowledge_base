@@ -11,7 +11,12 @@ import os
 from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
-from sql_worker.sql_reviewer import review_sql, _parse_response, _build_user_prompt
+from sql_worker.sql_reviewer import (
+    review_sql,
+    _parse_response,
+    _build_user_prompt,
+    _REVIEWER_SYSTEM_PROMPT,
+)
 from sql_worker.schema_linker import build_column_registry
 from sql_worker.sql_verifier import verify_sql
 _SIMPLE_SQL = (
@@ -96,6 +101,12 @@ class TestBuildUserPrompt:
         p = _build_user_prompt("Q?", "SELECT 1;", "", "snowflake")
         assert "SQL DIALECT INSTRUCTIONS" in p
         assert "Target dialect: snowflake" in p
+
+
+class TestReviewerPromptRules:
+    def test_scope_context_rule_present(self):
+        assert "those resolved scope fields must appear in SELECT" in _REVIEWER_SYSTEM_PROMPT
+        assert "Ensure applied scope context is visible in output" in _REVIEWER_SYSTEM_PROMPT
 class TestReviewSQLApproved:
     def test_approved_response(self):
         with patch(_CALL_LLM_PATCH, return_value="APPROVED"):

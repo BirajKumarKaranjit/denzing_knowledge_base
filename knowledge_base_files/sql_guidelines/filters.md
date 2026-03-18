@@ -11,6 +11,17 @@ priority: critical
 #####NOTE: AlLways follow this rule all filters: 
 - If user asks vague questions in which the LLM might get confused whether to return latest game, latest year or what kind of game_type, always default to latest regular season. For example, if user asks "How many points did LeBron James score?" without any time context, interpret as "How many points did LeBron James score in his most recent game?" and apply `ORDER BY g.game_date DESC LIMIT 1` instead of season-level aggregation.
 
+## SCOPE PROJECTION CONTRACT (MANDATORY)
+
+If a query uses scope filters (period/year/date/type/status/category), the final SELECT must include the
+resolved scope values so the result is self-descriptive.
+
+- If filtered by a period label (for example game type), include that label in output.
+- If filtered by current/latest/previous period logic, include the resolved period value in output.
+- Do not return only entity + aggregate when scope filters were applied.
+
+This rule applies even when scope was computed in a CTE.
+
 ## RULE 1 — Name Matching: Always ILIKE '%name%', Never =
 Player names include suffixes (Jr., II, III) and accents (Jokić). Any `=` match silently returns zero rows when the stored value differs.
 

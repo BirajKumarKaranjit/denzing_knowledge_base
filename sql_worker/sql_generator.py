@@ -162,6 +162,10 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
     "- Every value computed in a CTE that scopes the query MUST appear in the final SELECT.\n"
     "- If a CTE computes a boundary value (minimum, maximum, threshold, or derived period) used for\n"
     "  filtering, expose that boundary in output so users can see query scope.\n"
+    "- If the query applies period/category scope filters (for example type/status/period labels), include\n"
+    "  the resolved scope field(s) in SELECT so results are self-descriptive.\n"
+    "- If the query uses a computed latest/max period boundary (for example MAX(year/period_id/date bucket)),\n"
+    "  include the resolved boundary value in SELECT with a clear alias.\n"
     "- Always include dimension/context columns that explain an aggregate: entity, time scope, and sample size.\n"
     "- Never return a bare aggregate (SUM, AVG, COUNT, MAX, MIN) as the only output column.\n"
     "- For ranking/list/comparison questions, return all qualifying rows; default to LIMIT 10 for open-ended\n"
@@ -207,6 +211,8 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
     "     in the final SELECT path; never compute a filter signal and forget to use it downstream.\n"
     "  10. Text entity filters use dialect-appropriate case-insensitive matching; avoid strict equality\n"
     "      for human names/labels/categories.\n"
+    "  11. If the query is scoped by period/category filters or computed latest/max boundary logic,\n"
+    "      those scope fields are present in final SELECT with descriptive aliases.\n"
 )
 
 

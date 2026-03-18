@@ -219,7 +219,7 @@ class TestValidSQL:
         assert result.is_valid
         assert result.errors == []
 
-    def test_nested_cte_multiple_ctes(self, registry):
+    def test_nested_cte_multiple_ctes_requires_scope_projection(self, registry):
         sql = (
             "WITH games_2022 AS ("
             "  SELECT game_id FROM dwh_d_games WHERE season_year = '2022'"
@@ -237,7 +237,26 @@ class TestValidSQL:
         )
         result = verify_sql(sql, registry)
         assert result.is_valid
-        assert result.errors == []
+        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+
+    def test_nested_cte_multiple_ctes_valid_when_scope_selected(self, registry):
+        sql = (
+            "WITH games_2022 AS ("
+            "  SELECT game_id, season_year FROM dwh_d_games WHERE season_year = '2022'"
+            "), "
+            "scorer_totals AS ("
+            "  SELECT player_id, SUM(points) AS total "
+            "  FROM dwh_f_player_boxscore pb "
+            "  JOIN games_2022 g ON pb.game_id = g.game_id "
+            "  GROUP BY player_id"
+            ") "
+            "SELECT p.full_name, st.total, '2022' AS season_year "
+            "FROM scorer_totals st "
+            "JOIN dwh_d_players p ON st.player_id = p.player_id "
+            "ORDER BY st.total DESC LIMIT 1"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
 
     def test_select_alias_used_in_order_by(self, registry):
         sql = (
@@ -273,6 +292,91 @@ class TestValidSQL:
             "union_column_mismatch", "order_by_in_union_branch"
         )]
         assert structural_errors == []
+
+    def test_scope_projection_not_triggered_by_join_only_comparison(self, registry):
+        sql = (
+            "SELECT p.full_name "
+            "FROM dwh_d_players p "
+            "JOIN dwh_f_player_boxscore pb ON p.player_id = pb.player_id "
+            "JOIN dwh_d_games g ON pb.game_id = g.game_id "
+            "JOIN (SELECT season_year FROM dwh_d_games LIMIT 1) s "
+            "  ON g.season_year = s.season_year "
+            "LIMIT 5"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+
+    def test_scope_projection_still_enforced_for_with_where_filter(self, registry):
+        sql = (
+            "WITH scoped_games AS ("
+            "  SELECT game_id FROM dwh_d_games WHERE season_year = '2022'"
+            ") "
+            "SELECT COUNT(*) AS games_count "
+            "FROM scoped_games"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+
+    def test_literal_neq_filter_not_enforced_as_scope_projection(self, registry):
+        sql = (
+            "SELECT p.full_name "
+            "FROM dwh_d_players p "
+            "WHERE p.position != 'Center'"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+
+    def test_literal_not_in_filter_not_enforced_as_scope_projection(self, registry):
+        sql = (
+            "SELECT p.full_name "
+            "FROM dwh_d_players p "
+            "WHERE p.position NOT IN ('Center', 'Forward')"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+
+    def test_select_star_skips_scope_projection_check(self, registry):
+        sql = (
+            "SELECT * "
+            "FROM dwh_d_games g "
+            "WHERE g.season_year = (SELECT MAX(g2.season_year) FROM dwh_d_games g2)"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+
+    def test_column_to_column_scope_filter_requires_projection(self, registry):
+        sql = (
+            "WITH current_season AS ("
+            "  SELECT MAX(g2.season_year) AS season_year FROM dwh_d_games g2"
+            ") "
+            "SELECT COUNT(*) AS game_count "
+            "FROM dwh_d_games g "
+            "JOIN current_season cs ON 1 = 1 "
+            "WHERE g.season_year = cs.season_year"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        assert any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+
+    def test_column_to_column_scope_filter_passes_when_projected(self, registry):
+        sql = (
+            "WITH current_season AS ("
+            "  SELECT MAX(g2.season_year) AS season_year FROM dwh_d_games g2"
+            ") "
+            "SELECT g.season_year, COUNT(*) AS game_count "
+            "FROM dwh_d_games g "
+            "JOIN current_season cs ON 1 = 1 "
+            "WHERE g.season_year = cs.season_year "
+            "GROUP BY g.season_year"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
 
 
 # ===========================================================================
@@ -648,7 +752,7 @@ class TestNBAIntegration:
         assert not result.is_valid
         assert any(e.column == "game_type" for e in result.errors)
 
-    def test_valid_triple_double_query(self, nba_registry):
+    def test_triple_double_query_requires_scope_projection(self, nba_registry):
         sql = (
             "WITH triple_doubles AS ("
             "  SELECT pb.player_id, p.full_name, COUNT(*) AS triple_double_count "
@@ -667,7 +771,7 @@ class TestNBAIntegration:
         )
         result = verify_sql(sql, nba_registry)
         assert result.is_valid
-        assert result.errors == []
+        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
 
     def test_union_mismatch_on_nba_tables(self, nba_registry):
         sql = (
@@ -679,7 +783,7 @@ class TestNBAIntegration:
         errors = [e for e in result.errors if e.error_type == "union_column_mismatch"]
         assert len(errors) >= 1
 
-    def test_team_name_join_pattern_valid(self, nba_registry):
+    def test_team_name_join_pattern_allows_literal_scope_filter_without_projection(self, nba_registry):
         sql = (
             "SELECT g.game_date, ht.full_name AS home_team, vt.full_name AS away_team, "
             "g.home_score, g.visitor_score "
@@ -691,5 +795,5 @@ class TestNBAIntegration:
         )
         result = verify_sql(sql, nba_registry)
         assert result.is_valid
-        assert result.errors == []
+        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
 

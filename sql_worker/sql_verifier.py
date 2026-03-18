@@ -28,7 +28,7 @@ class VerificationError:
 
     error_type: str
     """One of: column_not_in_ddl | wrong_table_for_column |
-    union_column_mismatch | order_by_in_union_branch"""
+    union_column_mismatch | order_by_in_union_branch | scope_filter_not_projected"""
     message: str
     column: str | None = None
     table: str | None = None
@@ -95,6 +95,7 @@ def verify_sql(
 
         errors.extend(_check_union_column_parity(statement))
         errors.extend(_check_order_by_in_union_branch(statement))
+        errors.extend(_check_scope_filter_projection(statement))
         warnings.extend(_check_group_by_completeness(statement))
 
     is_valid = len(errors) == 0
@@ -471,4 +472,174 @@ def _is_aggregate(expr: exp.Expression) -> bool:
         if expr.find(agg_type):
             return True
     return False
+
+
+def _check_scope_filter_projection(statement: exp.Expression) -> list[VerificationError]:
+    """Require columns used to restrict query scope to be visible in SELECT output."""
+    top_select = _top_level_select(statement)
+    if top_select is None:
+        return []
+
+    filtered_cols = _collect_scope_filtered_columns(statement)
+    if not filtered_cols:
+        return []
+
+    join_key_cols = _collect_join_key_columns(statement)
+    literal_filter_cols = _collect_literal_filter_columns(statement)
+    id_filter_cols = _collect_id_filter_columns(filtered_cols)
+    scope_cols = filtered_cols - join_key_cols - literal_filter_cols - id_filter_cols
+    if not scope_cols:
+        return []
+
+    projected = _collect_projected_field_names(top_select)
+    if "*" in projected:
+        return []
+
+    missing = sorted(col for col in scope_cols if col not in projected)
+    if not missing:
+        return []
+
+    return [
+        VerificationError(
+            error_type="scope_filter_not_projected",
+            message=(
+                "Columns used to restrict query scope are not in SELECT output: "
+                f"{missing}. Include them so the result is self-descriptive."
+            ),
+            suggestion="Add the missing scope columns to the SELECT clause.",
+        )
+    ]
+
+
+def _top_level_select(statement: exp.Expression) -> exp.Select | None:
+    """Return the root SELECT node when available."""
+    if isinstance(statement, exp.With):
+        statement = statement.this
+
+    if isinstance(statement, exp.Union):
+        node: exp.Expression = statement
+        while isinstance(node, exp.Union):
+            node = node.right
+        if isinstance(node, exp.Select):
+            return node
+        return None
+
+    if isinstance(statement, exp.Select):
+        return statement
+
+    if isinstance(statement, exp.Subquery):
+        inner = statement.this
+        if isinstance(inner, exp.With):
+            inner = inner.this
+        if isinstance(inner, exp.Select):
+            return inner
+
+    return None
+
+
+def _collect_scope_filtered_columns(statement: exp.Expression) -> set[str]:
+    """Collect all columns used in the top-level WHERE/HAVING predicates."""
+    top_select = _top_level_select(statement)
+    if top_select is None:
+        return set()
+
+    cols: set[str] = set()
+    for filter_node in (top_select.find(exp.Where), top_select.find(exp.Having)):
+        if filter_node is None:
+            continue
+        for col in filter_node.find_all(exp.Column):
+            col_name = (col.name or "").lower()
+            if not col_name:
+                continue
+            cols.add(col_name)
+    return cols
+
+
+def _collect_join_key_columns(statement: exp.Expression) -> set[str]:
+    """Collect column names used in JOIN ON clauses."""
+    cols: set[str] = set()
+    for join in statement.find_all(exp.Join):
+        on_clause = join.args.get("on")
+        if on_clause is None:
+            continue
+        for col in on_clause.find_all(exp.Column):
+            if col.name:
+                cols.add(col.name.lower())
+    return cols
+
+
+def _collect_literal_filter_columns(statement: exp.Expression) -> set[str]:
+    """Collect filtered columns compared directly against literal-like values."""
+    cols: set[str] = set()
+    top_select = _top_level_select(statement)
+    if top_select is None:
+        return cols
+
+    def _has_literal_like_value(node: exp.Expression) -> bool:
+        for child in node.args.values():
+            if child is None:
+                continue
+            if isinstance(child, list):
+                if any(isinstance(item, (exp.Literal, exp.Tuple)) for item in child):
+                    return True
+                continue
+            if isinstance(child, (exp.Literal, exp.Tuple)):
+                return True
+        return False
+
+    for filter_node in (top_select.find(exp.Where), top_select.find(exp.Having)):
+        if filter_node is None:
+            continue
+        for comparison in filter_node.find_all(
+            (exp.EQ, exp.NEQ, exp.ILike, exp.Like, exp.In, exp.GT, exp.GTE, exp.LT, exp.LTE)
+        ):
+            has_literal = _has_literal_like_value(comparison)
+            if not has_literal:
+                continue
+            for col in comparison.find_all(exp.Column):
+                if col.name:
+                    cols.add(col.name.lower())
+
+        for not_node in filter_node.find_all(exp.Not):
+            inner = not_node.this
+            if not isinstance(inner, exp.In):
+                continue
+
+            has_literal = _has_literal_like_value(inner)
+            if not has_literal:
+                continue
+
+            for col in inner.find_all(exp.Column):
+                if col.name:
+                    cols.add(col.name.lower())
+
+    return cols
+
+
+def _collect_id_filter_columns(filtered_cols: set[str]) -> set[str]:
+    """Collect identifier-style columns that should not be required in output."""
+    return {c for c in filtered_cols if c == "id" or c.endswith("_id")}
+
+
+def _collect_projected_field_names(select: exp.Select) -> set[str]:
+    """Return column/alias names visible in the top-level SELECT output."""
+    projected: set[str] = set()
+
+    for sel_expr in select.expressions:
+        if isinstance(sel_expr, exp.Star):
+            return {"*"}
+
+        if isinstance(sel_expr, exp.Column) and (sel_expr.name or "").strip() == "*":
+            return {"*"}
+
+        if isinstance(sel_expr, exp.Alias):
+            alias = str(sel_expr.alias).lower()
+            projected.add(alias)
+        for col in sel_expr.find_all(exp.Column):
+            if col.name:
+                projected.add(col.name.lower())
+
+
+    return projected
+
 
