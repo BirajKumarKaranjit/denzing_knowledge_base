@@ -260,6 +260,40 @@ producing meaningless results (Robert Parish having 1598 "triple doubles").
 
 ---
 
+## Streak and Window Logic
+
+When computing consecutive-event streaks (win streaks, activity streaks, threshold streaks):
+
+- Use a two-window gap/island pattern:
+  - `ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY event_date)`
+  - `ROW_NUMBER() OVER (PARTITION BY entity_id, qualifying_flag ORDER BY event_date)`
+- The second window must partition by `qualifying_flag`. If both windows use identical partitions,
+  grouping collapses and streak detection fails.
+- Filter on window outputs (for example `rank`, `row_num`, `streak_group`) only in an outer query/CTE.
+  Do not filter on a window alias at the same SELECT level where it is computed.
+- For partial-period comparisons, compare both sides at the same partial boundary.
+  Never compare partial-period values against full-period totals.
+- For multi-event winner logic (series/campaign/cohort), aggregate outcomes across all relevant events
+  before selecting a winner.
+- For per-segment differential metrics, use a deterministic paired-row join on shared event keys.
+
+---
+
+## Double Aggregation Prevention
+
+- Avoid aggregating already-aggregated metrics unless the metric definition explicitly requires two stages.
+- Do not `AVG()` a value that was already `SUM()`ed at an unnecessary inner grain.
+  Flatten to a single aggregation level when possible.
+- For per-entity/per-group averages on raw events, prefer `AVG(raw_metric)` at the target grain.
+- Avoid `SUM(metric)/COUNT(DISTINCT event_id)` when events can appear in multiple grouped entities;
+  this can distort denominators. Prefer directly averaged correctly scoped event rows.
+- Scalar subqueries used as denominators must be correlated to the same entity/event scope.
+  Never rely on arbitrary `LIMIT 1` scalar lookups for denominator selection.
+- For ratio denominators that depend on counterpart rows (peer/opponent/comparator), use explicit joins
+  on shared keys instead of unscoped scalar subqueries.
+
+---
+
 ## Anti-Pattern Summary
 
 | Bad Pattern | Fix |

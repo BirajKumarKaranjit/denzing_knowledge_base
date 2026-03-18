@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-import sqlglot
+import sqlparse
 
 from utils.llm_client import call_llm
 from utils.prompts.kb_generation_prompts import get_dialect_instruction
@@ -29,8 +29,10 @@ _REVIEWER_SYSTEM_PROMPT = (
     "Goal: judge whether the SQL is logically correct and complete for the question.\n"
     "If incorrect, return a minimal corrected SQL.\n\n"
     "RULES:\n"
-    "- Schema existence validation is handled upstream. Do not remove or question any\n"
-    "  table or column. Focus on logic and answer quality only.\n"
+    "- Prefer logic and answer quality checks. Do not silently substitute tables/columns\n"
+    "  to different sources unless a checklist rule explicitly requires approved=false.\n"
+    "- Do not replace a granular source table with a coarser summary table when the question\n"
+    "  requires granular counting or filtering. If logic cannot be preserved, set approved=false.\n"
     "- If the provided SQL is empty or comment-only, return approved=true immediately.\n"
     "  Never construct SQL from scratch - only review and minimally correct.\n"
     "- Do not invent table or column names. Use only names present in the SQL or DDL.\n"
@@ -47,6 +49,8 @@ _REVIEWER_SYSTEM_PROMPT = (
     "1) Intent: does the SQL answer exactly what the user asked?\n"
     "2) Aggregation grain: grouping and calculation level are correct.\n"
     "   Every non-aggregated SELECT column must appear in GROUP BY.\n"
+    "   Check for double-aggregation: if a CTE already groups by event and SUMs a metric,\n"
+    "   outer layers must not AVG that pre-summed metric; flatten to one aggregation level.\n"
     "3) Named entity in SELECT: if the question is about a specific entity\n"
     "   (player, team, product, customer), its human-readable name must appear\n"
     "   in SELECT even when the query is already filtered to that entity.\n"
@@ -57,6 +61,8 @@ _REVIEWER_SYSTEM_PROMPT = (
     "6) Superlative intent: if question contains 'best', 'most', 'highest', 'lowest',\n"
     "   'worst', or 'top', use LIMIT 10 not LIMIT 1 unless user asked for a single result.\n"
     "   When using RANK(), filter in an outer CTE - never WHERE rank=1 inside the same CTE.\n"
+    "   Verify expected output columns are present (headline metric + supporting context).\n"
+    "   If required context columns are missing, set approved=false and add them.\n"
     "7) UNION compatibility: all branches return the same number of columns.\n"
     "8) AND/OR predicates: parentheses are explicit when AND and OR are mixed.\n"
     "9) Averages: prefer AVG(col) over SUM/COUNT. Cast integers to numeric before division.\n"
@@ -66,6 +72,9 @@ _REVIEWER_SYSTEM_PROMPT = (
     "    limitation, and compute the closest available approximation.\n"
     "12) Output usefulness: include human-readable dimensions (names, dates, sample size)\n"
     "    alongside aggregates. Never return bare aggregates without context columns.\n"
+    "13) Schema assumption check: if SQL references a column not present in supplied DDL,\n"
+    "    set approved=false immediately. In revised_sql, compute from available raw columns\n"
+    "    or return an empty SQL block and explain the missing column in changes.\n"
     "- Only flag genuine issues. Approve confidently when SQL is correct.\n\n"
     "OUTPUT - strictly a JSON object, no markdown:\n"
     "{\n"
@@ -246,19 +255,20 @@ def _parse_json_response(raw: str, dialect: str = "") -> ReviewResult | None:
 
 
 def format_sql(sql: str, dialect: str = "") -> str:
-    """Format SQL into a readable pretty-printed statement."""
+    """Format SQL for terminal readability without over-expanding clauses."""
     cleaned = (sql or "").strip()
     if not cleaned:
         return cleaned
 
-    read_write = _normalize_sqlglot_dialect(dialect)
     try:
-        return sqlglot.transpile(
+        _ = _normalize_sqlglot_dialect(dialect)
+        return sqlparse.format(
             cleaned,
-            read=read_write,
-            write=read_write,
-            pretty=True,
-        )[0]
+            reindent=True,
+            keyword_case="upper",
+            strip_comments=False,
+            use_space_around_operators=True,
+        ).strip()
     except Exception:
         return cleaned
 

@@ -268,6 +268,26 @@ def _is_executable_sql(sql: str) -> bool:
     return bool(statements)
 
 
+def _format_sql(sql: str) -> str:
+    """Format SQL for terminal display only."""
+    import sqlparse
+
+    cleaned = (sql or "").strip()
+    if not cleaned:
+        return cleaned
+
+    try:
+        return sqlparse.format(
+            cleaned,
+            reindent=True,
+            keyword_case="upper",
+            strip_comments=False,
+            use_space_around_operators=True,
+        ).strip()
+    except Exception:
+        return cleaned
+
+
 def cmd_query(user_query: str) -> None:
     """Run a full pipeline query: relevance gate → retrieve → assemble → generate SQL → PEER.
 
@@ -327,9 +347,10 @@ def cmd_query(user_query: str) -> None:
     print(f"\n[main] Calling LLM for SQL generation...")
     llm_response = generate_sql(prompt)
     raw_sql = extract_sql_from_response(llm_response)
+    raw_sql_display = _format_sql(raw_sql)
     print(f"The LLM returned the following raw SQL (before PEER patching):")
     print(f"\n{'=' * 60}")
-    print(raw_sql)
+    print(raw_sql_display)
     print(f"{'=' * 60}")
 
     remote_conn = get_connection(NBA_POSTGRES_DSN)
@@ -405,7 +426,7 @@ def cmd_query(user_query: str) -> None:
         print(f"\n{'=' * 60}")
         print("  Verification-Corrected SQL (attempt 2):")
         print(f"{'=' * 60}")
-        print(final_sql)
+        print(_format_sql(final_sql))
         print(f"{'=' * 60}\n")
 
     if SQL_REVIEWER_ENABLED:
@@ -478,7 +499,7 @@ def cmd_query(user_query: str) -> None:
     else:
         print("  Generated SQL:")
     print(f"{'=' * 60}")
-    print(final_sql)
+    print(_format_sql(final_sql))
     print(f"{'=' * 60}\n")
 
     if not _is_executable_sql(final_sql):
@@ -500,7 +521,7 @@ def cmd_query(user_query: str) -> None:
         print(f"\n{'=' * 60}")
         print("  Retry SQL (before PEER patching):")
         print(f"{'=' * 60}")
-        print(retry_raw_sql)
+        print(_format_sql(retry_raw_sql))
         print(f"{'=' * 60}")
 
         retry_peer = run_peer(retry_raw_sql, remote_conn)
@@ -520,7 +541,7 @@ def cmd_query(user_query: str) -> None:
         else:
             print("  Retry SQL:")
         print(f"{'=' * 60}")
-        print(final_retry_sql)
+        print(_format_sql(final_retry_sql))
         print(f"{'=' * 60}\n")
 
         if not _is_executable_sql(final_retry_sql):

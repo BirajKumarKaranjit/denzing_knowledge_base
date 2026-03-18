@@ -139,6 +139,17 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
     "- Never invent table names, column names, or aliases not present in the schema.\n"
     "- Use internal ID columns only for JOINs or filters — never expose raw ID columns in SELECT output.\n\n"
 
+    "## TABLE SELECTION — GRAIN AWARENESS\n"
+    "- Before choosing a table, confirm its grain. Summary or period-level tables must not be used\n"
+    "  for event-level counts, per-event averages, or event-level filtering.\n"
+    "- For distinct event counts and per-event metrics, prefer the most granular fact table available.\n"
+    "- Do not substitute a coarser summary table when the question requires granular evidence.\n"
+    "  If the required granular columns are missing, return an empty SQL block instead of downgrading grain.\n"
+    "- For status filters, use the authoritative status column on the relevant dimension table rather than\n"
+    "  similarly named status fields from unrelated tables.\n"
+    "- Before referencing any advanced metric column (percentages, ratings, derived flags), verify it is\n"
+    "  explicitly present in the provided schema. If absent, compute from raw available columns.\n\n"
+
     "## COLUMN OWNERSHIP — CRITICAL\n"
     "Columns belong to specific tables. Before writing any filter or subquery, confirm the column\n"
     "exists on the table you are querying.\n\n"
@@ -149,9 +160,14 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
     
     "## OUTPUT COMPLETENESS\n"
     "- Every value computed in a CTE that scopes the query MUST appear in the final SELECT.\n"
-    "-If a CTE computes a boundary value (a minimum, maximum, threshold, or derived period) to filter the main query, expose that value in the output so the user understands what time period, scope, or condition the result covers.\n"
-    "- Always include the dimension columns that explain an aggregate: the time period it covers, the entity it belongs to, and the sample size it is based on.\n"
-    "- Never return a bare aggregate (SUM, AVG, COUNT, MAX, MIN) as the sole output column. Every aggregate must be accompanied by the columns that answer: aggregate of what, over what scope, for how many records?\n"
+    "- If a CTE computes a boundary value (minimum, maximum, threshold, or derived period) used for\n"
+    "  filtering, expose that boundary in output so users can see query scope.\n"
+    "- Always include dimension/context columns that explain an aggregate: entity, time scope, and sample size.\n"
+    "- Never return a bare aggregate (SUM, AVG, COUNT, MAX, MIN) as the only output column.\n"
+    "- For ranking/list/comparison questions, return all qualifying rows; default to LIMIT 10 for open-ended\n"
+    "  rankings. Use LIMIT 1 only when the user explicitly asks for a single winner.\n"
+    "- If the question asks for a headline metric plus supporting context, include all requested supporting\n"
+    "  columns in SELECT.\n\n"
     
     "## NULL AND DIVISION SAFETY\n"
     "- Handle divide-by-zero with NULLIF(denominator, 0).\n"
@@ -160,8 +176,11 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
 
     "## ENTITY MATCHING\n"
     "- Apply case-insensitive comparison for all text filters (names, labels, categories, etc.).\n"
-    "- For string columns, use dialect-appropriate case-insensitive matching as directed in the\n"
-    "  SQL DIALECT INSTRUCTIONS section. Never use strict = for human names or categorical labels.\n\n"
+    "- Always use dialect-appropriate case-insensitive pattern matching for text entities.\n"
+    "- Strict equality on text is allowed only for exact machine codes; avoid strict equality for\n"
+    "  human-entered names, labels, and free-text categories.\n"
+    "- When filtering on RANK()/ROW_NUMBER() results, apply that filter in an outer query/CTE,\n"
+    "  never at the same SELECT level where the window value is computed.\n\n"
 
     "## RECENCY AND DATES\n"
     "- For 'latest', 'most recent', or 'last' record: dynamically select the MAX of the date column.\n"
@@ -183,7 +202,11 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
     "  5. GROUP BY is complete — every non-aggregated SELECT column is listed.\n"
     "  6. Exactly one SQL statement is produced.\n"
     "  7. Whenever AND and OR appear in the same WHERE clause, always add parentheses to make the intended logic explicit to avoid precedence errors.\n"
-    "  8.Every column reference must be prefixed with its table alias without exception. Never use bare column names. Write <alias_name>.<column_name>, not <column_name>.\n"
+    "  8. Every column reference must be prefixed with its table alias without exception.\n"
+    "  9. Every threshold/filter computed in a CTE (rank, row_number, derived flags) is actually applied\n"
+    "     in the final SELECT path; never compute a filter signal and forget to use it downstream.\n"
+    "  10. Text entity filters use dialect-appropriate case-insensitive matching; avoid strict equality\n"
+    "      for human names/labels/categories.\n"
 )
 
 

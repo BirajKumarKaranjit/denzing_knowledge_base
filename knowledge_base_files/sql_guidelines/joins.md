@@ -249,6 +249,24 @@ WITH collapsed AS (
 )
 -- then join collapsed, not the raw table
 ---
+## Alias / Nickname Resolution Joins
+
+When a query uses an alias or nickname to identify an entity (resolved via a
+lookup table like dwh_d_player_nicknames), the final SELECT MUST include the
+entity's canonical identifier (e.g. full_name) alongside all requested metrics.
+
+Never return only derived or aggregate columns without confirming which entity
+was matched. The user needs to see who or what was resolved.
+
+### Pattern
+```sql
+JOIN <alias_table> a ON a.entity_id = e.entity_id
+WHERE a.alias ILIKE '%<user_input>%'
+```
+
+Always include `e.full_name` (or equivalent canonical name column) in SELECT.
+Optionally include the matched alias when ambiguity is possible.
+---
 ## Anti-Pattern Summary
 
 | Bad Pattern | Fix |
