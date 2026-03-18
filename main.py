@@ -298,6 +298,13 @@ def cmd_query(user_query: str) -> None:
     """
     import time
     start_time = time.time()
+    sql_generation_time = 0.0
+    sql_verification_time = 0.0
+    sql_reviewer_time = 0.0
+    peer_module_time = 0.0
+    sql_execution_time = 0.0
+    query_classification_time = 0.0
+    query_mutation_kb_retrieval_time = 0.0
     from kb_system.kb_store import get_connection
     from kb_system.kb_retriever import retrieve_context_for_query
     from kb_system.peer import run_peer
@@ -311,9 +318,11 @@ def cmd_query(user_query: str) -> None:
     print(f"  Query: {user_query}")
     print(f"{'=' * 60}")
 
+    t0 = time.perf_counter()
     relevant, category, response_msg, suggested_questions = is_query_relevant(
         user_query, _SCHEMA_CONTEXT
     )
+    query_classification_time += time.perf_counter() - t0
 
     if category == "META_QUERY":
         print(f"\n[main] Meta query detected — answering from knowledge base documentation.")
@@ -333,7 +342,9 @@ def cmd_query(user_query: str) -> None:
         return
 
     conn = get_connection(POSTGRES_DSN)
+    t0 = time.perf_counter()
     retrieval_result = retrieve_context_for_query(conn, user_query)
+    query_mutation_kb_retrieval_time += time.perf_counter() - t0
 
     prompt, citation_md = build_sql_prompt(
         user_query=user_query,
@@ -345,8 +356,10 @@ def cmd_query(user_query: str) -> None:
     print(prompt)
     print(f"{'=' * 60}")
     print(f"\n[main] Calling LLM for SQL generation...")
+    t0 = time.perf_counter()
     llm_response = generate_sql(prompt)
     raw_sql = extract_sql_from_response(llm_response)
+    sql_generation_time += time.perf_counter() - t0
     raw_sql_display = _format_sql(raw_sql)
     print(f"The LLM returned the following raw SQL (before PEER patching):")
     print(f"\n{'=' * 60}")
@@ -355,7 +368,9 @@ def cmd_query(user_query: str) -> None:
 
     remote_conn = get_connection(NBA_POSTGRES_DSN)
     final_sql = raw_sql
+    t0 = time.perf_counter()
     initial_verification = verify_sql(final_sql, _COLUMN_REGISTRY, dialect=SQL_DIALECT)
+    sql_verification_time += time.perf_counter() - t0
     verifier_error_messages: list[str] = [
         f"[{err.error_type}] {err.message}" for err in initial_verification.errors
     ]
@@ -376,6 +391,7 @@ def cmd_query(user_query: str) -> None:
         _reviewer_client = get_llm_client(SQL_REVIEWER_PROVIDER, SQL_REVIEWER_API_KEY)
         ddl_context = _build_reviewer_ddl_context(retrieval_result, final_sql)
 
+        t0 = time.perf_counter()
         review = review_sql(
             user_query=user_query,
             generated_sql=final_sql,
@@ -385,6 +401,7 @@ def cmd_query(user_query: str) -> None:
             dialect=SQL_DIALECT,
             verifier_errors=verifier_error_messages,
         )
+        sql_reviewer_time += time.perf_counter() - t0
         print(f"\n{'=' * 60}")
         if review.approved:
             print("\n[sql_reviewer] Approved — no changes.")
@@ -401,9 +418,9 @@ def cmd_query(user_query: str) -> None:
             if revised:
                 final_sql = revised
 
-    print("\n[main] Proceeding to execution — retry logic handles any remaining SQL errors.")
-
+    t0 = time.perf_counter()
     peer_result = run_peer(final_sql, remote_conn)
+    peer_module_time += time.perf_counter() - t0
 
     if peer_result.messages:
         print(f"\n{'=' * 60}")
@@ -435,15 +452,19 @@ def cmd_query(user_query: str) -> None:
         success = False
     else:
         print("\n[executor] Executing SQL against remote database...")
+        t0 = time.perf_counter()
         success, exec_error = _execute_sql(final_sql)
+        sql_execution_time += time.perf_counter() - t0
 
     if not success and exec_error:
         print(f"\n[sql_generator] Attempt 1 failed: {exec_error}. Retrying...")
 
         retry_prompt = build_retry_prompt(prompt, final_sql, exec_error)
         print(f"\n[sql_generator] Regenerating SQL with error context...")
+        t0 = time.perf_counter()
         retry_response = generate_sql(retry_prompt)
         retry_raw_sql = extract_sql_from_response(retry_response)
+        sql_generation_time += time.perf_counter() - t0
 
         print(f"\n{'=' * 60}")
         print("  Retry SQL (before PEER patching):")
@@ -451,7 +472,9 @@ def cmd_query(user_query: str) -> None:
         print(_format_sql(retry_raw_sql))
         print(f"{'=' * 60}")
 
+        t0 = time.perf_counter()
         retry_peer = run_peer(retry_raw_sql, remote_conn)
+        peer_module_time += time.perf_counter() - t0
 
         if retry_peer.messages:
             print(f"\n{'=' * 60}")
@@ -476,7 +499,9 @@ def cmd_query(user_query: str) -> None:
             retry_success, retry_error = False, "Retry SQL is empty/comment-only"
         else:
             print("[executor] Executing retry SQL against remote database...")
+            t0 = time.perf_counter()
             retry_success, retry_error = _execute_sql(final_retry_sql)
+            sql_execution_time += time.perf_counter() - t0
 
         if not retry_success:
             print(f"\n[sql_generator] Attempt 2 failed: {retry_error}")
@@ -487,6 +512,21 @@ def cmd_query(user_query: str) -> None:
             )
 
     print(citation_md)
+    query_classify_mutate_retrieve_time = (
+        query_classification_time + query_mutation_kb_retrieval_time
+    )
+    print(f"\n{'=' * 60}")
+    print("  MODULE TIMING SUMMARY")
+    print(f"{'=' * 60}")
+    print(
+        "[timing] Query classification + Mutation + KB Retrieval : "
+        f"{query_classify_mutate_retrieve_time:.2f} seconds"
+    )
+    print(f"[timing] SQL generation   : {sql_generation_time:.2f} seconds")
+    print(f"[timing] SQL verification : {sql_verification_time:.2f} seconds")
+    print(f"[timing] SQL reviewer     : {sql_reviewer_time:.2f} seconds")
+    print(f"[timing] PEER module      : {peer_module_time:.2f} seconds")
+    print(f"[timing] SQL execution    : {sql_execution_time:.2f} seconds")
     end_time = time.time()
     Total_Query_Execution_Time = end_time - start_time
     print(f"\n[main] Total time taken to Execute the query is: {Total_Query_Execution_Time:.2f} seconds")
