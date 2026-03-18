@@ -236,8 +236,8 @@ class TestValidSQL:
             "ORDER BY st.total DESC LIMIT 1"
         )
         result = verify_sql(sql, registry)
-        assert result.is_valid
-        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
 
     def test_nested_cte_multiple_ctes_valid_when_scope_selected(self, registry):
         sql = (
@@ -316,8 +316,8 @@ class TestValidSQL:
             "FROM scoped_games"
         )
         result = verify_sql(sql, registry)
-        assert result.is_valid
-        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
 
     def test_literal_neq_filter_not_enforced_as_scope_projection(self, registry):
         sql = (
@@ -414,6 +414,110 @@ class TestValidSQL:
             "SELECT * "
             "FROM dwh_d_games g "
             "WHERE g.game_type ILIKE '%Regular Season%'"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_cte_literal_filters_missing_in_final_select_are_flagged(self, registry):
+        sql = (
+            "WITH team_games AS ("
+            "  SELECT g.game_id, g.game_type, t.full_name "
+            "  FROM dwh_d_games g "
+            "  JOIN dwh_d_teams t ON g.home_team_id = t.team_id "
+            "  WHERE g.game_type ILIKE '%Regular Season%' "
+            "    AND t.full_name ILIKE '%Denver Nuggets%'"
+            ") "
+            "SELECT COUNT(*) AS game_count FROM team_games"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_two_hop_cte_chain_denver_pattern_filter_context_is_flagged(self, registry):
+        sql = (
+            "WITH team_home_games AS ("
+            "  SELECT g.game_id, g.season_year, g.game_type, t.full_name "
+            "  FROM dwh_d_games g "
+            "  JOIN dwh_d_teams t ON g.home_team_id = t.team_id "
+            "  WHERE t.full_name ILIKE '%Denver Nuggets%' "
+            "    AND g.game_type ILIKE '%Regular Season%'"
+            "), "
+            "home_wins AS ("
+            "  SELECT thg.season_year, COUNT(*) AS home_wins "
+            "  FROM team_home_games thg "
+            "  GROUP BY thg.season_year"
+            "), "
+            "home_games AS ("
+            "  SELECT thg.season_year, COUNT(*) AS home_games "
+            "  FROM team_home_games thg "
+            "  GROUP BY thg.season_year"
+            ") "
+            "SELECT hw.home_wins, hg.home_games "
+            "FROM home_wins hw "
+            "JOIN home_games hg ON hw.season_year = hg.season_year"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_cte_literal_filters_projected_in_final_select_passes(self, registry):
+        sql = (
+            "WITH team_games AS ("
+            "  SELECT g.game_id, g.game_type, t.full_name "
+            "  FROM dwh_d_games g "
+            "  JOIN dwh_d_teams t ON g.home_team_id = t.team_id "
+            "  WHERE g.game_type ILIKE '%Regular Season%' "
+            "    AND t.full_name ILIKE '%Denver Nuggets%'"
+            ") "
+            "SELECT tg.game_type, tg.full_name, COUNT(*) AS game_count "
+            "FROM team_games tg "
+            "GROUP BY tg.game_type, tg.full_name"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_cte_literal_filter_on_id_column_is_excluded(self, registry):
+        sql = (
+            "WITH filtered_team_games AS ("
+            "  SELECT g.game_id, g.home_team_id "
+            "  FROM dwh_d_games g "
+            "  WHERE g.home_team_id = 'team-001'"
+            ") "
+            "SELECT COUNT(*) AS game_count FROM filtered_team_games"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_grandparent_cte_literal_filter_missing_in_final_select_is_flagged(self, registry):
+        sql = (
+            "WITH base_games AS ("
+            "  SELECT g.game_id, g.game_type "
+            "  FROM dwh_d_games g "
+            "  WHERE g.game_type ILIKE '%Regular Season%'"
+            "), "
+            "season_games AS ("
+            "  SELECT bg.game_id, bg.game_type FROM base_games bg"
+            "), "
+            "scoped_games AS ("
+            "  SELECT sg.game_id, sg.game_type FROM season_games sg"
+            ") "
+            "SELECT COUNT(*) AS game_count FROM scoped_games"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_cte_literal_filter_with_select_star_in_final_select_is_not_flagged(self, registry):
+        sql = (
+            "WITH team_games AS ("
+            "  SELECT g.game_id, g.game_type "
+            "  FROM dwh_d_games g "
+            "  WHERE g.game_type ILIKE '%Regular Season%'"
+            ") "
+            "SELECT * FROM team_games"
         )
         result = verify_sql(sql, registry)
         assert result.is_valid
@@ -863,8 +967,8 @@ class TestNBAIntegration:
             "ORDER BY triple_double_count DESC LIMIT 10"
         )
         result = verify_sql(sql, nba_registry)
-        assert result.is_valid
-        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
 
     def test_union_mismatch_on_nba_tables(self, nba_registry):
         sql = (

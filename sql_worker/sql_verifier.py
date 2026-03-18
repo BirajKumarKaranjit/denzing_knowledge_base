@@ -21,6 +21,18 @@ _AGGREGATE_FUNCS: frozenset[str] = frozenset(
      "array_agg", "string_agg", "json_agg", "jsonb_agg", "listagg"}
 )
 
+_LITERAL_COMPARISON_TYPES = (
+    exp.EQ,
+    exp.NEQ,
+    exp.ILike,
+    exp.Like,
+    exp.In,
+    exp.GT,
+    exp.GTE,
+    exp.LT,
+    exp.LTE,
+)
+
 
 @dataclass
 class VerificationError:
@@ -519,7 +531,39 @@ def _check_filter_context_projection(statement: exp.Expression) -> list[Verifica
     if top_select is None:
         return []
 
-    literal_filter_cols = _collect_literal_filter_columns(statement)
+    top_level_literal_cols = _collect_literal_filter_columns(statement)
+
+    cte_nodes = {cte.alias_or_name.lower(): cte for cte in statement.find_all(exp.CTE) if cte.alias_or_name}
+    cte_names = set(cte_nodes)
+
+    discovered_cte_names: set[str] = set(_collect_direct_cte_names(top_select, cte_names))
+    frontier: set[str] = set(discovered_cte_names)
+    # Traverse two CTE dependency layers: (1) CTEs directly read by the final SELECT,
+    # (2) CTEs those direct CTEs depend on. This captures the common
+    # base-filter -> aggregation CTE -> final SELECT pattern without pulling in
+    # deeper intermediate computation chains.
+    for _ in range(2):
+        next_frontier: set[str] = set()
+        for cte_name in frontier:
+            cte_node = cte_nodes.get(cte_name)
+            if cte_node is None:
+                continue
+            for select in _collect_select_nodes(cte_node.this):
+                deps = _collect_direct_cte_names(select, cte_names)
+                next_frontier.update(deps - discovered_cte_names)
+        if not next_frontier:
+            break
+        discovered_cte_names.update(next_frontier)
+        frontier = next_frontier
+
+    cte_literal_cols: set[str] = set()
+    for cte_name in discovered_cte_names:
+        cte_node = cte_nodes.get(cte_name)
+        if cte_node is None:
+            continue
+        cte_literal_cols.update(_collect_cte_literal_filter_columns(cte_node))
+
+    literal_filter_cols = top_level_literal_cols | cte_literal_cols
     if not literal_filter_cols:
         return []
 
@@ -621,6 +665,21 @@ def _collect_literal_filter_columns(statement: exp.Expression) -> set[str]:
     if top_select is None:
         return cols
 
+    return _collect_literal_filter_columns_from_select(top_select)
+
+
+def _collect_cte_literal_filter_columns(cte: exp.CTE) -> set[str]:
+    """Collect literal-filtered columns from a single CTE body."""
+    cols: set[str] = set()
+    for select in _collect_select_nodes(cte.this):
+        cols.update(_collect_literal_filter_columns_from_select(select))
+    return cols
+
+
+def _collect_literal_filter_columns_from_select(select: exp.Select) -> set[str]:
+    """Collect literal-filtered columns from one SELECT's WHERE/HAVING."""
+    cols: set[str] = set()
+
     def _has_literal_like_value(node: exp.Expression) -> bool:
         for child in node.args.values():
             if child is None:
@@ -635,13 +694,13 @@ def _collect_literal_filter_columns(statement: exp.Expression) -> set[str]:
 
     def _belongs_to_top_select(node: exp.Expression) -> bool:
         owner = node.find_ancestor(exp.Select)
-        return owner is top_select
+        return owner is select
 
-    for filter_node in (top_select.find(exp.Where), top_select.find(exp.Having)):
+    for filter_node in (select.find(exp.Where), select.find(exp.Having)):
         if filter_node is None:
             continue
         for comparison in filter_node.find_all(
-            (exp.EQ, exp.NEQ, exp.ILike, exp.Like, exp.In, exp.GT, exp.GTE, exp.LT, exp.LTE)
+            _LITERAL_COMPARISON_TYPES
         ):
             if not _belongs_to_top_select(comparison):
                 continue
@@ -668,6 +727,51 @@ def _collect_literal_filter_columns(statement: exp.Expression) -> set[str]:
                     cols.add(col.name.lower())
 
     return cols
+
+
+def _collect_select_nodes(node: exp.Expression) -> list[exp.Select]:
+    """Return SELECT leaves from an expression (supports UNION trees)."""
+    if isinstance(node, exp.Select):
+        return [node]
+    if isinstance(node, exp.Subquery):
+        inner = node.this
+        if isinstance(inner, exp.Select):
+            return [inner]
+        if isinstance(inner, exp.Union):
+            return _collect_select_nodes(inner)
+        return []
+    if isinstance(node, exp.Union):
+        return _collect_select_nodes(node.left) + _collect_select_nodes(node.right)
+    return []
+
+
+def _collect_direct_cte_names(top_select: exp.Select, all_cte_names: set[str]) -> set[str]:
+    """Collect CTE names directly read by top_select FROM/JOIN relations."""
+    direct_names: set[str] = set()
+
+    from_clause = top_select.args.get("from")
+    if from_clause is None:
+        # sqlglot versions differ: some expose FROM as "from_" in args.
+        from_clause = top_select.args.get("from_")
+    if from_clause is not None:
+        relations = []
+        if from_clause.this is not None:
+            relations.append(from_clause.this)
+        relations.extend(from_clause.expressions or [])
+        for relation in relations:
+            if isinstance(relation, exp.Table) and relation.name:
+                name = relation.name.lower()
+                if name in all_cte_names:
+                    direct_names.add(name)
+
+    for join in top_select.args.get("joins") or []:
+        relation = join.this
+        if isinstance(relation, exp.Table) and relation.name:
+            name = relation.name.lower()
+            if name in all_cte_names:
+                direct_names.add(name)
+
+    return direct_names
 
 
 def _collect_id_filter_columns(filtered_cols: set[str]) -> set[str]:

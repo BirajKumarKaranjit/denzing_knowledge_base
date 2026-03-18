@@ -196,6 +196,9 @@ _SQL_GENERATION_SYSTEM_PROMPT = (
 
     "## DIALECT\n"
     "- Strictly follow the SQL DIALECT INSTRUCTIONS block in the prompt for engine-specific syntax.\n\n"
+    "## CTE-BASED QUERY OUTPUT COMPLETENESS\n"
+    "- When the final SELECT reads entirely from CTEs with no direct WHERE clause,\n"
+    "  always include in SELECT the key scope columns that were used to filter the CTE data — such as team name, season, and game type — so the output is self-descriptive.\n"
     
     "## MANDATORY SELF-CHECK BEFORE OUTPUT\n"
     "Before writing the final SQL, verify:\n"

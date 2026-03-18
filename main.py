@@ -541,5 +541,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
-    # cmd_query(input("\nEnter a natural language question to convert to SQL: "))
+    # main()
+    cmd_query(input("\nEnter a natural language question to convert to SQL: "))
