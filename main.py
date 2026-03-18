@@ -401,25 +401,7 @@ def cmd_query(user_query: str) -> None:
             if revised:
                 final_sql = revised
 
-    final_verification = verify_sql(final_sql, _COLUMN_REGISTRY, dialect=SQL_DIALECT)
-    if final_verification.warnings:
-        for w in final_verification.warnings:
-            print(f"[verifier] Warning: {w}")
-
-    if not final_verification.is_valid:
-        print("\n[verifier] Final SQL failed hard verification gate. Execution halted.")
-        for err in final_verification.errors:
-            print(f"  [{err.error_type}] {err.message}")
-        print(citation_md)
-        end_time = time.time()
-        total_query_execution_time = end_time - start_time
-        print(
-            f"\n[main] Total time taken to Execute the query is: "
-            f"{total_query_execution_time:.2f} seconds"
-        )
-        conn.close()
-        remote_conn.close()
-        return
+    print("\n[main] Proceeding to execution — retry logic handles any remaining SQL errors.")
 
     peer_result = run_peer(final_sql, remote_conn)
 
@@ -541,5 +523,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # main()
-    cmd_query(input("\nEnter a natural language question to convert to SQL: "))
+    main()
+    # cmd_query(input("\nEnter a natural language question to convert to SQL: "))

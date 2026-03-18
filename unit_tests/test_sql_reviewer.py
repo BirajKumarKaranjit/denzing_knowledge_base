@@ -107,6 +107,11 @@ class TestReviewerPromptRules:
     def test_scope_context_rule_present(self):
         assert "those resolved scope fields must appear in SELECT" in _REVIEWER_SYSTEM_PROMPT
         assert "Ensure applied scope context is visible in output" in _REVIEWER_SYSTEM_PROMPT
+
+    def test_filter_context_duplicate_projection_rule_present(self):
+        assert "check whether that column or" in _REVIEWER_SYSTEM_PROMPT
+        assert "equivalent alias is already projected in SELECT" in _REVIEWER_SYSTEM_PROMPT
+        assert "do not add duplicates" in _REVIEWER_SYSTEM_PROMPT
 class TestReviewSQLApproved:
     def test_approved_response(self):
         with patch(_CALL_LLM_PATCH, return_value="APPROVED"):

@@ -378,6 +378,60 @@ class TestValidSQL:
         assert result.is_valid
         assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
 
+    def test_cte_scalar_subquery_scope_filter_missing_in_final_select_is_flagged(self, registry):
+        sql = (
+            "WITH player_season_stats AS ("
+            "  SELECT pb.player_id, p.full_name, "
+            "         SUM(pb.points) AS total_points, "
+            "         AVG(pb.minutes) AS avg_minutes "
+            "  FROM dwh_f_player_boxscore pb "
+            "  JOIN dwh_d_players p ON pb.player_id = p.player_id "
+            "  JOIN dwh_d_games g ON pb.game_id = g.game_id "
+            "  WHERE g.game_type ILIKE '%Regular Season%' "
+            "    AND g.season_year = ("
+            "      SELECT MAX(g2.season_year) "
+            "      FROM dwh_d_games g2 "
+            "      WHERE g2.game_type ILIKE '%Regular Season%'"
+            "    ) "
+            "  GROUP BY pb.player_id, p.full_name "
+            ") "
+            "SELECT full_name, total_points, ROUND(avg_minutes, 2) AS avg_minutes, "
+            "       'Regular Season' AS game_type "
+            "FROM player_season_stats "
+            "ORDER BY total_points DESC "
+            "LIMIT 1"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        assert any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+
+    def test_cte_scalar_subquery_scope_filter_passes_when_projected(self, registry):
+        sql = (
+            "WITH player_season_stats AS ("
+            "  SELECT pb.player_id, p.full_name, g.season_year, "
+            "         SUM(pb.points) AS total_points, "
+            "         AVG(pb.minutes) AS avg_minutes "
+            "  FROM dwh_f_player_boxscore pb "
+            "  JOIN dwh_d_players p ON pb.player_id = p.player_id "
+            "  JOIN dwh_d_games g ON pb.game_id = g.game_id "
+            "  WHERE g.game_type ILIKE '%Regular Season%' "
+            "    AND g.season_year = ("
+            "      SELECT MAX(g2.season_year) "
+            "      FROM dwh_d_games g2 "
+            "      WHERE g2.game_type ILIKE '%Regular Season%'"
+            "    ) "
+            "  GROUP BY pb.player_id, p.full_name, g.season_year "
+            ") "
+            "SELECT full_name, season_year, total_points, ROUND(avg_minutes, 2) AS avg_minutes, "
+            "       'Regular Season' AS game_type "
+            "FROM player_season_stats "
+            "ORDER BY total_points DESC "
+            "LIMIT 1"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+
     def test_literal_filter_column_missing_from_select_is_flagged(self, registry):
         sql = (
             "SELECT COUNT(*) AS game_count "
@@ -433,6 +487,23 @@ class TestValidSQL:
         result = verify_sql(sql, registry)
         assert not result.is_valid
         assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_cte_scalar_subquery_literal_filter_is_not_flagged_for_filter_context(self, registry):
+        sql = (
+            "WITH latest_regular_game AS ("
+            "  SELECT g.game_id "
+            "  FROM dwh_d_games g "
+            "  WHERE g.game_id = ("
+            "    SELECT MAX(g2.game_id) "
+            "    FROM dwh_d_games g2 "
+            "    WHERE g2.game_type ILIKE '%Regular Season%'"
+            "  )"
+            ") "
+            "SELECT COUNT(*) AS game_count FROM latest_regular_game"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
 
     def test_two_hop_cte_chain_denver_pattern_filter_context_is_flagged(self, registry):
         sql = (
@@ -548,6 +619,20 @@ class TestValidSQL:
             "  WHERE g2.game_type ILIKE '%Playoff%'"
             ") "
             "GROUP BY g.season_year"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_scalar_subquery_literal_filter_is_excluded_from_outer_filter_context(self, registry):
+        sql = (
+            "SELECT g.season_year "
+            "FROM dwh_d_games g "
+            "WHERE g.season_year = ("
+            "  SELECT MAX(g2.season_year) "
+            "  FROM dwh_d_games g2 "
+            "  WHERE g2.game_type ILIKE '%Regular Season%'"
+            ")"
         )
         result = verify_sql(sql, registry)
         assert result.is_valid

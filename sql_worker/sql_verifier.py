@@ -495,11 +495,25 @@ def _check_scope_filter_projection(statement: exp.Expression) -> list[Verificati
         return []
 
     filtered_cols = _collect_scope_filtered_columns(statement)
+
+    cte_nodes = {cte.alias_or_name.lower(): cte for cte in statement.find_all(exp.CTE) if cte.alias_or_name}
+    discovered_cte_names = _collect_cte_dependency_names(top_select, cte_nodes, max_hops=2)
+
+    cte_scope_cols: set[str] = set()
+    cte_literal_cols: set[str] = set()
+    for cte_name in discovered_cte_names:
+        cte_node = cte_nodes.get(cte_name)
+        if cte_node is None:
+            continue
+        cte_scope_cols.update(_collect_cte_scope_filtered_columns(cte_node))
+        cte_literal_cols.update(_collect_cte_literal_filter_columns(cte_node))
+
+    filtered_cols |= cte_scope_cols
     if not filtered_cols:
         return []
 
     join_key_cols = _collect_join_key_columns(statement)
-    literal_filter_cols = _collect_literal_filter_columns(statement)
+    literal_filter_cols = _collect_literal_filter_columns(statement) | cte_literal_cols
     id_filter_cols = _collect_id_filter_columns(filtered_cols)
     scope_cols = filtered_cols - join_key_cols - literal_filter_cols - id_filter_cols
     if not scope_cols:
@@ -534,27 +548,7 @@ def _check_filter_context_projection(statement: exp.Expression) -> list[Verifica
     top_level_literal_cols = _collect_literal_filter_columns(statement)
 
     cte_nodes = {cte.alias_or_name.lower(): cte for cte in statement.find_all(exp.CTE) if cte.alias_or_name}
-    cte_names = set(cte_nodes)
-
-    discovered_cte_names: set[str] = set(_collect_direct_cte_names(top_select, cte_names))
-    frontier: set[str] = set(discovered_cte_names)
-    # Traverse two CTE dependency layers: (1) CTEs directly read by the final SELECT,
-    # (2) CTEs those direct CTEs depend on. This captures the common
-    # base-filter -> aggregation CTE -> final SELECT pattern without pulling in
-    # deeper intermediate computation chains.
-    for _ in range(2):
-        next_frontier: set[str] = set()
-        for cte_name in frontier:
-            cte_node = cte_nodes.get(cte_name)
-            if cte_node is None:
-                continue
-            for select in _collect_select_nodes(cte_node.this):
-                deps = _collect_direct_cte_names(select, cte_names)
-                next_frontier.update(deps - discovered_cte_names)
-        if not next_frontier:
-            break
-        discovered_cte_names.update(next_frontier)
-        frontier = next_frontier
+    discovered_cte_names = _collect_cte_dependency_names(top_select, cte_nodes, max_hops=2)
 
     cte_literal_cols: set[str] = set()
     for cte_name in discovered_cte_names:
@@ -638,11 +632,55 @@ def _collect_scope_filtered_columns(statement: exp.Expression) -> set[str]:
         for col in filter_node.find_all(exp.Column):
             if not _belongs_to_top_select(col):
                 continue
+            if not _is_direct_filter_column(col, filter_node):
+                continue
             col_name = (col.name or "").lower()
             if not col_name:
                 continue
             cols.add(col_name)
     return cols
+
+
+def _collect_scope_filtered_columns_from_select(select: exp.Select) -> set[str]:
+    """Collect WHERE/HAVING filter columns that directly belong to one SELECT."""
+    def _belongs_to_select(node: exp.Expression) -> bool:
+        owner = node.find_ancestor(exp.Select)
+        return owner is select
+
+    cols: set[str] = set()
+    for filter_node in (select.find(exp.Where), select.find(exp.Having)):
+        if filter_node is None:
+            continue
+        for col in filter_node.find_all(exp.Column):
+            if not _belongs_to_select(col):
+                continue
+            if not _is_direct_filter_column(col, filter_node):
+                continue
+            col_name = (col.name or "").lower()
+            if not col_name:
+                continue
+            cols.add(col_name)
+    return cols
+
+
+def _collect_cte_scope_filtered_columns(cte: exp.CTE) -> set[str]:
+    """Collect scope-filtered columns from one CTE body."""
+    cols: set[str] = set()
+    for select in _collect_select_nodes(cte.this):
+        cols.update(_collect_scope_filtered_columns_from_select(select))
+    return cols
+
+
+def _is_direct_filter_column(col: exp.Column, filter_node: exp.Expression) -> bool:
+    """Return True when *col* is in the direct WHERE/HAVING path, not a nested subquery."""
+    cursor: exp.Expression | None = col
+    while cursor is not None:
+        if isinstance(cursor, exp.Subquery):
+            return False
+        if cursor is filter_node or isinstance(cursor, (exp.Where, exp.Having)):
+            return True
+        cursor = cursor.parent
+    return False
 
 
 def _collect_join_key_columns(statement: exp.Expression) -> set[str]:
@@ -708,7 +746,7 @@ def _collect_literal_filter_columns_from_select(select: exp.Select) -> set[str]:
             if not has_literal:
                 continue
             for col in comparison.find_all(exp.Column):
-                if col.name:
+                if col.name and _is_direct_filter_column(col, filter_node):
                     cols.add(col.name.lower())
 
         for not_node in filter_node.find_all(exp.Not):
@@ -723,7 +761,7 @@ def _collect_literal_filter_columns_from_select(select: exp.Select) -> set[str]:
                 continue
 
             for col in inner.find_all(exp.Column):
-                if col.name:
+                if col.name and _is_direct_filter_column(col, filter_node):
                     cols.add(col.name.lower())
 
     return cols
@@ -772,6 +810,34 @@ def _collect_direct_cte_names(top_select: exp.Select, all_cte_names: set[str]) -
                 direct_names.add(name)
 
     return direct_names
+
+
+def _collect_cte_dependency_names(
+    top_select: exp.Select,
+    cte_nodes: dict[str, exp.CTE],
+    *,
+    max_hops: int,
+) -> set[str]:
+    """Collect direct and bounded dependent CTE names reachable from top_select."""
+    cte_names = set(cte_nodes)
+    discovered: set[str] = set(_collect_direct_cte_names(top_select, cte_names))
+    frontier: set[str] = set(discovered)
+
+    for _ in range(max_hops):
+        next_frontier: set[str] = set()
+        for cte_name in frontier:
+            cte_node = cte_nodes.get(cte_name)
+            if cte_node is None:
+                continue
+            for select in _collect_select_nodes(cte_node.this):
+                deps = _collect_direct_cte_names(select, cte_names)
+                next_frontier.update(deps - discovered)
+        if not next_frontier:
+            break
+        discovered.update(next_frontier)
+        frontier = next_frontier
+
+    return discovered
 
 
 def _collect_id_filter_columns(filtered_cols: set[str]) -> set[str]:

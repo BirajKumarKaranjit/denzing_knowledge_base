@@ -117,11 +117,8 @@ def test_cmd_query_pipeline_order_forwards_verifier_errors_and_executes(monkeypa
     verif_error = SimpleNamespace(error_type="scope_filter_not_projected", message="Columns used to restrict query scope are not in SELECT output: ['season_year'].")
 
     def _fake_verify_sql(sql: str, registry: dict[str, list[str]], dialect: str = ""):
-        if "SELECT SUM(pb.points)" in sql:
-            trace.append("verify_initial")
-            return SimpleNamespace(is_valid=False, warnings=[], errors=[verif_error])
-        trace.append("verify_final")
-        return SimpleNamespace(is_valid=True, warnings=[], errors=[])
+        trace.append("verify_initial")
+        return SimpleNamespace(is_valid=False, warnings=[], errors=[verif_error])
 
     def _fake_review_sql(**kwargs):
         trace.append("review")
@@ -175,10 +172,9 @@ def test_cmd_query_pipeline_order_forwards_verifier_errors_and_executes(monkeypa
 
     assert "verify_initial" in trace
     assert "review" in trace
-    assert "verify_final" in trace
     assert "peer" in trace
     assert "execute" in trace
-    assert trace.index("verify_initial") < trace.index("review") < trace.index("verify_final") < trace.index("peer") < trace.index("execute")
+    assert trace.index("verify_initial") < trace.index("review") < trace.index("peer") < trace.index("execute")
 
     forwarded_errors = review_payload.get("verifier_errors")
     assert isinstance(forwarded_errors, list)
@@ -187,7 +183,7 @@ def test_cmd_query_pipeline_order_forwards_verifier_errors_and_executes(monkeypa
 
 
 @pytest.mark.usefixtures("monkeypatch")
-def test_cmd_query_hard_gate_blocks_peer_and_execution(monkeypatch) -> None:
+def test_cmd_query_proceeds_to_peer_and_execution_without_post_review_hard_gate(monkeypatch) -> None:
     trace: list[str] = []
 
     query_conn = _FakeConn("query")
@@ -198,7 +194,7 @@ def test_cmd_query_hard_gate_blocks_peer_and_execution(monkeypatch) -> None:
 
     monkeypatch.setattr(main, "SQL_REVIEWER_ENABLED", True)
     monkeypatch.setattr(main, "_build_reviewer_ddl_context", lambda retrieval_result, sql: "CREATE TABLE dwh_d_games (season_year text);")
-    monkeypatch.setattr(main, "_execute_sql", lambda sql: (_ for _ in ()).throw(AssertionError("execute should not run")))
+    monkeypatch.setattr(main, "_execute_sql", lambda sql: (trace.append("execute"), (True, None))[1])
 
     import kb_system.kb_store as kb_store
     import kb_system.kb_retriever as kb_retriever
@@ -223,22 +219,21 @@ def test_cmd_query_hard_gate_blocks_peer_and_execution(monkeypatch) -> None:
 
     def _fake_verify_sql(sql: str, registry: dict[str, list[str]], dialect: str = ""):
         call_count["n"] += 1
-        if call_count["n"] == 1:
-            trace.append("verify_initial")
-            return SimpleNamespace(is_valid=True, warnings=[], errors=[])
-        trace.append("verify_final")
+        trace.append("verify_initial")
         return SimpleNamespace(is_valid=False, warnings=[], errors=[gate_error])
 
-    def _peer_should_not_run(sql: str, conn):
-        raise AssertionError("peer should not run when hard verification gate fails")
+    def _fake_run_peer(sql: str, conn):
+        trace.append("peer")
+        return SimpleNamespace(sql=sql, patched=False, messages=[], unvalidatable=[], error="")
 
     monkeypatch.setattr(sql_verifier, "verify_sql", _fake_verify_sql)
-    monkeypatch.setattr(peer, "run_peer", _peer_should_not_run)
+    monkeypatch.setattr(peer, "run_peer", _fake_run_peer)
 
     main.cmd_query("sample question")
 
-    assert trace == ["verify_initial", "verify_final"]
+    assert trace == ["verify_initial", "peer", "execute"]
+    assert call_count["n"] == 1
     assert query_conn.closed is True
-    assert remote_conn.closed is True
+    assert remote_conn.closed is False
 
 
