@@ -378,19 +378,27 @@ def _probe_candidates(
 def _fuzzy_match(value: str, candidates: list[str]) -> tuple[str, int]:
     """Return the best candidate and its score using both token scorers.
     """
-    best_candidate = ""
-    best_score = 0
+    ranked = _rank_fuzzy_candidates(value, candidates)
+    if not ranked:
+        return "", 0
+    return ranked[0]
+
+
+def _rank_fuzzy_candidates(value: str, candidates: list[str]) -> list[tuple[str, int]]:
+    """Return candidates ranked by fuzzy score (highest first)."""
+    ranked: list[tuple[str, int]] = []
     val_proc = fuzz_utils.default_process(value)
     for candidate in candidates:
         cand_proc = fuzz_utils.default_process(candidate)
-        score = max(
+        score = int(
+            max(
             fuzz.token_sort_ratio(val_proc, cand_proc, processor=None),
             fuzz.token_set_ratio(val_proc, cand_proc, processor=None),
+            )
         )
-        if score > best_score:
-            best_score = score
-            best_candidate = candidate
-    return best_candidate, best_score
+        ranked.append((candidate, score))
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return ranked
 
 
 
@@ -721,7 +729,21 @@ def _run_peer_internal(
                 f"(single candidate, action={entity.action})"
             )
         else:
-            best, score = _fuzzy_match(entity.value, candidates)
+            ranked_candidates = _rank_fuzzy_candidates(entity.value, candidates)
+            probable = [
+                (name, score)
+                for name, score in ranked_candidates
+                if score >= PEER_FLAG_THRESHOLD
+            ]
+            if probable:
+                preview = ", ".join(
+                    f"'{name}' ({score:.1f})" for name, score in probable[:5]
+                )
+                print(
+                    f"[peer]     Probable Matches With Fuzzy Score (>= {PEER_FLAG_THRESHOLD}): {preview}"
+                )
+
+            best, score = ranked_candidates[0] if ranked_candidates else ("", 0)
             action = _determine_action(score)
             entity.corrected = best
             entity.score = score

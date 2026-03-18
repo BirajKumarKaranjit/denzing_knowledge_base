@@ -42,6 +42,7 @@ from kb_system.peer import (
     _collect_comparisons,
     _build_word_prefixes,
     _fuzzy_match,
+    _rank_fuzzy_candidates,
     _probe_ilike_fallback,
     _probe_candidates,
 )
@@ -246,6 +247,28 @@ class TestFuzzyMatch:
         best, score = _fuzzy_match("Joel Embiid", [])
         assert best == ""
         assert score == 0
+
+
+class TestRankFuzzyCandidates:
+    def test_returns_descending_scores(self):
+        ranked = _rank_fuzzy_candidates(
+            "Nikla Jokc",
+            ["Nikola Jokić", "Nick Young", "Minnesota Timberwolves"],
+        )
+        assert ranked
+        assert ranked[0][0] == "Nikola Jokić"
+        assert all(ranked[i][1] >= ranked[i + 1][1] for i in range(len(ranked) - 1))
+
+    def test_probable_filter_uses_flag_threshold(self, monkeypatch):
+        monkeypatch.setattr(peer_mod, "PEER_FLAG_THRESHOLD", 60)
+        ranked = _rank_fuzzy_candidates(
+            "Nikla Jokc",
+            ["Nikola Jokić", "Joel Kramer", "Joe Fabel"],
+        )
+        probable = [(name, score) for name, score in ranked if score >= peer_mod.PEER_FLAG_THRESHOLD]
+        assert probable
+        assert probable[0][0] == "Nikola Jokić"
+        assert all(score >= 60 for _, score in probable)
 
 
 # ---------------------------------------------------------------------------
