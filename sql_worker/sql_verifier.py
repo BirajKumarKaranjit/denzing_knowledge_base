@@ -28,7 +28,8 @@ class VerificationError:
 
     error_type: str
     """One of: column_not_in_ddl | wrong_table_for_column |
-    union_column_mismatch | order_by_in_union_branch | scope_filter_not_projected"""
+    union_column_mismatch | order_by_in_union_branch | scope_filter_not_projected |
+    filter_context_not_projected"""
     message: str
     column: str | None = None
     table: str | None = None
@@ -96,6 +97,7 @@ def verify_sql(
         errors.extend(_check_union_column_parity(statement))
         errors.extend(_check_order_by_in_union_branch(statement))
         errors.extend(_check_scope_filter_projection(statement))
+        errors.extend(_check_filter_context_projection(statement))
         warnings.extend(_check_group_by_completeness(statement))
 
     is_valid = len(errors) == 0
@@ -511,6 +513,44 @@ def _check_scope_filter_projection(statement: exp.Expression) -> list[Verificati
     ]
 
 
+def _check_filter_context_projection(statement: exp.Expression) -> list[VerificationError]:
+    """Require literal-filter context columns to be visible in SELECT output."""
+    top_select = _top_level_select(statement)
+    if top_select is None:
+        return []
+
+    literal_filter_cols = _collect_literal_filter_columns(statement)
+    if not literal_filter_cols:
+        return []
+
+    id_filter_cols = _collect_id_filter_columns(literal_filter_cols)
+    context_cols = literal_filter_cols - id_filter_cols
+    if not context_cols:
+        return []
+
+    projected = _collect_projected_field_names(top_select)
+    if "*" in projected:
+        return []
+
+    missing = sorted(col for col in context_cols if col not in projected)
+    if not missing:
+        return []
+
+    return [
+        VerificationError(
+            error_type="filter_context_not_projected",
+            message=(
+                "Columns used in literal WHERE/HAVING filters are not present "
+                f"in SELECT output: {missing}."
+            ),
+            suggestion=(
+                "Add the missing filtered context columns to SELECT so the result "
+                "confirms the applied filter context."
+            ),
+        )
+    ]
+
+
 def _top_level_select(statement: exp.Expression) -> exp.Select | None:
     """Return the root SELECT node when available."""
     if isinstance(statement, exp.With):
@@ -543,11 +583,17 @@ def _collect_scope_filtered_columns(statement: exp.Expression) -> set[str]:
     if top_select is None:
         return set()
 
+    def _belongs_to_top_select(node: exp.Expression) -> bool:
+        owner = node.find_ancestor(exp.Select)
+        return owner is top_select
+
     cols: set[str] = set()
     for filter_node in (top_select.find(exp.Where), top_select.find(exp.Having)):
         if filter_node is None:
             continue
         for col in filter_node.find_all(exp.Column):
+            if not _belongs_to_top_select(col):
+                continue
             col_name = (col.name or "").lower()
             if not col_name:
                 continue
@@ -587,12 +633,18 @@ def _collect_literal_filter_columns(statement: exp.Expression) -> set[str]:
                 return True
         return False
 
+    def _belongs_to_top_select(node: exp.Expression) -> bool:
+        owner = node.find_ancestor(exp.Select)
+        return owner is top_select
+
     for filter_node in (top_select.find(exp.Where), top_select.find(exp.Having)):
         if filter_node is None:
             continue
         for comparison in filter_node.find_all(
             (exp.EQ, exp.NEQ, exp.ILike, exp.Like, exp.In, exp.GT, exp.GTE, exp.LT, exp.LTE)
         ):
+            if not _belongs_to_top_select(comparison):
+                continue
             has_literal = _has_literal_like_value(comparison)
             if not has_literal:
                 continue
@@ -601,6 +653,8 @@ def _collect_literal_filter_columns(statement: exp.Expression) -> set[str]:
                     cols.add(col.name.lower())
 
         for not_node in filter_node.find_all(exp.Not):
+            if not _belongs_to_top_select(not_node):
+                continue
             inner = not_node.this
             if not isinstance(inner, exp.In):
                 continue

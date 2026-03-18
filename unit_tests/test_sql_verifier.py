@@ -326,8 +326,8 @@ class TestValidSQL:
             "WHERE p.position != 'Center'"
         )
         result = verify_sql(sql, registry)
-        assert result.is_valid
-        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
 
     def test_literal_not_in_filter_not_enforced_as_scope_projection(self, registry):
         sql = (
@@ -336,8 +336,8 @@ class TestValidSQL:
             "WHERE p.position NOT IN ('Center', 'Forward')"
         )
         result = verify_sql(sql, registry)
-        assert result.is_valid
-        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
 
     def test_select_star_skips_scope_projection_check(self, registry):
         sql = (
@@ -377,6 +377,99 @@ class TestValidSQL:
         result = verify_sql(sql, registry)
         assert result.is_valid
         assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+
+    def test_literal_filter_column_missing_from_select_is_flagged(self, registry):
+        sql = (
+            "SELECT COUNT(*) AS game_count "
+            "FROM dwh_d_games g "
+            "WHERE g.game_type ILIKE '%Regular Season%'"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_literal_filter_column_in_select_is_not_flagged(self, registry):
+        sql = (
+            "SELECT g.game_type, COUNT(*) AS game_count "
+            "FROM dwh_d_games g "
+            "WHERE g.game_type ILIKE '%Regular Season%' "
+            "GROUP BY g.game_type"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_literal_filter_on_id_column_is_excluded(self, registry):
+        sql = (
+            "SELECT COUNT(*) AS player_count "
+            "FROM dwh_d_players p "
+            "WHERE p.player_id = 'abc-123'"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_filter_context_check_skips_select_star(self, registry):
+        sql = (
+            "SELECT * "
+            "FROM dwh_d_games g "
+            "WHERE g.game_type ILIKE '%Regular Season%'"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_literal_and_column_scope_same_column_reports_single_error_type(self, registry):
+        sql = (
+            "WITH cs AS (SELECT 'Regular Season' AS game_type) "
+            "SELECT COUNT(*) AS game_count "
+            "FROM dwh_d_games g "
+            "JOIN cs ON 1 = 1 "
+            "WHERE g.game_type ILIKE '%Regular Season%' "
+            "AND g.game_type = cs.game_type"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        error_types = [e.error_type for e in result.errors]
+        assert error_types.count("filter_context_not_projected") == 1
+        assert "scope_filter_not_projected" not in error_types
+
+    def test_subquery_literal_filter_not_treated_as_top_level_filter_context(self, registry):
+        sql = (
+            "SELECT g.season_year, COUNT(*) AS game_count "
+            "FROM dwh_d_games g "
+            "WHERE g.season_year = ("
+            "  SELECT MAX(g2.season_year) "
+            "  FROM dwh_d_games g2 "
+            "  WHERE g2.game_type ILIKE '%Playoff%'"
+            ") "
+            "GROUP BY g.season_year"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_having_literal_filter_missing_from_select_is_flagged(self, registry):
+        sql = (
+            "SELECT COUNT(*) AS game_count "
+            "FROM dwh_d_games g "
+            "GROUP BY g.game_type "
+            "HAVING g.game_type ILIKE '%Regular Season%'"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_having_literal_filter_present_in_select_is_not_flagged(self, registry):
+        sql = (
+            "SELECT g.game_type, COUNT(*) AS game_count "
+            "FROM dwh_d_games g "
+            "GROUP BY g.game_type "
+            "HAVING g.game_type ILIKE '%Regular Season%'"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
+        assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
 
 
 # ===========================================================================
@@ -794,6 +887,6 @@ class TestNBAIntegration:
             "ORDER BY g.game_date DESC LIMIT 10"
         )
         result = verify_sql(sql, nba_registry)
-        assert result.is_valid
-        assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
 

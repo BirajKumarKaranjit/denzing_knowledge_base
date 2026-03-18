@@ -86,6 +86,8 @@ _REVIEWER_SYSTEM_PROMPT = (
     "- Apply minimum edits needed to resolve all verifier errors, alongside any logic fixes.\n"
     "- Typical fixes:\n"
     "  * scope_filter_not_projected: add missing columns to SELECT and GROUP BY when required.\n"
+    "  * filter_context_not_projected: add literal-filtered columns to SELECT, and to GROUP BY\n"
+    "    when the query uses aggregation; for non-aggregated queries add only SELECT projection.\n"
     "  * union_column_mismatch: align branch column counts and compatible types.\n"
     "  * order_by_in_union_branch: wrap the branch in a subquery.\n"
     "  * column_not_in_ddl: remove or replace with valid schema columns.\n"
