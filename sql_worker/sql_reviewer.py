@@ -79,6 +79,17 @@ _REVIEWER_SYSTEM_PROMPT = (
     "13) Schema assumption check: if SQL references a column not present in supplied DDL,\n"
     "    set approved=false immediately. In revised_sql, compute from available raw columns\n"
     "    or return an empty SQL block and explain the missing column in changes.\n"
+    "\n"
+    "VERIFIER ERROR RESOLUTION (MANDATORY WHEN PROVIDED):\n"
+    "- If the VERIFIER ERRORS section is non-empty, treat every listed error as confirmed\n"
+    "  structural defects that must be fixed. Do not question verifier validity.\n"
+    "- Apply minimum edits needed to resolve all verifier errors, alongside any logic fixes.\n"
+    "- Typical fixes:\n"
+    "  * scope_filter_not_projected: add missing columns to SELECT and GROUP BY when required.\n"
+    "  * union_column_mismatch: align branch column counts and compatible types.\n"
+    "  * order_by_in_union_branch: wrap the branch in a subquery.\n"
+    "  * column_not_in_ddl: remove or replace with valid schema columns.\n"
+    "- If VERIFIER ERRORS is empty, follow only the normal checklist.\n"
     "- Only flag genuine issues. Approve confidently when SQL is correct.\n\n"
     "OUTPUT - strictly a JSON object, no markdown:\n"
     "{\n"
@@ -86,7 +97,9 @@ _REVIEWER_SYSTEM_PROMPT = (
     "  \"revised_sql\": string | null,\n"
     "  \"changes\": [string, ...]\n"
     "}\n"
-    "If approved=true: revised_sql must be null, changes must be [], no exceptions.\n"
+    "If approved=true and VERIFIER ERRORS is empty: revised_sql must be null and changes must be [].\n"
+    "If VERIFIER ERRORS is non-empty: approved must be false, revised_sql must be complete,\n"
+    "and changes must list every verifier error resolution and logic fix.\n"
     "If approved=false: revised_sql must be a complete executable SQL statement.\n"
     "Return only the JSON object; any extra text will be discarded.\n"
 )
@@ -107,6 +120,7 @@ def review_sql(
     client: Any,
     model: str,
     dialect: str = "",
+    verifier_errors: list[str] | None = None,
 ) -> ReviewResult:
     """Submit *generated_sql* to the LLM reviewer and return a ReviewResult.
 
@@ -135,6 +149,7 @@ def review_sql(
         generated_sql=generated_sql,
         ddl_context=ddl_context,
         dialect=dialect,
+        verifier_errors=verifier_errors,
     )
 
     try:
@@ -158,11 +173,18 @@ def _build_user_prompt(
     generated_sql: str,
     ddl_context: str,
     dialect: str,
+    verifier_errors: list[str] | None = None,
 ) -> str:
     """Assemble the user-facing review prompt."""
+    verifier_errors = verifier_errors or []
+    verifier_block = "\n".join(f"- {err}" for err in verifier_errors)
+    if not verifier_block:
+        verifier_block = "None - SQL passed all structural checks."
+
     parts: list[str] = [
         f"## USER QUESTION\n\n{user_query}",
         f"## GENERATED SQL\n\n```sql\n{generated_sql}\n```",
+        f"## VERIFIER ERRORS\n\n{verifier_block}",
     ]
 
     if dialect.strip():

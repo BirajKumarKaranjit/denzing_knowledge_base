@@ -355,79 +355,22 @@ def cmd_query(user_query: str) -> None:
 
     remote_conn = get_connection(NBA_POSTGRES_DSN)
     final_sql = raw_sql
-    verification_passed: bool = False
+    initial_verification = verify_sql(final_sql, _COLUMN_REGISTRY, dialect=SQL_DIALECT)
+    verifier_error_messages: list[str] = [
+        f"[{err.error_type}] {err.message}" for err in initial_verification.errors
+    ]
 
-    verification_attempts: int = 0
-    _MAX_VERIFICATION_ATTEMPTS: int = 2
+    print(f"\n{'=' * 60}")
+    if initial_verification.warnings:
+        for w in initial_verification.warnings:
+            print(f"\n[verifier] Warning: {w}")
 
-    while verification_attempts < _MAX_VERIFICATION_ATTEMPTS:
-        verification = verify_sql(final_sql, _COLUMN_REGISTRY, dialect=SQL_DIALECT)
-        verification_attempts += 1
-        print(f"\n{'=' * 60}")
-        if verification.warnings:
-            for w in verification.warnings:
-                print(f"\n\n[verifier] Warning: {w}")
-
-        if verification.is_valid:
-            verification_passed = True
-            if verification_attempts == 1:
-                print("\n[verifier] Passed — no schema errors.")
-            else:
-                print("[verifier] Passed on attempt 2.")
-            break
-
-        print(
-            f"\n[verifier] Schema errors detected (attempt {verification_attempts}"
-            f"/{_MAX_VERIFICATION_ATTEMPTS}):"
-        )
-        for err in verification.errors:
-            print(f"  [{err.error_type}] {err.message}")
-
-        if verification_attempts >= _MAX_VERIFICATION_ATTEMPTS:
-            print(
-                "[verifier] Max verification attempts reached. "
-                "Proceeding to execution with remaining schema warnings."
-            )
-            break
-
-        affected_tables: set[str] = set()
-        for e in verification.errors:
-            if e.table and e.table in _COLUMN_REGISTRY:
-                affected_tables.add(e.table)
-            if e.suggestion:
-                for t in _COLUMN_REGISTRY:
-                    if t in (e.suggestion or ""):
-                        affected_tables.add(t)
-
-        table_column_reference = ""
-        if affected_tables:
-            lines = [
-                "\n\n## ACTUAL COLUMN LISTS FOR AFFECTED TABLES\n",
-                "Use ONLY the columns listed below for each table. "
-                "Do not reference any column not in this list.\n",
-            ]
-            for t in sorted(affected_tables):
-                cols = ", ".join(_COLUMN_REGISTRY[t])
-                lines.append(f"- **{t}**: {cols}")
-            table_column_reference = "\n".join(lines)
-
-        schema_error_block = (
-            "\n\n## SCHEMA VALIDATION ERRORS\n\n"
-            "The SQL you generated contains column references that do not match the DDL.\n"
-            "Fix only the column/table errors listed below. Do not change the query logic.\n\n"
-            + "\n".join(f"- {e.message}" for e in verification.errors)
-            + table_column_reference
-        )
-        verify_retry_prompt = prompt + schema_error_block
-        verify_retry_response = generate_sql(verify_retry_prompt)
-        verify_retry_sql = extract_sql_from_response(verify_retry_response)
-        final_sql = verify_retry_sql
-
-        print(f"\n{'=' * 60}")
-        print("  Verification-Corrected SQL (attempt 2):")
-        print(f"{'=' * 60}")
-        print(_format_sql(final_sql))
-        print(f"{'=' * 60}\n")
+    if initial_verification.is_valid:
+        print("\n[verifier] Passed — no schema errors.")
+    else:
+        print("\n[verifier] Schema errors detected — forwarding to reviewer:")
+        for msg in verifier_error_messages:
+            print(f"  {msg}")
 
     if SQL_REVIEWER_ENABLED:
         _reviewer_client = get_llm_client(SQL_REVIEWER_PROVIDER, SQL_REVIEWER_API_KEY)
@@ -440,6 +383,7 @@ def cmd_query(user_query: str) -> None:
             client=_reviewer_client,
             model=SQL_REVIEWER_MODEL,
             dialect=SQL_DIALECT,
+            verifier_errors=verifier_error_messages,
         )
         print(f"\n{'=' * 60}")
         if review.approved:
@@ -450,31 +394,32 @@ def cmd_query(user_query: str) -> None:
                 print(f"  - {change}")
 
             revised = review.revised_sql or ""
-            if revised:
-                if not _is_executable_sql(revised):
-                    print(
-                        "\n[sql_reviewer] Revised SQL is empty/comment-only — using original."
-                    )
-                    revised = ""
+            if revised and not _is_executable_sql(revised):
+                print("\n[sql_reviewer] Revised SQL is empty/comment-only — using original.")
+                revised = ""
 
             if revised:
-                revised_check = verify_sql(revised, _COLUMN_REGISTRY, dialect=SQL_DIALECT)
-                original_tables = _extract_table_names_from_sql(final_sql)
-                revised_tables = _extract_table_names_from_sql(revised)
-                dropped_tables = sorted(original_tables - revised_tables)
+                final_sql = revised
 
-                if verification_passed and dropped_tables:
-                    print(
-                        "\n[sql_reviewer] Revised SQL dropped referenced table(s) "
-                        f"{dropped_tables} after verifier passed — using original."
-                    )
-                elif revised_check.is_valid:
-                    final_sql = revised
-                    print("\n[sql_reviewer] Revised SQL passed schema check — using revised SQL.")
-                else:
-                    print("\n[sql_reviewer] Revised SQL failed schema check — using original.")
-                    for err in revised_check.errors:
-                        print(f"  [schema] {err.message}")
+    final_verification = verify_sql(final_sql, _COLUMN_REGISTRY, dialect=SQL_DIALECT)
+    if final_verification.warnings:
+        for w in final_verification.warnings:
+            print(f"[verifier] Warning: {w}")
+
+    if not final_verification.is_valid:
+        print("\n[verifier] Final SQL failed hard verification gate. Execution halted.")
+        for err in final_verification.errors:
+            print(f"  [{err.error_type}] {err.message}")
+        print(citation_md)
+        end_time = time.time()
+        total_query_execution_time = end_time - start_time
+        print(
+            f"\n[main] Total time taken to Execute the query is: "
+            f"{total_query_execution_time:.2f} seconds"
+        )
+        conn.close()
+        remote_conn.close()
+        return
 
     peer_result = run_peer(final_sql, remote_conn)
 
