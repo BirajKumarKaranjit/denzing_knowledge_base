@@ -501,12 +501,14 @@ def _check_scope_filter_projection(statement: exp.Expression) -> list[Verificati
 
     cte_scope_cols: set[str] = set()
     cte_literal_cols: set[str] = set()
+    cte_wildcard_like_cols: set[str] = set()
     for cte_name in discovered_cte_names:
         cte_node = cte_nodes.get(cte_name)
         if cte_node is None:
             continue
         cte_scope_cols.update(_collect_cte_scope_filtered_columns(cte_node))
         cte_literal_cols.update(_collect_cte_literal_filter_columns(cte_node))
+        cte_wildcard_like_cols.update(_collect_cte_wildcard_like_filter_columns(cte_node))
 
     filtered_cols |= cte_scope_cols
     if not filtered_cols:
@@ -514,8 +516,9 @@ def _check_scope_filter_projection(statement: exp.Expression) -> list[Verificati
 
     join_key_cols = _collect_join_key_columns(statement)
     literal_filter_cols = _collect_literal_filter_columns(statement) | cte_literal_cols
+    wildcard_like_cols = _collect_wildcard_like_filter_columns(statement) | cte_wildcard_like_cols
     id_filter_cols = _collect_id_filter_columns(filtered_cols)
-    scope_cols = filtered_cols - join_key_cols - literal_filter_cols - id_filter_cols
+    scope_cols = filtered_cols - join_key_cols - literal_filter_cols - wildcard_like_cols - id_filter_cols
     if not scope_cols:
         return []
 
@@ -714,6 +717,22 @@ def _collect_cte_literal_filter_columns(cte: exp.CTE) -> set[str]:
     return cols
 
 
+def _collect_wildcard_like_filter_columns(statement: exp.Expression) -> set[str]:
+    """Collect columns filtered by wildcard LIKE/ILIKE in top-level WHERE/HAVING."""
+    top_select = _top_level_select(statement)
+    if top_select is None:
+        return set()
+    return _collect_wildcard_like_filter_columns_from_select(top_select)
+
+
+def _collect_cte_wildcard_like_filter_columns(cte: exp.CTE) -> set[str]:
+    """Collect columns filtered by wildcard LIKE/ILIKE inside a CTE body."""
+    cols: set[str] = set()
+    for select in _collect_select_nodes(cte.this):
+        cols.update(_collect_wildcard_like_filter_columns_from_select(select))
+    return cols
+
+
 def _collect_literal_filter_columns_from_select(select: exp.Select) -> set[str]:
     """Collect literal-filtered columns from one SELECT's WHERE/HAVING."""
     cols: set[str] = set()
@@ -742,6 +761,8 @@ def _collect_literal_filter_columns_from_select(select: exp.Select) -> set[str]:
         ):
             if not _belongs_to_top_select(comparison):
                 continue
+            if _is_wildcard_like_lookup(comparison):
+                continue
             has_literal = _has_literal_like_value(comparison)
             if not has_literal:
                 continue
@@ -765,6 +786,43 @@ def _collect_literal_filter_columns_from_select(select: exp.Select) -> set[str]:
                     cols.add(col.name.lower())
 
     return cols
+
+
+def _collect_wildcard_like_filter_columns_from_select(select: exp.Select) -> set[str]:
+    """Collect columns used in wildcard LIKE/ILIKE filters for one SELECT."""
+    cols: set[str] = set()
+
+    def _belongs_to_top_select(node: exp.Expression) -> bool:
+        owner = node.find_ancestor(exp.Select)
+        return owner is select
+
+    for filter_node in (select.find(exp.Where), select.find(exp.Having)):
+        if filter_node is None:
+            continue
+        for comparison in filter_node.find_all((exp.ILike, exp.Like)):
+            if not _belongs_to_top_select(comparison):
+                continue
+            if not _is_wildcard_like_lookup(comparison):
+                continue
+            for col in comparison.find_all(exp.Column):
+                if col.name and _is_direct_filter_column(col, filter_node):
+                    cols.add(col.name.lower())
+
+    return cols
+
+
+def _is_wildcard_like_lookup(node: exp.Expression) -> bool:
+    """Return True when a LIKE/ILIKE predicate compares against a % wildcard literal."""
+    if not isinstance(node, (exp.ILike, exp.Like)):
+        return False
+    for child in node.args.values():
+        if child is None:
+            continue
+        children = child if isinstance(child, list) else [child]
+        for item in children:
+            if isinstance(item, exp.Literal) and "%" in str(item.this or ""):
+                return True
+    return False
 
 
 def _collect_select_nodes(node: exp.Expression) -> list[exp.Select]:

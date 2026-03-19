@@ -346,6 +346,10 @@ def cmd_query(user_query: str) -> None:
     retrieval_result = retrieve_context_for_query(conn, user_query)
     query_mutation_kb_retrieval_time += time.perf_counter() - t0
 
+    augmented_query = (
+        f"{user_query}\n"
+        "Include all filter/scope columns, readable names, and aggregate sample sizes in SELECT. Hence, the output must be fully self-descriptive.")
+    user_query=augmented_query
     prompt, citation_md = build_sql_prompt(
         user_query=user_query,
         retrieval_result=retrieval_result,
@@ -563,5 +567,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # main()
-    cmd_query(input("\nEnter a natural language question to convert to SQL: "))
+    main()
+    # cmd_query(input("\nEnter a natural language question to convert to SQL: "))

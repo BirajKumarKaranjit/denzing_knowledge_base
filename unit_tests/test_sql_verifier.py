@@ -432,15 +432,25 @@ class TestValidSQL:
         assert result.is_valid
         assert not any(e.error_type == "scope_filter_not_projected" for e in result.errors)
 
-    def test_literal_filter_column_missing_from_select_is_flagged(self, registry):
+    def test_exact_literal_filter_column_missing_from_select_is_flagged(self, registry):
+        sql = (
+            "SELECT COUNT(*) AS game_count "
+            "FROM dwh_d_games g "
+            "WHERE g.game_type = 'Regular Season'"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
+
+    def test_wildcard_ilike_filter_column_missing_from_select_is_not_flagged(self, registry):
         sql = (
             "SELECT COUNT(*) AS game_count "
             "FROM dwh_d_games g "
             "WHERE g.game_type ILIKE '%Regular Season%'"
         )
         result = verify_sql(sql, registry)
-        assert not result.is_valid
-        assert any(e.error_type == "filter_context_not_projected" for e in result.errors)
+        assert result.is_valid
+        assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
 
     def test_literal_filter_column_in_select_is_not_flagged(self, registry):
         sql = (
@@ -479,8 +489,8 @@ class TestValidSQL:
             "  SELECT g.game_id, g.game_type, t.full_name "
             "  FROM dwh_d_games g "
             "  JOIN dwh_d_teams t ON g.home_team_id = t.team_id "
-            "  WHERE g.game_type ILIKE '%Regular Season%' "
-            "    AND t.full_name ILIKE '%Denver Nuggets%'"
+            "  WHERE g.game_type = 'Regular Season' "
+            "    AND t.full_name = 'Denver Nuggets'"
             ") "
             "SELECT COUNT(*) AS game_count FROM team_games"
         )
@@ -511,8 +521,8 @@ class TestValidSQL:
             "  SELECT g.game_id, g.season_year, g.game_type, t.full_name "
             "  FROM dwh_d_games g "
             "  JOIN dwh_d_teams t ON g.home_team_id = t.team_id "
-            "  WHERE t.full_name ILIKE '%Denver Nuggets%' "
-            "    AND g.game_type ILIKE '%Regular Season%'"
+            "  WHERE t.full_name = 'Denver Nuggets' "
+            "    AND g.game_type = 'Regular Season'"
             "), "
             "home_wins AS ("
             "  SELECT thg.season_year, COUNT(*) AS home_wins "
@@ -567,7 +577,7 @@ class TestValidSQL:
             "WITH base_games AS ("
             "  SELECT g.game_id, g.game_type "
             "  FROM dwh_d_games g "
-            "  WHERE g.game_type ILIKE '%Regular Season%'"
+            "  WHERE g.game_type = 'Regular Season'"
             "), "
             "season_games AS ("
             "  SELECT bg.game_id, bg.game_type FROM base_games bg"
@@ -594,7 +604,7 @@ class TestValidSQL:
         assert result.is_valid
         assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
 
-    def test_literal_and_column_scope_same_column_reports_single_error_type(self, registry):
+    def test_wildcard_literal_and_column_scope_same_column_is_not_flagged(self, registry):
         sql = (
             "WITH cs AS (SELECT 'Regular Season' AS game_type) "
             "SELECT COUNT(*) AS game_count "
@@ -604,10 +614,11 @@ class TestValidSQL:
             "AND g.game_type = cs.game_type"
         )
         result = verify_sql(sql, registry)
-        assert not result.is_valid
-        error_types = [e.error_type for e in result.errors]
-        assert error_types.count("filter_context_not_projected") == 1
-        assert "scope_filter_not_projected" not in error_types
+        assert result.is_valid
+        assert not any(
+            e.error_type in {"filter_context_not_projected", "scope_filter_not_projected"}
+            for e in result.errors
+        )
 
     def test_subquery_literal_filter_not_treated_as_top_level_filter_context(self, registry):
         sql = (
@@ -643,7 +654,7 @@ class TestValidSQL:
             "SELECT COUNT(*) AS game_count "
             "FROM dwh_d_games g "
             "GROUP BY g.game_type "
-            "HAVING g.game_type ILIKE '%Regular Season%'"
+            "HAVING g.game_type = 'Regular Season'"
         )
         result = verify_sql(sql, registry)
         assert not result.is_valid
@@ -654,7 +665,7 @@ class TestValidSQL:
             "SELECT g.game_type, COUNT(*) AS game_count "
             "FROM dwh_d_games g "
             "GROUP BY g.game_type "
-            "HAVING g.game_type ILIKE '%Regular Season%'"
+            "HAVING g.game_type = 'Regular Season'"
         )
         result = verify_sql(sql, registry)
         assert result.is_valid
