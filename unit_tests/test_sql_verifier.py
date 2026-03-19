@@ -671,6 +671,74 @@ class TestValidSQL:
         assert result.is_valid
         assert not any(e.error_type == "filter_context_not_projected" for e in result.errors)
 
+    def test_cte_having_same_select_alias_is_flagged_postgres(self, registry):
+        sql = (
+            "WITH player_totals AS ("
+            "  SELECT pb.player_id, SUM(pb.points) AS total_points "
+            "  FROM dwh_f_player_boxscore pb "
+            "  GROUP BY pb.player_id "
+            "  HAVING total_points >= 3"
+            ") "
+            "SELECT pt.player_id, pt.total_points FROM player_totals pt"
+        )
+        result = verify_sql(sql, registry, dialect="postgresql")
+        assert not result.is_valid
+        assert any(e.error_type == "having_alias_reference" for e in result.errors)
+
+    def test_cte_having_grouped_column_not_alias_has_no_having_alias_error(self, registry):
+        sql = (
+            "WITH player_totals AS ("
+            "  SELECT pb.player_id, SUM(pb.points) AS total_points "
+            "  FROM dwh_f_player_boxscore pb "
+            "  GROUP BY pb.player_id "
+            "  HAVING pb.player_id IS NOT NULL"
+            ") "
+            "SELECT pt.player_id, pt.total_points FROM player_totals pt"
+        )
+        result = verify_sql(sql, registry, dialect="postgresql")
+        assert result.is_valid
+        assert not any(e.error_type == "having_alias_reference" for e in result.errors)
+
+    def test_outer_where_on_cte_alias_is_allowed(self, registry):
+        sql = (
+            "WITH player_totals AS ("
+            "  SELECT pb.player_id, SUM(pb.points) AS total_points "
+            "  FROM dwh_f_player_boxscore pb "
+            "  GROUP BY pb.player_id"
+            ") "
+            "SELECT pt.player_id, pt.total_points "
+            "FROM player_totals pt "
+            "WHERE pt.total_points > 10"
+        )
+        result = verify_sql(sql, registry, dialect="postgresql")
+        assert result.is_valid
+        assert not any(e.error_type == "having_alias_reference" for e in result.errors)
+
+    def test_cte_having_same_select_alias_is_allowed_on_snowflake(self, registry):
+        sql = (
+            "WITH player_totals AS ("
+            "  SELECT pb.player_id, SUM(pb.points) AS total_points "
+            "  FROM dwh_f_player_boxscore pb "
+            "  GROUP BY pb.player_id "
+            "  HAVING total_points >= 3"
+            ") "
+            "SELECT pt.player_id, pt.total_points FROM player_totals pt"
+        )
+        result = verify_sql(sql, registry, dialect="snowflake")
+        assert result.is_valid
+        assert not any(e.error_type == "having_alias_reference" for e in result.errors)
+
+    def test_flat_query_having_same_select_alias_is_flagged_postgres(self, registry):
+        sql = (
+            "SELECT pb.player_id, SUM(pb.points) AS computed_total "
+            "FROM dwh_f_player_boxscore pb "
+            "GROUP BY pb.player_id "
+            "HAVING computed_total > 0"
+        )
+        result = verify_sql(sql, registry, dialect="postgresql")
+        assert not result.is_valid
+        assert any(e.error_type == "having_alias_reference" for e in result.errors)
+
 
 # ===========================================================================
 # verify_sql — column errors
@@ -818,6 +886,23 @@ class TestUnionChecks:
         result = verify_sql(sql, registry)
         mismatch_errors = [e for e in result.errors if e.error_type == "union_column_mismatch"]
         assert mismatch_errors == []
+
+    def test_limit_inside_cte_is_flagged(self, registry):
+        sql = (
+            "WITH cte AS (SELECT player_id FROM dwh_f_player_boxscore LIMIT 5) "
+            "SELECT * FROM cte"
+        )
+        result = verify_sql(sql, registry)
+        assert not result.is_valid
+        assert any(e.error_type == "limit_inside_cte" for e in result.errors)
+
+    def test_limit_on_outer_select_not_flagged(self, registry):
+        sql = (
+            "WITH cte AS (SELECT player_id FROM dwh_f_player_boxscore) "
+            "SELECT * FROM cte LIMIT 5"
+        )
+        result = verify_sql(sql, registry)
+        assert result.is_valid
 
     def test_order_by_in_union_branch_detected(self, registry):
         # This is invalid SQL — ORDER BY inside a UNION branch

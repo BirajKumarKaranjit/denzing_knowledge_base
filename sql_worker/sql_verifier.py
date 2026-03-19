@@ -1,9 +1,18 @@
 """sql_worker/sql_verifier.py
 
-Structural SQL verification using sqlglot AST analysis.
+Hybrid SQL verifier.
 
-Validates generated SQL against a DDL column registry before execution.
-No LLM calls. No semantic matching. Exact structural checks only.
+This module performs registry-aware semantic checks using ``sqlglot`` (column
+existence, alias resolution, scope and GROUP BY checks) and delegates structural
+and style rules to external tools via adapters:
+
+- ``sqlfluff`` (style and structural lints)
+- ``sqllineage`` (CTE/table lineage and unused-CTE detection)
+
+Keep DDL-aware checks (column validation, filter/scope projection, having alias
+rules, union parity) implemented via sqlglot to ensure correctness against the
+project's JSONB-based DDL registry; offload generic style/pattern checks to the
+adapters to reduce custom code and maintenance burden.
 """
 
 from __future__ import annotations
@@ -41,7 +50,9 @@ class VerificationError:
     error_type: str
     """One of: column_not_in_ddl | wrong_table_for_column |
     union_column_mismatch | order_by_in_union_branch | scope_filter_not_projected |
-    filter_context_not_projected"""
+    filter_context_not_projected | having_alias_reference |
+    window_function_in_where | limit_inside_cte | self_join_without_alias |
+    missing_nullif_in_division"""
     message: str
     column: str | None = None
     table: str | None = None
@@ -61,9 +72,16 @@ def verify_sql(
     registry: dict[str, list[str]],
     dialect: str = "",
 ) -> VerificationResult:
-    """Validate *sql* against *registry* using sqlglot AST analysis.
+    """Validate *sql* against *registry*.
+
+    Implementation notes
+    - Use ``sqlglot`` for registry-aware semantic checks (columns/tables/aliases,
+      GROUP BY completeness, HAVING alias usage, UNION parity).
+    - Call adapters (``sqlfluff`` and ``sqllineage``) for style and lineage
+      checks; adapter results are merged into the returned ``VerificationResult``.
 
     Parameters
+    ----------
     sql:
     registry:
         ``{table_name: [col1, col2, ...]}`` built by ``build_column_registry()``.
@@ -71,10 +89,12 @@ def verify_sql(
     dialect:
         SQL dialect name used for sqlglot parsing (for example: postgresql,
         snowflake, bigquery).
+
     Returns
+    -------
     VerificationResult
-        ``is_valid=False`` when at least one hard error is found.
-        ``warnings`` are non-fatal and do not block execution.
+        ``is_valid=False`` when at least one hard error is found. ``warnings``
+        are non-fatal and do not block execution.
     """
     if not sql or not sql.strip():
         return VerificationResult(is_valid=True)
@@ -108,9 +128,35 @@ def verify_sql(
 
         errors.extend(_check_union_column_parity(statement))
         errors.extend(_check_order_by_in_union_branch(statement))
+        errors.extend(_check_limit_inside_cte(statement))
+        # New checks
+        warnings.extend(_check_order_by_without_limit(statement))
+        errors.extend(_check_window_function_in_where(statement))
+        errors.extend(_check_self_join_without_alias(statement))
+        # cross/join-without-condition detection is delegated to sqlfluff via the adapter
+        warnings.extend(_check_bare_aggregate_in_final_select(statement))
+        # SELECT * detection is handled by sqlfluff adapter; removed hand-rolled check.
+        warnings.extend(_check_non_sargable_function_on_filter_column(statement))
+        errors.extend(_check_duplicate_cte_name(statement))
+        warnings.extend(_check_unused_cte(statement))
+        errors.extend(_check_missing_nullif_in_division(statement))
         errors.extend(_check_scope_filter_projection(statement))
         errors.extend(_check_filter_context_projection(statement))
         warnings.extend(_check_group_by_completeness(statement))
+        errors.extend(_check_having_alias_reference(statement, dialect=read_dialect))
+
+        # Run external adapters (sqlfluff + sqllineage) to catch style/lineage issues.
+        try:
+            from .sql_rule_adapters import run_sqlfluff_checks, run_sqllineage_checks
+
+            fluff_errors, fluff_warnings = run_sqlfluff_checks(sql, dialect)
+            errors.extend(fluff_errors)
+            warnings.extend(fluff_warnings)
+
+            lineage_warnings = run_sqllineage_checks(sql)
+            warnings.extend(lineage_warnings)
+        except Exception as exc:  # pragma: no cover - adapter may error in some envs
+            _log.debug("rule adapter error (non-fatal): %s", exc)
 
     is_valid = len(errors) == 0
     return VerificationResult(is_valid=is_valid, errors=errors, warnings=warnings)
@@ -194,6 +240,8 @@ def _validate_columns(
         qualifier = _resolve_qualifier(col_ref, alias_map)
 
         if not col_name or col_name == "*":
+            continue
+        if _is_same_select_having_alias_reference(col_ref):
             continue
 
         if qualifier:
@@ -399,7 +447,14 @@ def _flatten_union_branches(union: exp.Union) -> list[exp.Select]:
 
 
 def _check_order_by_in_union_branch(statement: exp.Expression) -> list[VerificationError]:
-    """Detect ORDER BY or LIMIT placed directly inside a UNION branch (not in a subquery)."""
+    """Detect ORDER BY or LIMIT placed directly inside a UNION branch (not in a subquery).
+
+    NOTE: This check is intentionally implemented here (hand-rolled) and kept
+    permanently. sqlfluff is unable to reliably parse some UNION/UNION ALL
+    constructs and may raise parse errors rather than producing a lint that we
+    can depend on. Therefore we keep this sqlglot-based check to ensure
+    deterministic behavior for ORDER BY / LIMIT inside UNION branches.
+    """
     errors: list[VerificationError] = []
 
     for union in statement.find_all(exp.Union):
@@ -458,6 +513,82 @@ def _check_group_by_completeness(statement: exp.Expression) -> list[str]:
                     )
 
     return warnings
+
+
+def _check_having_alias_reference(
+    statement: exp.Expression,
+    dialect: str = "",
+) -> list[VerificationError]:
+    """Flag same-SELECT HAVING references to SELECT aliases in strict dialects."""
+    if (dialect or "").strip().lower() in {"snowflake", "bigquery", "duckdb"}:
+        return []
+
+    errors: list[VerificationError] = []
+
+    for select in statement.find_all(exp.Select):
+        aliases = {
+            str(sel_expr.alias).lower()
+            for sel_expr in select.expressions
+            if isinstance(sel_expr, exp.Alias)
+        }
+        if not aliases:
+            continue
+
+        having_node = select.args.get("having")
+        if not isinstance(having_node, exp.Having):
+            continue
+
+        flagged_aliases: set[str] = set()
+        for col in having_node.find_all(exp.Column):
+            alias_name = (col.name or "").lower()
+            if not alias_name or alias_name not in aliases:
+                continue
+            if not _is_direct_filter_column(col, having_node):
+                continue
+            flagged_aliases.add(alias_name)
+
+        for alias_name in sorted(flagged_aliases):
+            errors.append(
+                VerificationError(
+                    error_type="having_alias_reference",
+                    message=(
+                        f"HAVING references SELECT alias '{alias_name}' in the same SELECT. "
+                        "The alias may not be resolved at HAVING evaluation time in this dialect."
+                    ),
+                    column=alias_name,
+                    suggestion=(
+                        "Replace the alias in HAVING with its full expression, or wrap the SELECT "
+                        "in an outer CTE/subquery and filter on the alias there."
+                    ),
+                )
+            )
+
+    return errors
+
+
+def _is_same_select_having_alias_reference(col_ref: exp.Column) -> bool:
+    """Return True when a HAVING column matches a SELECT alias in the same SELECT."""
+    having_node = col_ref.find_ancestor(exp.Having)
+    if not isinstance(having_node, exp.Having):
+        return False
+
+    select_node = having_node.find_ancestor(exp.Select)
+    if not isinstance(select_node, exp.Select):
+        return False
+
+    alias_name = (col_ref.name or "").lower()
+    if not alias_name:
+        return False
+
+    aliases = {
+        str(sel_expr.alias).lower()
+        for sel_expr in select_node.expressions
+        if isinstance(sel_expr, exp.Alias)
+    }
+    if alias_name not in aliases:
+        return False
+
+    return _is_direct_filter_column(col_ref, having_node)
 
 
 def _has_aggregates(select: exp.Select) -> bool:
@@ -924,4 +1055,302 @@ def _collect_projected_field_names(select: exp.Select) -> set[str]:
 
     return projected
 
+
+def _check_limit_inside_cte(statement: exp.Expression) -> list[VerificationError]:
+    """Flag LIMIT or TOP inside a CTE body as an error.
+
+    CTEs are not ordered sets in many SQL dialects; placing a LIMIT/TOP inside a
+    CTE can lead to non-deterministic or engine-dependent behaviour.
+    """
+    errors: list[VerificationError] = []
+
+    for cte in statement.find_all(exp.CTE):
+        # Walk select nodes inside the CTE body
+        for select in _collect_select_nodes(cte.this):
+            # If the select contains a Limit or an Order without being wrapped by
+            # a surrounding subquery with a limit, flag it. sqlglot represents
+            # TOP as a Select.args.get("limit") in some dialects; checking for
+            # exp.Limit is sufficient for most cases.
+            if select.find(exp.Limit) is not None:
+                errors.append(
+                    VerificationError(
+                        error_type="limit_inside_cte",
+                        message=(
+                            "LIMIT found inside a CTE body. LIMIT/TOP inside CTEs is "
+                            "not portable and may produce non-deterministic results."
+                        ),
+                    )
+                )
+            # Also check for presence of TOP via Select.args (sqlglot may parse TOP
+            # by placing a Value in the 'limit' arg depending on dialect)
+            limit_arg = select.args.get("limit")
+            if limit_arg is not None and not isinstance(limit_arg, exp.Limit):
+                # If it's a raw expression representing TOP, flag it
+                errors.append(
+                    VerificationError(
+                        error_type="limit_inside_cte",
+                        message=(
+                            "TOP/LIMIT found inside a CTE body. LIMIT/TOP inside CTEs is "
+                            "not portable and may produce non-deterministic results."
+                        ),
+                    )
+                )
+    return errors
+
+
+def _check_order_by_without_limit(statement: exp.Expression) -> list[str]:
+    """Warn when a non-top-level SELECT (CTE or subquery) contains ORDER BY but no LIMIT.
+
+    We only warn for ORDER BY inside CTEs or subqueries because top-level ORDER BY
+    is often intentional alongside LIMIT; subquery/CTE ORDER BY without LIMIT is
+    often a sign of a misplaced ordering.
+    """
+    warnings: list[str] = []
+    top = _top_level_select(statement)
+    for select in statement.find_all(exp.Select):
+        # skip the top-level final select
+        if top is not None and select is top:
+            continue
+        has_order = select.find(exp.Order) is not None
+        has_limit = select.find(exp.Limit) is not None or select.args.get("limit") is not None
+        if has_order and not has_limit:
+            warnings.append(
+                "ORDER BY without LIMIT detected inside a subquery/CTE; consider adding LIMIT or removing ORDER BY."
+            )
+    return warnings
+
+
+def _check_window_function_in_where(statement: exp.Expression) -> list[VerificationError]:
+    """Flag usage of window functions inside WHERE clauses (not allowed).
+
+    Detect exp.Window nodes appearing under a WHERE where the Window is not
+    enclosed in a subquery. Window functions cannot be filtered by WHERE and
+    should be computed in an outer query or a CTE.
+    """
+    errors: list[VerificationError] = []
+    # Walk WHERE nodes and look for Window descendants that are not inside a subquery
+    for where in statement.find_all(exp.Where):
+        # If the WHERE itself is inside a subquery, ignore; we only flag top-level
+        # WHERE nodes of the main query (or CTE bodies) that contain window funcs.
+        if where.find_ancestor(exp.Subquery) is not None:
+            continue
+        for window in where.find_all(exp.Window):
+            # If the window is inside a subquery (ancestor Subquery between window and where), ignore
+            anc = window.parent
+            inside_subquery = False
+            while anc is not None and anc is not where:
+                if isinstance(anc, exp.Subquery):
+                    inside_subquery = True
+                    break
+                anc = anc.parent
+            if inside_subquery:
+                continue
+            errors.append(
+                VerificationError(
+                    error_type="window_function_in_where",
+                    message=(
+                        "Window function used inside WHERE clause. Window functions are "
+                        "not allowed in WHERE; move the expression to a subquery or use HAVING."
+                    ),
+                )
+            )
+    return errors
+
+
+def _check_self_join_without_alias(statement: exp.Expression) -> list[VerificationError]:
+    """Detect self-joins where the same table appears multiple times without proper aliases."""
+    errors: list[VerificationError] = []
+    for select in statement.find_all(exp.Select):
+        # collect table occurrences in this select
+        name_to_occurrences: dict[str, list[exp.Table]] = {}
+        from_clause = select.args.get("from") or select.args.get("from_")
+        relations: list[exp.Expression] = []
+        if from_clause is not None:
+            if getattr(from_clause, "this", None) is not None:
+                relations.append(from_clause.this)
+            relations.extend(from_clause.expressions or [])
+        for join in select.args.get("joins") or []:
+            relations.append(join.this)
+
+        for rel in relations:
+            if isinstance(rel, exp.Table) and rel.name:
+                name = rel.name.lower()
+                name_to_occurrences.setdefault(name, []).append(rel)
+
+        for name, occ in name_to_occurrences.items():
+            if len(occ) > 1:
+                # If any occurrence lacks an alias or uses the bare table name as alias, flag it
+                for table_node in occ:
+                    alias = (table_node.alias or "").lower()
+                    if not alias or alias == name:
+                        errors.append(
+                            VerificationError(
+                                error_type="self_join_without_alias",
+                                message=(
+                                    f"Table '{name}' is joined multiple times but one occurrence has no alias. "
+                                    "Provide distinct aliases for self-joins to avoid ambiguity."
+                                ),
+                                table=name,
+                            )
+                        )
+                        break
+    return errors
+
+
+def _check_bare_aggregate_in_final_select(statement: exp.Expression) -> list[str]:
+    """Warn when the final/top-level SELECT returns only aggregates with no GROUP BY or context.
+
+    This can be intentional, but often a user expects row-level context alongside aggregates.
+    """
+    warnings: list[str] = []
+    top_select = _top_level_select(statement)
+    if top_select is None:
+        return warnings
+
+    if _has_aggregates(top_select):
+        group_by = top_select.find(exp.Group)
+        non_agg_columns = []
+        for sel_expr in top_select.expressions:
+            if not _is_aggregate(sel_expr):
+                inner = sel_expr.this if isinstance(sel_expr, exp.Alias) else sel_expr
+                if isinstance(inner, exp.Column):
+                    non_agg_columns.append(inner.name.lower())
+        if not non_agg_columns and not group_by:
+            warnings.append(
+                "Top-level SELECT returns only aggregate expressions with no GROUP BY; verify this is intended."
+            )
+    return warnings
+
+
+def _check_non_sargable_function_on_filter_column(statement: exp.Expression) -> list[str]:
+    """Warn when WHERE/HAVING predicates apply a non-sargable function to a column (e.g. LOWER(col) = 'x')."""
+    warnings: list[str] = []
+
+    def _is_function_wrapping_column(node: exp.Expression) -> bool:
+        # If node is a function and contains a Column child, consider it non-sargable
+        if isinstance(node, exp.Func) or isinstance(node, exp.Anonymous):
+            for c in node.find_all(exp.Column):
+                return True
+        return False
+
+    for select in statement.find_all(exp.Select):
+        for filter_node in (select.find(exp.Where), select.find(exp.Having)):
+            if filter_node is None:
+                continue
+            for comparison in filter_node.find_all(_LITERAL_COMPARISON_TYPES):
+                # check left and right sides
+                for side in comparison.args.values():
+                    if side is None:
+                        continue
+                    nodes = side if isinstance(side, list) else [side]
+                    for node in nodes:
+                        if _is_function_wrapping_column(node):
+                            warnings.append(
+                                "Potential non-sargable predicate detected (function applied to column). "
+                                "Consider rewriting to make use of indexes (e.g., LOWER(col) -> col ILIKE ...)."
+                            )
+    return warnings
+
+
+def _check_duplicate_cte_name(statement: exp.Expression) -> list[VerificationError]:
+    """Error when the same CTE name is declared more than once."""
+    errors: list[VerificationError] = []
+    names: dict[str, int] = {}
+    for cte in statement.find_all(exp.CTE):
+        name = (cte.alias_or_name or "").lower()
+        if not name:
+            continue
+        names[name] = names.get(name, 0) + 1
+    for name, count in names.items():
+        if count > 1:
+            errors.append(
+                VerificationError(
+                    error_type="duplicate_cte_name",
+                    message=(f"CTE name '{name}' declared {count} times. Duplicate CTE names are not allowed."),
+                    suggestion="Rename the duplicate CTEs so each has a unique alias.",
+                )
+            )
+    return errors
+
+
+def _check_unused_cte(statement: exp.Expression) -> list[str]:
+    """Warn when a CTE is declared but never referenced by the top-level query or other CTEs."""
+    warnings: list[str] = []
+    cte_nodes = {cte.alias_or_name.lower(): cte for cte in statement.find_all(exp.CTE) if cte.alias_or_name}
+    if not cte_nodes:
+        return warnings
+    top_select = _top_level_select(statement)
+    if top_select is None:
+        return warnings
+    referenced = _collect_cte_dependency_names(top_select, cte_nodes, max_hops=10)
+    for name in sorted(cte_nodes.keys()):
+        if name not in referenced:
+            warnings.append(f"CTE '{name}' is declared but never used in the final query.")
+    return warnings
+
+
+def _check_missing_nullif_in_division(statement: exp.Expression) -> list[VerificationError]:
+    """Error when division operations do not guard denominator with NULLIF to avoid divide-by-zero.
+
+    This flags simple binary division operators where the right-hand side is not
+    wrapped in NULLIF(..., 0). Only divisions that appear in SELECT expressions
+    or top-level WHERE predicates are considered.
+    """
+    errors: list[VerificationError] = []
+    # sqlglot may represent division with exp.Div or exp.Divide depending on version
+    div_types = [getattr(exp, "Div", None), getattr(exp, "Divide", None)]
+    div_types = [t for t in div_types if t is not None]
+
+    def _is_nullif(node: exp.Expression) -> bool:
+        # sqlglot versions may represent NULLIF as a concrete class or as a
+        # function-like Anonymous/Func node named 'nullif'. Detect both.
+        if node is None:
+            return False
+        if getattr(exp, "NullIf", None) is not None and isinstance(node, getattr(exp, "NullIf")):
+            return True
+        if isinstance(node, (exp.Anonymous, exp.Func)):
+            name = (getattr(node, "name", None) or "").lower()
+            # For Func node, name may be in node.this
+            if not name and hasattr(node, "this") and getattr(node.this, "name", None):
+                name = getattr(node.this, "name").lower()
+            return name == "nullif"
+        return False
+
+    for node in statement.walk():
+        # Check any node that is one of the division types
+        if type(node) in div_types:
+            # Determine if this division is inside a SELECT expression or a WHERE
+            in_select = node.find_ancestor(exp.Select) is not None
+            in_where = node.find_ancestor(exp.Where) is not None
+            if not (in_select or in_where):
+                continue
+
+            right = getattr(node, "right", None) or node.args.get("right") or node.args.get("this")
+            if right is None:
+                continue
+            # If the right side is a NULLIF, it's fine
+            if _is_nullif(right):
+                continue
+            # If right contains a Literal zero, treat as guarded
+            has_zero = False
+            for lit in right.find_all(exp.Literal):
+                try:
+                    if str(lit.this) == "0":
+                        has_zero = True
+                        break
+                except Exception:
+                    pass
+            if has_zero:
+                continue
+
+            errors.append(
+                VerificationError(
+                    error_type="missing_nullif_in_division",
+                    message=(
+                        "Division operation without NULLIF guard on denominator detected. "
+                        "Wrap the denominator with NULLIF(denom, 0) to avoid divide-by-zero errors."
+                    ),
+                )
+            )
+    return errors
 
