@@ -15,7 +15,14 @@ from psycopg2.extensions import connection as PgConnection
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.config import POSTGRES_DSN, EMBEDDING_DIMENSION, RRF_K, MANDATORY_FILES
+from utils.config import (
+    POSTGRES_DSN,
+    EMBEDDING_DIMENSION,
+    RRF_K,
+    MANDATORY_FILES,
+    BM25_ENABLED,
+    BM25_PER_QUERY_K,
+)
 from kb_system.kb_parser import ParsedKBFile
 
 
@@ -62,6 +69,8 @@ def init_schema(conn: PgConnection) -> None:
             );
         """)
 
+        cur.execute("ALTER TABLE kb_files ADD COLUMN IF NOT EXISTS search_vector tsvector;")
+
         cur.execute(f"""
             CREATE INDEX IF NOT EXISTS idx_kb_embedding
             ON kb_files
@@ -80,6 +89,53 @@ def init_schema(conn: PgConnection) -> None:
             CREATE INDEX IF NOT EXISTS idx_kb_section
             ON kb_files (section);
         """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_kb_search_vector
+            ON kb_files
+            USING GIN (search_vector);
+        """)
+
+        cur.execute(
+            """
+            CREATE OR REPLACE FUNCTION kb_files_update_search_vector()
+            RETURNS trigger AS $$
+            BEGIN
+                NEW.search_vector := to_tsvector(
+                    'english',
+                    COALESCE(NEW.metadata->>'name', '') || ' ' ||
+                    COALESCE(NEW.metadata->>'description', '') || ' ' ||
+                    COALESCE(NEW.metadata->>'example_queries', '') || ' ' ||
+                    COALESCE(NEW.metadata->>'tags', '') || ' ' ||
+                    COALESCE(NEW.content, '')
+                );
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            """
+        )
+
+        cur.execute("""
+            DROP TRIGGER IF EXISTS trg_kb_files_search_vector ON kb_files;
+            CREATE TRIGGER trg_kb_files_search_vector
+            BEFORE INSERT OR UPDATE ON kb_files
+            FOR EACH ROW EXECUTE FUNCTION kb_files_update_search_vector();
+        """)
+
+        cur.execute(
+            """
+            UPDATE kb_files
+            SET search_vector = to_tsvector(
+                'english',
+                COALESCE(metadata->>'name', '') || ' ' ||
+                COALESCE(metadata->>'description', '') || ' ' ||
+                COALESCE(metadata->>'example_queries', '') || ' ' ||
+                COALESCE(metadata->>'tags', '') || ' ' ||
+                COALESCE(content, '')
+            )
+            WHERE search_vector IS NULL;
+            """
+        )
 
     conn.commit()
     print("[kb_store] Schema initialized successfully.")
@@ -200,6 +256,7 @@ def _fetch_mandatory_files(
 def retrieve_with_rrf(
     conn: PgConnection,
     query_embeddings: list[list[float]],
+    query_text: str = "",
     section: str = "ddl",
     top_k: int = 3,
     per_query_k: int = 10,
@@ -252,6 +309,16 @@ def retrieve_with_rrf(
             ranked.append(record)
 
         all_ranked_lists.append(ranked)
+
+    if BM25_ENABLED and query_text.strip():
+        bm25_ranked = retrieve_with_bm25(
+            conn=conn,
+            query_text=query_text,
+            section=section,
+            top_k=max(BM25_PER_QUERY_K, per_query_k),
+        )
+        if bm25_ranked:
+            all_ranked_lists.append(bm25_ranked)
 
     rrf_scores: dict[str, float] = {}
     best_cosine: dict[str, float] = {}
@@ -311,6 +378,53 @@ def retrieve_with_rrf(
         results.extend(fetched)
 
     return results
+
+
+def retrieve_with_bm25(
+    conn: PgConnection,
+    query_text: str,
+    section: str,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    """Retrieve ranked KB files using Postgres full-text search."""
+    if not query_text.strip():
+        return []
+
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                WITH q AS (
+                    SELECT websearch_to_tsquery('english', %s) AS tsq
+                )
+                SELECT
+                    file_path,
+                    section,
+                    metadata,
+                    content,
+                    ts_rank_cd(search_vector, q.tsq) AS bm25_score
+                FROM kb_files, q
+                WHERE
+                    section = %s
+                    AND is_entry_point = FALSE
+                    AND search_vector @@ q.tsq
+                ORDER BY bm25_score DESC
+                LIMIT %s;
+                """,
+                (query_text, section, top_k),
+            )
+            rows = cur.fetchall()
+    except psycopg2.Error:
+        conn.rollback()
+        return []
+
+    ranked: list[dict] = []
+    for row in rows:
+        record = dict(row)
+        if isinstance(record.get("metadata"), str):
+            record["metadata"] = json.loads(record["metadata"])
+        ranked.append(record)
+    return ranked
 
 
 def retrieve_similar_tables(

@@ -485,6 +485,7 @@ def retrieve_context_for_query(
         tables = retrieve_with_rrf(
             conn=conn,
             query_embeddings=all_embeddings,
+            query_text=user_query,
             section=section,
             top_k=candidate_k,
             per_query_k=max(candidate_k * 2, 10),
@@ -516,6 +517,7 @@ def retrieve_context_for_query(
     matched_sql_guidelines = retrieve_with_rrf(
         conn=conn,
         query_embeddings=all_embeddings,
+        query_text=user_query,
         section="sql_guidelines",
         top_k=1,
         per_query_k=8,

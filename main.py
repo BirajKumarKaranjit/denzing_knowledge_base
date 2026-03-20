@@ -355,20 +355,19 @@ def cmd_query(user_query: str) -> None:
         retrieval_result=retrieval_result,
         agent_backstory="You are an NBA analytics assistant with deep knowledge of basketball statistics.",
     )
-    print(f"\n The following prompt will be sent to the LLM for SQL generation:")
-    print(f"\n{'=' * 60}")
-    print(prompt)
-    print(f"{'=' * 60}")
+    # print(f"\n The following prompt will be sent to the LLM for SQL generation:")
+    # print(f"\n{'=' * 60}")
+    # print(prompt)
+    # print(f"{'=' * 60}")
     print(f"\n[main] Calling LLM for SQL generation...")
     t0 = time.perf_counter()
     llm_response = generate_sql(prompt)
     raw_sql = extract_sql_from_response(llm_response)
     sql_generation_time += time.perf_counter() - t0
     raw_sql_display = _format_sql(raw_sql)
-    print(f"The LLM returned the following raw SQL (before PEER patching):")
+    print(f"Generated RAW SQL:")
     print(f"\n{'=' * 60}")
     print(raw_sql_display)
-    print(f"{'=' * 60}")
 
     remote_conn = get_connection(NBA_POSTGRES_DSN)
     final_sql = raw_sql
@@ -567,5 +566,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
-    # cmd_query(input("\nEnter a natural language question to convert to SQL: "))
+    # main()
+    cmd_query(input("\nEnter a natural language question to convert to SQL: "))
