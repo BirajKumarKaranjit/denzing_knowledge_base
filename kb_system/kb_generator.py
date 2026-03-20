@@ -11,6 +11,7 @@ Workflow:
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
 import os
@@ -30,6 +31,7 @@ from utils.config import (
     SECTION_SUB_SECTIONS,
     SECTION_HINTS,
     SECTION_DDL_REQUIRED,
+    KB_GENERATION_MAX_CONCURRENCY,
 )
 from utils.sample_values_for_testing import Sample_NBA_DDL_DICT
 from utils.prompts.kb_generation_prompts import (
@@ -46,6 +48,7 @@ from utils.prompts.kb_generation_prompts import (
 )
 
 _client = openai.OpenAI(api_key=OPENAI_API_KEY)
+_async_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 
 def _strip_llm_fences(llm_output: str) -> str:
@@ -76,6 +79,28 @@ def generate_table_md_file(
         ),
     ]
     response = _client.chat.completions.create(
+        model=OPENAI_GENERATION_MODEL,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=2000,
+    )
+    return _strip_llm_fences(response.choices[0].message.content.strip())
+
+
+async def _generate_table_md_file_async(
+    table_name: str,
+    ddl_sql: str,
+    domain: str = "analytics",
+) -> str:
+    """Generate a table KB markdown file using the async OpenAI client."""
+    messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
+        ChatCompletionSystemMessageParam(role="system", content=TABLE_FILE_SYSTEM_PROMPT),
+        ChatCompletionUserMessageParam(
+            role="user",
+            content=table_file_user_prompt(table_name, ddl_sql, domain),
+        ),
+    ]
+    response = await _async_client.chat.completions.create(
         model=OPENAI_GENERATION_MODEL,
         messages=messages,
         temperature=0.2,
@@ -155,6 +180,82 @@ def generate_section_sub_file(
     return _strip_llm_fences(response.choices[0].message.content.strip())
 
 
+async def _generate_section_sub_file_async(
+    section: str,
+    sub_section: str,
+    hint: str,
+    ddl_dict: Optional[dict[str, str]] = None,
+) -> str:
+    """Generate a section sub-file via async OpenAI API call."""
+    needs_ddl = SECTION_DDL_REQUIRED.get(section, False)
+    ddl_summary = _build_ddl_summary(ddl_dict) if (needs_ddl and ddl_dict) else None
+
+    if section == "response_guidelines" and sub_section == "response_format" and ddl_summary:
+        system_content = RESPONSE_FORMAT_SYSTEM_PROMPT
+        user_content = response_format_user_prompt(ddl_summary)
+    else:
+        system_content = SECTION_SUB_FILE_SYSTEM_PROMPT
+        user_content = section_sub_file_user_prompt(section, sub_section, hint, ddl_summary)
+
+    messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
+        ChatCompletionSystemMessageParam(role="system", content=system_content),
+        ChatCompletionUserMessageParam(role="user", content=user_content),
+    ]
+    response = await _async_client.chat.completions.create(
+        model=OPENAI_GENERATION_MODEL,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=2500,
+    )
+    return _strip_llm_fences(response.choices[0].message.content.strip())
+
+
+def _run_async(coro):
+    """Run a coroutine from sync code."""
+    return asyncio.run(coro)
+
+
+async def _generate_table_files_concurrently(
+    pending_items: list[tuple[str, str, Path]],
+    domain: str,
+    max_concurrency: int,
+) -> list[tuple[Path, str]]:
+    """Generate table files concurrently and return (path, content) pairs."""
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def _worker(table_name: str, ddl_sql: str, output_path: Path) -> tuple[Path, str]:
+        async with semaphore:
+            content = await _generate_table_md_file_async(table_name, ddl_sql, domain)
+            return output_path, content
+
+    tasks = [
+        asyncio.create_task(_worker(table_name, ddl_sql, output_path))
+        for table_name, ddl_sql, output_path in pending_items
+    ]
+    return await asyncio.gather(*tasks)
+
+
+async def _generate_sub_files_concurrently(
+    section: str,
+    pending_items: list[tuple[str, str, Path]],
+    ddl_dict: Optional[dict[str, str]],
+    max_concurrency: int,
+) -> list[tuple[Path, str]]:
+    """Generate section sub-files concurrently and return (path, content) pairs."""
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def _worker(sub_section: str, hint: str, output_path: Path) -> tuple[Path, str]:
+        async with semaphore:
+            content = await _generate_section_sub_file_async(section, sub_section, hint, ddl_dict)
+            return output_path, content
+
+    tasks = [
+        asyncio.create_task(_worker(sub_section, hint, output_path))
+        for sub_section, hint, output_path in pending_items
+    ]
+    return await asyncio.gather(*tasks)
+
+
 def generate_all_sub_files_for_section(
     section: str,
     ddl_dict: Optional[dict[str, str]] = None,
@@ -177,6 +278,8 @@ def generate_all_sub_files_for_section(
     section_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
 
+    pending: list[tuple[str, str, Path]] = []
+
     for sub in sub_sections:
         path = section_dir / f"{sub}.md"
 
@@ -185,8 +288,34 @@ def generate_all_sub_files_for_section(
             continue
 
         hint = hints.get(sub, f"Patterns and rules for the '{sub}' topic.")
-        print(f"[kb_generator] Generating {section}/{sub}.md via LLM...")
-        content = generate_section_sub_file(section, sub, hint, ddl_dict)
+        pending.append((sub, hint, path))
+
+    if not pending:
+        return written
+
+    max_concurrency = max(1, KB_GENERATION_MAX_CONCURRENCY)
+    if max_concurrency == 1 or len(pending) == 1:
+        for sub, hint, path in pending:
+            print(f"[kb_generator] Generating {section}/{sub}.md via LLM...")
+            content = generate_section_sub_file(section, sub, hint, ddl_dict)
+            path.write_text(content, encoding="utf-8")
+            written.append(path)
+            print(f"[kb_generator] Written: {path}")
+        return written
+
+    print(
+        f"[kb_generator] Generating {len(pending)} {section} sub-file(s) concurrently "
+        f"(max_concurrency={max_concurrency})..."
+    )
+    generated = _run_async(
+        _generate_sub_files_concurrently(
+            section=section,
+            pending_items=pending,
+            ddl_dict=ddl_dict,
+            max_concurrency=max_concurrency,
+        )
+    )
+    for path, content in generated:
         path.write_text(content, encoding="utf-8")
         written.append(path)
         print(f"[kb_generator] Written: {path}")
@@ -208,6 +337,8 @@ def generate_all_table_files(
     written_files: list[Path] = []
     table_names = list(ddl_dict.keys())
 
+    pending: list[tuple[str, str, Path]] = []
+
     for table_name, ddl_sql in ddl_dict.items():
         output_path = output_dir / f"{table_name}.md"
 
@@ -215,11 +346,33 @@ def generate_all_table_files(
             print(f"[kb_generator] Skipping {table_name}.md (already exists).")
             continue
 
-        print(f"[kb_generator] Generating {table_name}.md ...")
-        content = generate_table_md_file(table_name, ddl_sql, domain=domain)
-        output_path.write_text(content, encoding="utf-8")
-        written_files.append(output_path)
-        print(f"[kb_generator] Written: {output_path}")
+        pending.append((table_name, ddl_sql, output_path))
+
+    max_concurrency = max(1, KB_GENERATION_MAX_CONCURRENCY)
+    if pending:
+        if max_concurrency == 1 or len(pending) == 1:
+            for table_name, ddl_sql, output_path in pending:
+                print(f"[kb_generator] Generating {table_name}.md ...")
+                content = generate_table_md_file(table_name, ddl_sql, domain=domain)
+                output_path.write_text(content, encoding="utf-8")
+                written_files.append(output_path)
+                print(f"[kb_generator] Written: {output_path}")
+        else:
+            print(
+                f"[kb_generator] Generating {len(pending)} table file(s) concurrently "
+                f"(max_concurrency={max_concurrency})..."
+            )
+            generated = _run_async(
+                _generate_table_files_concurrently(
+                    pending_items=pending,
+                    domain=domain,
+                    max_concurrency=max_concurrency,
+                )
+            )
+            for output_path, content in generated:
+                output_path.write_text(content, encoding="utf-8")
+                written_files.append(output_path)
+                print(f"[kb_generator] Written: {output_path}")
 
     ddl_kb_path = output_dir / "KB.md"
     if not ddl_kb_path.exists() or overwrite:
